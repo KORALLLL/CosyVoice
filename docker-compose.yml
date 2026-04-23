@@ -1,0 +1,31 @@
+services:
+  cosyvoice3-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cosyvoice3-tts:latest
+    container_name: cosyvoice3-tts
+    ports:
+      - "8000:8000"
+    environment:
+      - COSYVOICE_MODEL_DIR=/models/Fun-CosyVoice3-0.5B
+      - COSYVOICE_BACKEND=native
+      - COSYVOICE_FP16=true
+      - COSYVOICE_LOAD_TRT=false
+      - TTS_PORT=8000
+      - TTS_WARMUP_ENABLED=true
+      - MAX_TEXT_LENGTH=5000
+      - ENABLE_TEXT_NORMALIZATION=true
+      - GENERATED_AUDIO_DIR=/app/generated
+    volumes:
+      - ./pretrained_models:/models:ro
+      - ./generated:/app/generated
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true

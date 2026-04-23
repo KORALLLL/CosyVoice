@@ -1,0 +1,187 @@
+# CosyVoice3 TTS Server — Quick Deploy Guide
+
+This guide reproduces the exact steps used to deploy `Fun-CosyVoice3-0.5B-2512` as a FastAPI inference endpoint on a CUDA-capable Linux host.
+
+## Prerequisites
+
+- Linux with NVIDIA GPU (tested on Blackwell / sm_120 with CUDA 12.8)
+- `uv` installed (https://docs.astral.sh/uv/)
+- `git` with submodule support
+- ~10 GB free disk space (model + env + TRT cache)
+
+## 1. Clone & prepare repo
+
+```bash
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
+cd CosyVoice
+git submodule update --init --recursive
+```
+
+## 2. Create uv venv (Python 3.12)
+
+```bash
+uv venv .venv --python 3.12 --system-site-packages
+```
+
+## 3. Install PyTorch (CUDA 12.8 build for Blackwell)
+
+If you are on an older GPU (Ampere/Hopper with CUDA 12.1), you can skip to the next step and let `uv` install `torch==2.3.1+cu121` from requirements.  
+For **Blackwell (sm_120)** you **must** install PyTorch 2.8.0+cu128 manually:
+
+```bash
+# Download wheels once
+pip download torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  -d /tmp/torch_wheels
+
+# Install into venv
+uv pip install --python .venv/bin/python /tmp/torch_wheels/*.whl --force-reinstall
+```
+
+## 4. Install remaining dependencies
+
+```bash
+# Filter out the broken [IP_ADDRESS] placeholders and the old torch pins
+sed -e '/tensorrt-cu12/d' \
+    -e '/torch==/d' \
+    -e '/torchaudio==/d' \
+    -e '/triton==/d' \
+    requirements.txt > requirements_filtered.txt
+
+cat >> requirements_filtered.txt <<EOF
+prometheus-client
+httpx
+python-multipart
+EOF
+
+uv pip install --python .venv/bin/python --index-strategy unsafe-best-match \
+  -r requirements_filtered.txt
+```
+
+If `openai-whisper==20231117` fails to build, install it separately:
+
+```bash
+uv pip install --python .venv/bin/python --index-strategy unsafe-best-match \
+  --no-build-isolation openai-whisper==20231117
+```
+
+## 5. Download model
+
+```bash
+.venv/bin/python -c "
+from modelscope import snapshot_download
+snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512',
+                  cache_dir='./pretrained_models')
+"
+```
+
+The model lands under `./pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512`.
+
+## 6. Start the server
+
+Create a launcher script `run_server.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+export PYTHONPATH="$(pwd):$(pwd)/third_party/Matcha-TTS:$(pwd)/runtime/python/fastapi"
+
+export COSYVOICE_MODEL_DIR="$(pwd)/pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512"
+export COSYVOICE_BACKEND="native"
+export COSYVOICE_FP16="true"
+export COSYVOICE_LOAD_TRT="false"
+export TTS_PORT="8000"
+export TTS_HOST="[IP_ADDRESS]"
+export TTS_WARMUP_ENABLED="false"
+export MAX_TEXT_LENGTH="5000"
+export ENABLE_TEXT_NORMALIZATION="true"
+export GENERATED_AUDIO_DIR="$(pwd)/generated"
+
+mkdir -p "$GENERATED_AUDIO_DIR"
+
+exec .venv/bin/python runtime/python/fastapi/server_cosyvoice3.py
+```
+
+Run it:
+
+```bash
+chmod +x run_server.sh
+nohup ./run_server.sh > server.log 2>&1 &
+```
+
+Or use the wrapper that hard-codes `0.0.0.0` to avoid hostname resolution issues:
+
+```bash
+nohup .venv/bin/python run_uvicorn.py > server.log 2>&1 &
+```
+
+(see `run_uvicorn.py` in this repo for the exact wrapper)
+
+## 7. Verify
+
+```bash
+curl -s http://localhost:8000/health | python3 -m json.tool
+```
+
+## 8. Generate TTS (example — Russian cross-lingual)
+
+```bash
+curl -X POST http://localhost:8000/tts-stream \
+  -F "text=You are a helpful assistant.<|endofprompt|>Привет, это тест." \
+  -F "mode=cross_lingual" \
+  -F "lang=ru" \
+  -F "prompt_audio=@/path/to/reference.wav" \
+  -o output.raw
+```
+
+Convert raw int16 PCM @ 24 kHz to WAV:
+
+```bash
+python3 -c "
+import wave, sys
+with open('output.raw','rb') as f: pcm=f.read()
+with wave.open('output.wav','wb') as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
+    w.writeframes(pcm)
+"
+```
+
+## 9. Batch generation (Python script)
+
+Use the provided `generate_homographs.py` as a template. Key points:
+- Always prepend the system prefix for CosyVoice3: `You are a helpful assistant.<|endofprompt|>`
+- Upload prompt audio as `prompt_audio` file
+- Use `mode=zero_shot` or `mode=cross_lingual`
+- Response is raw int16 PCM, 24 kHz, mono
+
+## Known issues & fixes applied
+
+| Issue | Fix |
+|-------|-----|
+| `python-multipart` missing | `uv pip install python-multipart` |
+| BytesIO cannot be re-read by torchaudio | Save uploaded audio to `tempfile.NamedTemporaryFile` first |
+| Warmup text too short → hifigan kernel error | Set `TTS_WARMUP_ENABLED=false` |
+| Host `[IP_ADDRESS]` not resolvable | Use `0.0.0.0` or `127.0.0.1` in `run_uvicorn.py` |
+| Blackwell GPU (sm_120) incompatible with torch 2.3.1 | Upgrade to `torch==2.8.0+cu128` |
+| ONNX Runtime missing `libcudnn.so.8` | Falls back to CPU automatically (adds latency but works) |
+| `openai-whisper` build fails | Install with `--no-build-isolation` |
+
+## Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check + model status |
+| `POST /tts-stream` | Streaming TTS (form data) |
+| `POST /v1/audio/speech` | OpenAI-compatible streaming |
+| `POST /v1/audio/speech/wav` | OpenAI-compatible WAV |
+| `GET /v1/audio/voices` | List available speakers |
+| `GET /demo` | Web UI |
+
+## File reference
+
+- `run_server.sh` — bash launcher
+- `run_uvicorn.py` — Python launcher (binds `0.0.0.0:8000`)
+- `generate_homographs.py` — batch generation example
+- `server.log` — runtime logs

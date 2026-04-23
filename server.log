@@ -1,0 +1,461 @@
+INFO:     Started server process [807152]
+INFO:     Waiting for application startup.
+2026-04-23 17:57:33 | INFO     | Initializing TTS engine (backend=native, model=/workspace/CosyVoice/pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512)...
+[2026-04-23 17:58:25,076] [INFO] [real_accelerator.py:203:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+2026-04-23 17:58:41 | INFO     | Loading CosyVoice3 native model from /workspace/CosyVoice/pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512 (fp16=True, trt=False)
+Sliding Window Attention is enabled but not implemented for `sdpa`; unexpected results may be encountered.
+/workspace/CosyVoice/.venv/lib/python3.12/site-packages/lightning/fabric/__init__.py:41: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+2026-04-23 17:59:02 | INFO     | input frame rate=25
+/workspace/CosyVoice/.venv/lib/python3.12/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+[1;31m2026-04-23 17:59:14.455578230 [E:onnxruntime:Default, provider_bridge_ort.cc:1744 TryGetProviderInfo_CUDA] /onnxruntime_src/onnxruntime/core/session/provider_bridge_ort.cc:1426 onnxruntime::Provider& onnxruntime::ProviderLibrary::Get() [ONNXRuntimeError] : 1 : FAIL : Failed to load library libonnxruntime_providers_cuda.so with error: libcudnn.so.8: cannot open shared object file: No such file or directory
+[m
+[0;93m2026-04-23 17:59:14.455718648 [W:onnxruntime:Default, onnxruntime_pybind_state.cc:870 CreateExecutionProviderInstance] Failed to create CUDAExecutionProvider. Please reference https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirementsto ensure all dependencies are met.[m
+Downloading Model to directory: /root/.cache/modelscope/hub/pengzhendong/wetext
+Downloading Model to directory: /root/.cache/modelscope/hub/pengzhendong/wetext
+2026-04-23 17:59:19 | INFO     | use wetext frontend
+2026-04-23 17:59:47 | INFO     | NativeEngine ready
+2026-04-23 17:59:47 | WARNING  | ru-normalizr not installed, Russian normalization disabled
+2026-04-23 17:59:47 | INFO     | Normalizer ru not available for lang=ru
+2026-04-23 17:59:47 | INFO     | TTS warmup is disabled
+2026-04-23 17:59:47 | INFO     | CosyVoice3 TTS server ready (backend=native)
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-04-23 18:00:56 | INFO     | [4a158047-8c55-4144-a8e3-fd13319f57bb] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=75
+INFO:     127.0.0.1:36452 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:00:56 | INFO     | [4a158047-8c55-4144-a8e3-fd13319f57bb] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=75
+  0%|          | 0/1 [00:00<?, ?it/s]/workspace/CosyVoice/.venv/lib/python3.12/site-packages/torchaudio/_backend/utils.py:213: UserWarning: In 2.9, this function's implementation will be changed to use torchaudio.load_with_torchcodec` under the hood. Some parameters like ``normalize``, ``format``, ``buffer_size``, and ``backend`` will be ignored. We recommend that you port your code to rely directly on TorchCodec's decoder instead: https://docs.pytorch.org/torchcodec/stable/generated/torchcodec.decoders.AudioDecoder.html#torchcodec.decoders.AudioDecoder.
+  warnings.warn(
+2026-04-23 18:00:57 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Привет, это тест русского языка.
+/workspace/CosyVoice/cosyvoice/cli/model.py:103: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
+/workspace/CosyVoice/cosyvoice/cli/model.py:426: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(self.fp16):
+2026-04-23 18:01:02 | INFO     | yield speech len 1.4, rtf 3.6465246336800714
+2026-04-23 18:01:02 | INFO     | [4a158047-8c55-4144-a8e3-fd13319f57bb] first_chunk | bytes=67200 | audio_ms=1400 | latency_ms=6595 | rtf=4.71
+2026-04-23 18:01:03 | INFO     | yield speech len 0.92, rtf 0.4100773645483929
+100%|██████████| 1/1 [00:06<00:00,  6.98s/it]100%|██████████| 1/1 [00:06<00:00,  6.98s/it]
+2026-04-23 18:01:03 | INFO     | [4a158047-8c55-4144-a8e3-fd13319f57bb] stream_done | chunks=2 | bytes=111360 | total_ms=6985 | rtf=3.01
+2026-04-23 18:01:03 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_180056_250668_you_are_a_helpful_assistant_endofprompt_привет_э.wav
+INFO:     127.0.0.1:54824 - "POST /v1/audio/speech HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:44668 - "POST /tts-stream HTTP/1.1" 422 Unprocessable Entity
+INFO:     127.0.0.1:57452 - "POST /v1/audio/speech/wav HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:40910 - "POST /v1/audio/speech/wav HTTP/1.1" 500 Internal Server Error
+ERROR:    Exception in ASGI application
+  + Exception Group Traceback (most recent call last):
+  |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_utils.py", line 76, in collapse_excgroups
+  |     yield
+  |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 186, in __call__
+  |     async with anyio.create_task_group() as task_group:
+  |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/anyio/_backends/_asyncio.py", line 799, in __aexit__
+  |     raise BaseExceptionGroup(
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 396, in run_asgi
+    |     result = await app(  # type: ignore[func-returns-value]
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 70, in __call__
+    |     return await self.app(scope, receive, send)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1054, in __call__
+    |     await super().__call__(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/applications.py", line 113, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 187, in __call__
+    |     raise exc
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 165, in __call__
+    |     await self.app(scope, receive, _send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 185, in __call__
+    |     with collapse_excgroups():
+    |   File "/usr/lib/python3.12/contextlib.py", line 158, in __exit__
+    |     self.gen.throw(value)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_utils.py", line 82, in collapse_excgroups
+    |     raise exc
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 187, in __call__
+    |     response = await self.dispatch_func(request, call_next)
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/runtime/python/fastapi/server_cosyvoice3.py", line 501, in prometheus_http_middleware
+    |     response = await call_next(request)
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 163, in call_next
+    |     raise app_exc
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 149, in coro
+    |     await self.app(scope, receive_or_disconnect, send_no_error)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/cors.py", line 93, in __call__
+    |     await self.simple_response(scope, receive, send, request_headers=headers)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/cors.py", line 144, in simple_response
+    |     await self.app(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 62, in __call__
+    |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    |     raise exc
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 715, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 735, in app
+    |     await route.handle(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 288, in handle
+    |     await self.app(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 76, in app
+    |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    |     raise exc
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 73, in app
+    |     response = await f(request)
+    |                ^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 301, in app
+    |     raw_response = await run_endpoint_function(
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 212, in run_endpoint_function
+    |     return await dependant.call(**values)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/runtime/python/fastapi/server_cosyvoice3.py", line 695, in openai_compatible_tts_wav
+    |     prompt_audio = decode_base64_audio(req.ref_audio)
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/workspace/CosyVoice/runtime/python/fastapi/tts_engine.py", line 42, in decode_base64_audio
+    |     data = base64.b64decode(b64_str)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/usr/lib/python3.12/base64.py", line 88, in b64decode
+    |     return binascii.a2b_base64(s, strict_mode=validate)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    | binascii.Error: Incorrect padding
+    +------------------------------------
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 396, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 70, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/fastapi/applications.py", line 1054, in __call__
+    await super().__call__(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/applications.py", line 113, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 187, in __call__
+    raise exc
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py", line 165, in __call__
+    await self.app(scope, receive, _send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 185, in __call__
+    with collapse_excgroups():
+  File "/usr/lib/python3.12/contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_utils.py", line 82, in collapse_excgroups
+    raise exc
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 187, in __call__
+    response = await self.dispatch_func(request, call_next)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/runtime/python/fastapi/server_cosyvoice3.py", line 501, in prometheus_http_middleware
+    response = await call_next(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 163, in call_next
+    raise app_exc
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/base.py", line 149, in coro
+    await self.app(scope, receive_or_disconnect, send_no_error)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/cors.py", line 93, in __call__
+    await self.simple_response(scope, receive, send, request_headers=headers)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/cors.py", line 144, in simple_response
+    await self.app(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 62, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 715, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 735, in app
+    await route.handle(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 288, in handle
+    await self.app(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 76, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/starlette/routing.py", line 73, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 301, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/.venv/lib/python3.12/site-packages/fastapi/routing.py", line 212, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/runtime/python/fastapi/server_cosyvoice3.py", line 695, in openai_compatible_tts_wav
+    prompt_audio = decode_base64_audio(req.ref_audio)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/CosyVoice/runtime/python/fastapi/tts_engine.py", line 42, in decode_base64_audio
+    data = base64.b64decode(b64_str)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/base64.py", line 88, in b64decode
+    return binascii.a2b_base64(s, strict_mode=validate)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+binascii.Error: Incorrect padding
+INFO:     127.0.0.1:55726 - "POST /tts-stream HTTP/1.1" 422 Unprocessable Entity
+2026-04-23 18:05:41 | INFO     | [4957520d-8312-42fd-a9b1-79fbb10df175] /tts-stream | mode=zero_shot | lang=ru | speaker=string | chars=60
+INFO:     127.0.0.1:55844 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:05:41 | INFO     | [4957520d-8312-42fd-a9b1-79fbb10df175] stream_start | mode=zero_shot | lang=ru | speaker=string | chars=60
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:05:42 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Привет, это тест.
+2026-04-23 18:05:43 | INFO     | yield speech len 0.64, rtf 1.2455709278583527
+2026-04-23 18:05:43 | INFO     | [4957520d-8312-42fd-a9b1-79fbb10df175] first_chunk | bytes=30720 | audio_ms=640 | latency_ms=1917 | rtf=3.00
+100%|██████████| 1/1 [00:01<00:00,  1.93s/it]100%|██████████| 1/1 [00:01<00:00,  1.93s/it]
+2026-04-23 18:05:43 | INFO     | [4957520d-8312-42fd-a9b1-79fbb10df175] stream_done | chunks=1 | bytes=30720 | total_ms=1930 | rtf=3.02
+2026-04-23 18:05:43 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_180541_691186_you_are_a_helpful_assistant_endofprompt_привет_э.wav
+2026-04-23 18:14:02 | INFO     | [c06aced2-f5d1-4d03-8c9d-99f254726947] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=215
+INFO:     127.0.0.1:58796 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:02 | INFO     | [c06aced2-f5d1-4d03-8c9d-99f254726947] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=215
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:03 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Я регулярно плачу за ваши услуги без задержек, но последний счёт вызвал у меня такое недоумение, что я готов плачу от бессилия, ведь сумма не соответствует нашему договору.
+2026-04-23 18:14:05 | INFO     | yield speech len 2.4, rtf 0.7857829332351685
+2026-04-23 18:14:05 | INFO     | [c06aced2-f5d1-4d03-8c9d-99f254726947] first_chunk | bytes=115200 | audio_ms=2400 | latency_ms=3015 | rtf=1.26
+2026-04-23 18:14:07 | INFO     | yield speech len 4.0, rtf 0.5448607802391052
+2026-04-23 18:14:09 | INFO     | yield speech len 4.2, rtf 0.47232491629464285
+100%|██████████| 1/1 [00:07<00:00,  7.19s/it]100%|██████████| 1/1 [00:07<00:00,  7.19s/it]
+2026-04-23 18:14:09 | INFO     | [c06aced2-f5d1-4d03-8c9d-99f254726947] stream_done | chunks=3 | bytes=508800 | total_ms=7194 | rtf=0.68
+2026-04-23 18:14:09 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181402_230148_you_are_a_helpful_assistant_endofprompt_я_регуля.wav
+2026-04-23 18:14:09 | INFO     | [6dcdbbc0-aa15-4f0a-92f4-f72e8817b1df] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:38384 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:09 | INFO     | [6dcdbbc0-aa15-4f0a-92f4-f72e8817b1df] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=217
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:10 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Наш специалист приедет и починит замок вашей входной двери уже завтра, а в выходные вы можете отдохнуть и посетить замок, который мы рекомендуем в нашем туристическом пакете.
+2026-04-23 18:14:13 | INFO     | yield speech len 4.4, rtf 0.6622122634540905
+2026-04-23 18:14:13 | INFO     | [6dcdbbc0-aa15-4f0a-92f4-f72e8817b1df] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=4049 | rtf=0.92
+2026-04-23 18:14:15 | INFO     | yield speech len 4.0, rtf 0.5319597721099854
+2026-04-23 18:14:16 | INFO     | yield speech len 2.44, rtf 0.44198700639068106
+100%|██████████| 1/1 [00:07<00:00,  7.27s/it]100%|██████████| 1/1 [00:07<00:00,  7.27s/it]
+2026-04-23 18:14:16 | INFO     | [6dcdbbc0-aa15-4f0a-92f4-f72e8817b1df] stream_done | chunks=3 | bytes=520320 | total_ms=7270 | rtf=0.67
+2026-04-23 18:14:16 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181409_467578_you_are_a_helpful_assistant_endofprompt_наш_спец.wav
+2026-04-23 18:14:16 | INFO     | [b6a05458-9324-488a-beb1-2b07c6675f0d] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=210
+INFO:     127.0.0.1:38392 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:16 | INFO     | [b6a05458-9324-488a-beb1-2b07c6675f0d] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=210
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:17 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Ваш брак с нашим банком продолжается уже десять лет, и мы ценим это партнёрство, но к сожалению, последняя партия карт оказалась брак, поэтому мы заменим их бесплатно.
+2026-04-23 18:14:20 | INFO     | yield speech len 4.4, rtf 0.6486782702532681
+2026-04-23 18:14:20 | INFO     | [b6a05458-9324-488a-beb1-2b07c6675f0d] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3991 | rtf=0.91
+2026-04-23 18:14:22 | INFO     | yield speech len 4.0, rtf 0.5363849997520447
+2026-04-23 18:14:24 | INFO     | yield speech len 3.92, rtf 0.45480709903094235
+100%|██████████| 1/1 [00:07<00:00,  7.93s/it]100%|██████████| 1/1 [00:07<00:00,  7.93s/it]
+2026-04-23 18:14:24 | INFO     | [b6a05458-9324-488a-beb1-2b07c6675f0d] stream_done | chunks=3 | bytes=591360 | total_ms=7934 | rtf=0.64
+2026-04-23 18:14:24 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181416_784488_you_are_a_helpful_assistant_endofprompt_ваш_брак.wav
+2026-04-23 18:14:24 | INFO     | [29738552-b97f-4a9d-be62-79f8d488fdcf] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=200
+INFO:     127.0.0.1:34310 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:24 | INFO     | [29738552-b97f-4a9d-be62-79f8d488fdcf] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=200
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:25 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Для приготовления блюда по нашему рецепту вам нужна мука тонкого помола, а не мука от бесконечных звонков в колл-центр, где вас держат в ожидании более часа.
+2026-04-23 18:14:28 | INFO     | yield speech len 4.4, rtf 0.6475994803688743
+2026-04-23 18:14:28 | INFO     | [29738552-b97f-4a9d-be62-79f8d488fdcf] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3976 | rtf=0.90
+2026-04-23 18:14:30 | INFO     | yield speech len 4.0, rtf 0.5375853180885315
+2026-04-23 18:14:31 | INFO     | yield speech len 1.8, rtf 0.4318935341305203
+100%|██████████| 1/1 [00:06<00:00,  6.92s/it]100%|██████████| 1/1 [00:06<00:00,  6.92s/it]
+2026-04-23 18:14:31 | INFO     | [29738552-b97f-4a9d-be62-79f8d488fdcf] stream_done | chunks=3 | bytes=489600 | total_ms=6919 | rtf=0.68
+2026-04-23 18:14:31 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181424_767637_you_are_a_helpful_assistant_endofprompt_для_приг.wav
+2026-04-23 18:14:31 | INFO     | [0fb0cc8a-4732-43e3-a166-cf6e49c5ff8f] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=199
+INFO:     127.0.0.1:39574 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:31 | INFO     | [0fb0cc8a-4732-43e3-a166-cf6e49c5ff8f] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=199
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:32 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Мы отправили вам ключ для входа в личный кабинет на email, приложили ключ для регулировки оборудования, и дали ключ к пониманию вашей проблемы в инструкции.
+2026-04-23 18:14:35 | INFO     | yield speech len 4.4, rtf 0.6477799740704623
+2026-04-23 18:14:35 | INFO     | [0fb0cc8a-4732-43e3-a166-cf6e49c5ff8f] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3974 | rtf=0.90
+2026-04-23 18:14:37 | INFO     | yield speech len 4.0, rtf 0.5599893927574158
+2026-04-23 18:14:38 | INFO     | yield speech len 2.04, rtf 0.4242989362454882
+100%|██████████| 1/1 [00:07<00:00,  7.09s/it]100%|██████████| 1/1 [00:07<00:00,  7.09s/it]
+2026-04-23 18:14:38 | INFO     | [0fb0cc8a-4732-43e3-a166-cf6e49c5ff8f] stream_done | chunks=3 | bytes=501120 | total_ms=7094 | rtf=0.68
+2026-04-23 18:14:38 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181431_742069_you_are_a_helpful_assistant_endofprompt_мы_отпра.wav
+2026-04-23 18:14:38 | INFO     | [7cf26a93-609a-472d-aabe-ec71d1eb6677] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=184
+INFO:     127.0.0.1:39584 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:38 | INFO     | [7cf26a93-609a-472d-aabe-ec71d1eb6677] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=184
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:40 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Возьмите ручку и запишите номер заявки, а если у вас сломалась ручка на двери балкона, сообщите нам, и мы отправим мастера вместе с курьером.
+2026-04-23 18:14:42 | INFO     | yield speech len 4.4, rtf 0.639255480332808
+2026-04-23 18:14:42 | INFO     | [7cf26a93-609a-472d-aabe-ec71d1eb6677] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3935 | rtf=0.89
+2026-04-23 18:14:44 | INFO     | yield speech len 4.0, rtf 0.5310508608818054
+2026-04-23 18:14:45 | INFO     | yield speech len 1.92, rtf 0.5072960009177526
+100%|██████████| 1/1 [00:07<00:00,  7.05s/it]100%|██████████| 1/1 [00:07<00:00,  7.05s/it]
+2026-04-23 18:14:45 | INFO     | [7cf26a93-609a-472d-aabe-ec71d1eb6677] stream_done | chunks=3 | bytes=495360 | total_ms=7048 | rtf=0.68
+2026-04-23 18:14:45 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181438_885680_you_are_a_helpful_assistant_endofprompt_возьмите.wav
+2026-04-23 18:14:45 | INFO     | [160d43fa-5f99-4977-bbd8-6bb25eb7d215] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=195
+INFO:     127.0.0.1:42762 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:45 | INFO     | [160d43fa-5f99-4977-bbd8-6bb25eb7d215] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=195
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:47 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Проверьте каждый лист договора перед подписанием, ведь даже один упавший лист осенью меняет пейзаж, так и одна ошибка в документе меняет условия сделки.
+2026-04-23 18:14:50 | INFO     | yield speech len 4.4, rtf 0.669927488673817
+2026-04-23 18:14:50 | INFO     | [160d43fa-5f99-4977-bbd8-6bb25eb7d215] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=4071 | rtf=0.93
+2026-04-23 18:14:52 | INFO     | yield speech len 4.0, rtf 0.5343834757804871
+2026-04-23 18:14:53 | INFO     | yield speech len 2.76, rtf 0.45818703761999163
+100%|██████████| 1/1 [00:07<00:00,  7.49s/it]100%|██████████| 1/1 [00:07<00:00,  7.49s/it]
+2026-04-23 18:14:53 | INFO     | [160d43fa-5f99-4977-bbd8-6bb25eb7d215] stream_done | chunks=3 | bytes=535680 | total_ms=7488 | rtf=0.67
+2026-04-23 18:14:53 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181445_978791_you_are_a_helpful_assistant_endofprompt_проверьт.wav
+2026-04-23 18:14:53 | INFO     | [43dfb540-c8e4-4703-ac4f-80a4627a39e1] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=180
+INFO:     127.0.0.1:37290 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:53 | INFO     | [43dfb540-c8e4-4703-ac4f-80a4627a39e1] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=180
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:14:54 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Мы ценим, что вы остаетесь с нами, ведь каждый клиент — свет в окне нашего офиса, и мы хотим, чтобы свет вашей лояльности никогда не гас.
+2026-04-23 18:14:57 | INFO     | yield speech len 4.4, rtf 0.6399602781642566
+2026-04-23 18:14:57 | INFO     | [43dfb540-c8e4-4703-ac4f-80a4627a39e1] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3973 | rtf=0.90
+2026-04-23 18:14:59 | INFO     | yield speech len 4.0, rtf 0.49160468578338623
+2026-04-23 18:14:59 | INFO     | yield speech len 0.64, rtf 0.5485329777002335
+100%|██████████| 1/1 [00:06<00:00,  6.30s/it]100%|██████████| 1/1 [00:06<00:00,  6.30s/it]
+2026-04-23 18:14:59 | INFO     | [43dfb540-c8e4-4703-ac4f-80a4627a39e1] stream_done | chunks=3 | bytes=433920 | total_ms=6305 | rtf=0.70
+2026-04-23 18:14:59 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181453_518077_you_are_a_helpful_assistant_endofprompt_мы_ценим.wav
+2026-04-23 18:14:59 | INFO     | [3016c702-51b9-45d6-860c-a9a7667989ac] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=176
+INFO:     127.0.0.1:42418 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:14:59 | INFO     | [3016c702-51b9-45d6-860c-a9a7667989ac] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=176
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:15:01 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Дорога к решению вашего вопроса оказалась долгой, но теперь, когда проблема устранена, наша поддержка вам дорога, как никогда раньше.
+2026-04-23 18:15:03 | INFO     | yield speech len 4.4, rtf 0.6378424709493463
+2026-04-23 18:15:03 | INFO     | [3016c702-51b9-45d6-860c-a9a7667989ac] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=4033 | rtf=0.92
+2026-04-23 18:15:05 | INFO     | yield speech len 4.16, rtf 0.4692555046998537
+100%|██████████| 1/1 [00:05<00:00,  6.00s/it]100%|██████████| 1/1 [00:05<00:00,  6.00s/it]
+2026-04-23 18:15:05 | INFO     | [3016c702-51b9-45d6-860c-a9a7667989ac] stream_done | chunks=2 | bytes=410880 | total_ms=5999 | rtf=0.70
+2026-04-23 18:15:05 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181459_870517_you_are_a_helpful_assistant_endofprompt_дорога_к.wav
+2026-04-23 18:15:05 | INFO     | [a9849ac1-f595-4bcc-97b2-1b1440acbdbb] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=200
+INFO:     127.0.0.1:42420 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:15:05 | INFO     | [a9849ac1-f595-4bcc-97b2-1b1440acbdbb] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=200
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:15:07 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Если батарейка в вашем устройстве села, вставьте новую батарейку, следуя инструкции, а если ваш садовый участок зарос, вам понадобится коса для уборки травы.
+2026-04-23 18:15:09 | INFO     | yield speech len 4.4, rtf 0.6457347219640558
+2026-04-23 18:15:09 | INFO     | [a9849ac1-f595-4bcc-97b2-1b1440acbdbb] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3964 | rtf=0.90
+2026-04-23 18:15:12 | INFO     | yield speech len 4.0, rtf 0.5638955235481262
+2026-04-23 18:15:13 | INFO     | yield speech len 2.96, rtf 0.4647133318153588
+100%|██████████| 1/1 [00:07<00:00,  7.61s/it]100%|██████████| 1/1 [00:07<00:00,  7.61s/it]
+2026-04-23 18:15:13 | INFO     | [a9849ac1-f595-4bcc-97b2-1b1440acbdbb] stream_done | chunks=3 | bytes=545280 | total_ms=7610 | rtf=0.67
+2026-04-23 18:15:13 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181505_949619_you_are_a_helpful_assistant_endofprompt_если_бат.wav
+2026-04-23 18:18:42 | INFO     | [e6759dca-55d1-41f7-ac34-e483cf659907] /tts-stream | mode=zero_shot | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:59484 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:18:42 | INFO     | [e6759dca-55d1-41f7-ac34-e483cf659907] stream_start | mode=zero_shot | lang=ru | speaker=None | chars=217
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:18:43 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Я регулярно плачу за ваши услуги без задержек, но последний счёт вызвал у меня такое недоумение, что я готов плакать от бессилия, ведь сумма не соответствует нашему договору.
+2026-04-23 18:18:46 | INFO     | yield speech len 4.4, rtf 0.6458825414830988
+2026-04-23 18:18:46 | INFO     | [e6759dca-55d1-41f7-ac34-e483cf659907] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=4384 | rtf=1.00
+2026-04-23 18:18:48 | INFO     | yield speech len 3.36, rtf 0.4983559250831604
+100%|██████████| 1/1 [00:06<00:00,  6.08s/it]100%|██████████| 1/1 [00:06<00:00,  6.08s/it]
+2026-04-23 18:18:48 | INFO     | [e6759dca-55d1-41f7-ac34-e483cf659907] stream_done | chunks=2 | bytes=372480 | total_ms=6091 | rtf=0.78
+2026-04-23 18:18:48 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181842_280083_you_are_a_helpful_assistant_endofprompt_я_регуля.wav
+2026-04-23 18:18:48 | INFO     | [c937a78f-e8b3-4635-9f9b-e4f946b51010] /tts-stream | mode=zero_shot | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:59498 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:18:48 | INFO     | [c937a78f-e8b3-4635-9f9b-e4f946b51010] stream_start | mode=zero_shot | lang=ru | speaker=None | chars=217
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:18:49 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Наш специалист приедет и починит замок вашей входной двери уже завтра, а в выходные вы можете отдохнуть и посетить замок, который мы рекомендуем в нашем туристическом пакете.
+2026-04-23 18:18:52 | INFO     | yield speech len 4.4, rtf 0.6423542174425991
+2026-04-23 18:18:52 | INFO     | [c937a78f-e8b3-4635-9f9b-e4f946b51010] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3954 | rtf=0.90
+2026-04-23 18:18:54 | INFO     | yield speech len 4.0, rtf 0.5581737160682678
+2026-04-23 18:18:56 | INFO     | yield speech len 3.72, rtf 0.47847308138365385
+100%|██████████| 1/1 [00:07<00:00,  8.00s/it]100%|██████████| 1/1 [00:08<00:00,  8.01s/it]
+2026-04-23 18:18:56 | INFO     | [c937a78f-e8b3-4635-9f9b-e4f946b51010] stream_done | chunks=3 | bytes=581760 | total_ms=8038 | rtf=0.66
+2026-04-23 18:18:56 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181848_431758_you_are_a_helpful_assistant_endofprompt_наш_спец.wav
+2026-04-23 18:18:56 | INFO     | [95dac2d0-8408-444e-ba97-8b9ed39cd4e2] /tts-stream | mode=zero_shot | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:49522 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:18:56 | INFO     | [95dac2d0-8408-444e-ba97-8b9ed39cd4e2] stream_start | mode=zero_shot | lang=ru | speaker=None | chars=217
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:18:57 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Ваш брак с нашим банком продолжается уже десять лет, и мы ценим это партнёрство, но к сожалению, последняя партия карт оказалась бракованной, поэтому мы заменим их бесплатно.
+2026-04-23 18:19:00 | INFO     | yield speech len 4.4, rtf 0.6851538202979347
+2026-04-23 18:19:00 | INFO     | [95dac2d0-8408-444e-ba97-8b9ed39cd4e2] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=4147 | rtf=0.94
+2026-04-23 18:19:57 | INFO     | [2436e740-f80d-4b6e-8905-8ac93def96a3] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:58922 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:19:57 | INFO     | [2436e740-f80d-4b6e-8905-8ac93def96a3] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=217
+
+  0%|          | 0/1 [00:00<?, ?it/s][A2026-04-23 18:19:58 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Я регулярно плачу за ваши услуги без задержек, но последний счёт вызвал у меня такое недоумение, что я готов плакать от бессилия, ведь сумма не соответствует нашему договору.
+  0%|          | 0/1 [01:04<?, ?it/s]
+2026-04-23 18:20:00 | INFO     | [95dac2d0-8408-444e-ba97-8b9ed39cd4e2] stream_done | chunks=1 | bytes=211200 | total_ms=64366 | rtf=14.63
+2026-04-23 18:20:00 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181856_608879_you_are_a_helpful_assistant_endofprompt_ваш_брак.wav
+2026-04-23 18:20:01 | INFO     | yield speech len 4.4, rtf 0.6240119175477461
+2026-04-23 18:20:01 | INFO     | [2436e740-f80d-4b6e-8905-8ac93def96a3] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3874 | rtf=0.88
+2026-04-23 18:20:03 | INFO     | yield speech len 4.0, rtf 0.5561210513114929
+2026-04-23 18:20:04 | INFO     | yield speech len 1.72, rtf 0.4456977511561194
+
+100%|██████████| 1/1 [00:06<00:00,  6.88s/it][A100%|██████████| 1/1 [00:06<00:00,  6.88s/it]
+2026-04-23 18:20:04 | INFO     | [2436e740-f80d-4b6e-8905-8ac93def96a3] stream_done | chunks=3 | bytes=485760 | total_ms=6882 | rtf=0.68
+2026-04-23 18:20:04 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_181957_626096_you_are_a_helpful_assistant_endofprompt_я_регуля.wav
+2026-04-23 18:20:04 | INFO     | [27d2880b-385b-46f9-9664-0e8d0b38b929] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:37698 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:04 | INFO     | [27d2880b-385b-46f9-9664-0e8d0b38b929] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=217
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:05 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Наш специалист приедет и починит замок вашей входной двери уже завтра, а в выходные вы можете отдохнуть и посетить замок, который мы рекомендуем в нашем туристическом пакете.
+2026-04-23 18:20:08 | INFO     | yield speech len 4.4, rtf 0.6479586254466663
+2026-04-23 18:20:08 | INFO     | [27d2880b-385b-46f9-9664-0e8d0b38b929] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3974 | rtf=0.90
+2026-04-23 18:20:10 | INFO     | yield speech len 4.0, rtf 0.538514256477356
+2026-04-23 18:20:11 | INFO     | yield speech len 0.88, rtf 0.5188221281225031
+100%|██████████| 1/1 [00:06<00:00,  6.60s/it]100%|██████████| 1/1 [00:06<00:00,  6.60s/it]
+2026-04-23 18:20:11 | INFO     | [27d2880b-385b-46f9-9664-0e8d0b38b929] stream_done | chunks=3 | bytes=445440 | total_ms=6599 | rtf=0.71
+2026-04-23 18:20:11 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182004_547590_you_are_a_helpful_assistant_endofprompt_наш_спец.wav
+2026-04-23 18:20:11 | INFO     | [6a732b48-b278-4822-937a-e00122ca010c] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=217
+INFO:     127.0.0.1:53412 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:11 | INFO     | [6a732b48-b278-4822-937a-e00122ca010c] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=217
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:12 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Ваш брак с нашим банком продолжается уже десять лет, и мы ценим это партнёрство, но к сожалению, последняя партия карт оказалась бракованной, поэтому мы заменим их бесплатно.
+2026-04-23 18:20:15 | INFO     | yield speech len 4.4, rtf 0.649456652727994
+2026-04-23 18:20:15 | INFO     | [6a732b48-b278-4822-937a-e00122ca010c] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3982 | rtf=0.91
+2026-04-23 18:20:17 | INFO     | yield speech len 4.0, rtf 0.5090036392211914
+2026-04-23 18:20:18 | INFO     | yield speech len 3.6, rtf 0.43375525209638804
+100%|██████████| 1/1 [00:07<00:00,  7.59s/it]100%|██████████| 1/1 [00:07<00:00,  7.59s/it]
+2026-04-23 18:20:18 | INFO     | [6a732b48-b278-4822-937a-e00122ca010c] stream_done | chunks=3 | bytes=576000 | total_ms=7595 | rtf=0.63
+2026-04-23 18:20:18 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182011_183490_you_are_a_helpful_assistant_endofprompt_ваш_брак.wav
+2026-04-23 18:20:18 | INFO     | [86ddbc9d-c008-4230-bd18-6b206c4c2113] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=200
+INFO:     127.0.0.1:53424 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:18 | INFO     | [86ddbc9d-c008-4230-bd18-6b206c4c2113] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=200
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:19 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Для приготовления блюда по нашему рецепту вам нужна мука тонкого помола, а не мука от бесконечных звонков в колл-центр, где вас держат в ожидании более часа.
+2026-04-23 18:20:22 | INFO     | yield speech len 4.4, rtf 0.6493127887899225
+2026-04-23 18:20:22 | INFO     | [86ddbc9d-c008-4230-bd18-6b206c4c2113] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3980 | rtf=0.90
+2026-04-23 18:20:24 | INFO     | yield speech len 4.0, rtf 0.5127576589584351
+2026-04-23 18:20:26 | INFO     | yield speech len 2.84, rtf 0.4861186087971002
+100%|██████████| 1/1 [00:07<00:00,  7.42s/it]100%|██████████| 1/1 [00:07<00:00,  7.42s/it]
+2026-04-23 18:20:26 | INFO     | [86ddbc9d-c008-4230-bd18-6b206c4c2113] stream_done | chunks=3 | bytes=539520 | total_ms=7426 | rtf=0.66
+2026-04-23 18:20:26 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182018_827456_you_are_a_helpful_assistant_endofprompt_для_приг.wav
+2026-04-23 18:20:26 | INFO     | [a509eec7-d3ee-40ff-aa17-857bd7c8cea5] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=199
+INFO:     127.0.0.1:60458 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:26 | INFO     | [a509eec7-d3ee-40ff-aa17-857bd7c8cea5] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=199
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:27 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Мы отправили вам ключ для входа в личный кабинет на имеил, приложили ключ для регулировки оборудования, и дали ключ к пониманию вашей проблемы в инструкции.
+2026-04-23 18:20:30 | INFO     | yield speech len 4.4, rtf 0.644459995356473
+2026-04-23 18:20:30 | INFO     | [a509eec7-d3ee-40ff-aa17-857bd7c8cea5] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3958 | rtf=0.90
+2026-04-23 18:20:32 | INFO     | yield speech len 4.0, rtf 0.5315880179405212
+2026-04-23 18:20:33 | INFO     | yield speech len 1.52, rtf 0.4350933589433369
+100%|██████████| 1/1 [00:06<00:00,  6.76s/it]100%|██████████| 1/1 [00:06<00:00,  6.76s/it]
+2026-04-23 18:20:33 | INFO     | [a509eec7-d3ee-40ff-aa17-857bd7c8cea5] stream_done | chunks=3 | bytes=476160 | total_ms=6760 | rtf=0.68
+2026-04-23 18:20:33 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182026_296608_you_are_a_helpful_assistant_endofprompt_мы_отпра.wav
+2026-04-23 18:20:33 | INFO     | [fcc8a01d-03f6-4c23-9ddd-33c984bae2eb] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=184
+INFO:     127.0.0.1:45468 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:33 | INFO     | [fcc8a01d-03f6-4c23-9ddd-33c984bae2eb] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=184
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:34 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Возьмите ручку и запишите номер заявки, а если у вас сломалась ручка на двери балкона, сообщите нам, и мы отправим мастера вместе с курьером.
+2026-04-23 18:20:37 | INFO     | yield speech len 4.4, rtf 0.6432475826957008
+2026-04-23 18:20:37 | INFO     | [fcc8a01d-03f6-4c23-9ddd-33c984bae2eb] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3948 | rtf=0.90
+2026-04-23 18:20:39 | INFO     | yield speech len 4.0, rtf 0.538819432258606
+2026-04-23 18:20:39 | INFO     | yield speech len 1.28, rtf 0.43323878198862076
+100%|██████████| 1/1 [00:06<00:00,  6.67s/it]100%|██████████| 1/1 [00:06<00:00,  6.67s/it]
+2026-04-23 18:20:39 | INFO     | [fcc8a01d-03f6-4c23-9ddd-33c984bae2eb] stream_done | chunks=3 | bytes=464640 | total_ms=6673 | rtf=0.69
+2026-04-23 18:20:39 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182033_094391_you_are_a_helpful_assistant_endofprompt_возьмите.wav
+2026-04-23 18:20:39 | INFO     | [3da16ec1-0f83-4209-8644-bedd4bfb66e3] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=191
+INFO:     127.0.0.1:49562 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:39 | INFO     | [3da16ec1-0f83-4209-8644-bedd4bfb66e3] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=191
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:40 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Проверьте каждый лист договора перед подписанием, ведь даже один упавший лист осенью меняет пейзаж, и одна ошибка в документе меняет условия сделки.
+2026-04-23 18:20:43 | INFO     | yield speech len 4.4, rtf 0.6389752301302822
+2026-04-23 18:20:43 | INFO     | [3da16ec1-0f83-4209-8644-bedd4bfb66e3] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3933 | rtf=0.89
+2026-04-23 18:20:45 | INFO     | yield speech len 4.0, rtf 0.5328371524810791
+2026-04-23 18:20:46 | INFO     | yield speech len 0.88, rtf 0.3464211117137562
+100%|██████████| 1/1 [00:06<00:00,  6.38s/it]100%|██████████| 1/1 [00:06<00:00,  6.38s/it]
+2026-04-23 18:20:46 | INFO     | [3da16ec1-0f83-4209-8644-bedd4bfb66e3] stream_done | chunks=3 | bytes=445440 | total_ms=6383 | rtf=0.69
+2026-04-23 18:20:46 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182039_812845_you_are_a_helpful_assistant_endofprompt_проверьт.wav
+2026-04-23 18:20:46 | INFO     | [5ab49f76-ece1-45cb-a9ba-2ca8a3437159] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=181
+INFO:     127.0.0.1:49576 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:46 | INFO     | [5ab49f76-ece1-45cb-a9ba-2ca8a3437159] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=181
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:47 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Мы ценим, что вы остаетесь с нами, ведь каждый клиент — свет в окне нашего офиса, и мы хотим, чтобы свет вашей лояльности никогда не угас.
+2026-04-23 18:20:50 | INFO     | yield speech len 4.4, rtf 0.6477999687194824
+2026-04-23 18:20:50 | INFO     | [5ab49f76-ece1-45cb-a9ba-2ca8a3437159] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3965 | rtf=0.90
+2026-04-23 18:20:52 | INFO     | yield speech len 4.0, rtf 0.5377574563026428
+2026-04-23 18:20:53 | INFO     | yield speech len 2.4, rtf 0.4528481761614482
+100%|██████████| 1/1 [00:07<00:00,  7.22s/it]100%|██████████| 1/1 [00:07<00:00,  7.22s/it]
+2026-04-23 18:20:53 | INFO     | [5ab49f76-ece1-45cb-a9ba-2ca8a3437159] stream_done | chunks=3 | bytes=518400 | total_ms=7217 | rtf=0.67
+2026-04-23 18:20:53 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182046_237781_you_are_a_helpful_assistant_endofprompt_мы_ценим.wav
+2026-04-23 18:20:53 | INFO     | [76ae9f39-b289-4fa1-82c8-1a478b62de53] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=176
+INFO:     127.0.0.1:38778 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:53 | INFO     | [76ae9f39-b289-4fa1-82c8-1a478b62de53] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=176
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:20:54 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Дорога к решению вашего вопроса оказалась долгой, но теперь, когда проблема устранена, ваша поддержка нам дорога, как никогда раньше.
+2026-04-23 18:20:57 | INFO     | yield speech len 4.4, rtf 0.6476805968718095
+2026-04-23 18:20:57 | INFO     | [76ae9f39-b289-4fa1-82c8-1a478b62de53] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3987 | rtf=0.91
+2026-04-23 18:20:59 | INFO     | yield speech len 3.24, rtf 0.48713316152125224
+100%|██████████| 1/1 [00:05<00:00,  5.58s/it]100%|██████████| 1/1 [00:05<00:00,  5.58s/it]
+2026-04-23 18:20:59 | INFO     | [76ae9f39-b289-4fa1-82c8-1a478b62de53] stream_done | chunks=2 | bytes=366720 | total_ms=5579 | rtf=0.73
+2026-04-23 18:20:59 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182053_494070_you_are_a_helpful_assistant_endofprompt_дорога_к.wav
+2026-04-23 18:20:59 | INFO     | [1972fced-4e74-422d-9b8f-0bfffda01084] /tts-stream | mode=cross_lingual | lang=ru | speaker=None | chars=200
+INFO:     127.0.0.1:38780 - "POST /tts-stream HTTP/1.1" 200 OK
+2026-04-23 18:20:59 | INFO     | [1972fced-4e74-422d-9b8f-0bfffda01084] stream_start | mode=cross_lingual | lang=ru | speaker=None | chars=200
+  0%|          | 0/1 [00:00<?, ?it/s]2026-04-23 18:21:00 | INFO     | synthesis text You are a helpful assistant.<|endofprompt|>Если батарейка в вашем устройстве села, вставьте новую батарейку, следуя инструкции, а если ваш садовый участок зарос, вам понадобится коса для уборки травы.
+2026-04-23 18:21:03 | INFO     | yield speech len 4.4, rtf 0.6473561850461093
+2026-04-23 18:21:03 | INFO     | [1972fced-4e74-422d-9b8f-0bfffda01084] first_chunk | bytes=211200 | audio_ms=4400 | latency_ms=3970 | rtf=0.90
+2026-04-23 18:21:05 | INFO     | yield speech len 4.0, rtf 0.5297726392745972
+2026-04-23 18:21:05 | INFO     | yield speech len 1.16, rtf 0.39078634360740927
+100%|██████████| 1/1 [00:06<00:00,  6.56s/it]100%|██████████| 1/1 [00:06<00:00,  6.56s/it]
+2026-04-23 18:21:05 | INFO     | [1972fced-4e74-422d-9b8f-0bfffda01084] stream_done | chunks=3 | bytes=458880 | total_ms=6557 | rtf=0.69
+2026-04-23 18:21:05 | INFO     | Saved generated audio to /workspace/CosyVoice/generated/20260423_182059_117205_you_are_a_helpful_assistant_endofprompt_если_бат.wav
