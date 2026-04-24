@@ -168,18 +168,14 @@ class NativeEngine(TTSEngine):
 class VllmEngine(TTSEngine):
     def __init__(self, model_dir: str, fp16: bool = True, gpu_memory_utilization: float = 0.4, load_trt: bool = False, trt_concurrent: int = 1):
         from cosyvoice.cli.cosyvoice import CosyVoice3
-        try:
-            from vllm import ModelRegistry
-            from cosyvoice.vllm.cosyvoice2 import CosyVoice2ForCausalLM
-            if not ModelRegistry.is_registered("CosyVoice2ForCausalLM"):
-                ModelRegistry.register_model("CosyVoice2ForCausalLM", CosyVoice2ForCausalLM)
-        except (ImportError, AttributeError):
-            pass
         self.model_dir = model_dir
         self.fp16 = fp16
-        logger.info("Loading CosyVoice3 with vLLM from %s", model_dir)
-        self.cosyvoice = CosyVoice3(model_dir=model_dir, load_vllm=True, load_trt=load_trt, fp16=fp16, trt_concurrent=trt_concurrent)
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self._register_vllm_model()
         self._patch_vllm_config_arch(model_dir)
+        os.environ["COSYVOICE_GPU_MEM"] = str(gpu_memory_utilization)
+        logger.info("Loading CosyVoice3 with vLLM from %s (gpu_memory_utilization=%s)", model_dir, gpu_memory_utilization)
+        self.cosyvoice = CosyVoice3(model_dir=model_dir, load_vllm=True, load_trt=load_trt, fp16=fp16, trt_concurrent=trt_concurrent)
         self._mode_map = {
             "sft": self._infer_sft,
             "zero_shot": self._infer_zero_shot,
@@ -190,20 +186,42 @@ class VllmEngine(TTSEngine):
         logger.info("VllmEngine ready")
 
     @staticmethod
+    def _register_vllm_model():
+        from vllm import ModelRegistry
+
+        try:
+            registered = ModelRegistry.is_registered("CosyVoice2ForCausalLM")
+        except AttributeError:
+            registered = False
+
+        if registered:
+            return
+
+        try:
+            ModelRegistry.register_model(
+                "CosyVoice2ForCausalLM",
+                "cosyvoice.vllm.cosyvoice2:CosyVoice2ForCausalLM",
+            )
+        except ValueError as exc:
+            if "already" not in str(exc).lower() and "registered" not in str(exc).lower():
+                raise
+
+    @staticmethod
     def _patch_vllm_config_arch(model_dir: str):
         vllm_dir = os.path.join(model_dir, "vllm")
         config_path = os.path.join(vllm_dir, "config.json")
         if not os.path.exists(config_path):
             return
         import json
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
         archs = config.get("architectures", [])
         if archs == ["CosyVoice2ForCausalLM"]:
             return
         config["architectures"] = ["CosyVoice2ForCausalLM"]
-        with open(config_path, "w") as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
+            f.write("\n")
         logger.info("Patched vLLM config.json architectures to CosyVoice2ForCausalLM")
 
     def _infer_sft(self, text, speaker, speed, stream, **_):
@@ -245,7 +263,13 @@ class VllmEngine(TTSEngine):
         return self.cosyvoice.list_available_spks()
 
     def health_check(self) -> dict:
-        return {"status": "healthy", "backend": "vllm", "model_dir": self.model_dir, "fp16": self.fp16}
+        return {
+            "status": "healthy",
+            "backend": "vllm",
+            "model_dir": self.model_dir,
+            "fp16": self.fp16,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+        }
 
 
 class _Token2WavRunner:

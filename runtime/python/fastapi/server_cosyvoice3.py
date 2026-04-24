@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -25,7 +26,20 @@ from normalizer import create_normalizer_pipeline, NormalizerPipeline
 
 SAMPLE_RATE = 24000
 
+API_MODEL_NAME = "optimized_short"
+COSYVOICE_ROOT = Path(__file__).resolve().parents[3]
 COSYVOICE_MODEL_DIR = os.environ.get("COSYVOICE_MODEL_DIR", "")
+DEFAULT_LANG = os.environ.get("QWEN_DEFAULT_LANG", "ru").strip().lower() or "ru"
+DEFAULT_PROMPT_AUDIO = os.environ.get(
+    "COSYVOICE_DEFAULT_REF_AUDIO",
+    str(COSYVOICE_ROOT / "asset" / "qwen_ref_4.wav"),
+)
+COSYVOICE_COMPAT_MODE = os.environ.get("COSYVOICE_COMPAT_MODE", "cross_lingual").strip() or "cross_lingual"
+COSYVOICE_DEFAULT_SPEED_RAW = os.environ.get("COSYVOICE_DEFAULT_SPEED")
+COSYVOICE_DEFAULT_SPEED: float | None = None
+COSYVOICE_DEFAULT_SPEAKER = os.environ.get("COSYVOICE_DEFAULT_SPEAKER", "").strip() or None
+COSYVOICE_DEFAULT_INSTRUCT = os.environ.get("COSYVOICE_DEFAULT_INSTRUCT", "").strip() or None
+COSYVOICE_PROMPT_TEXT = os.environ.get("COSYVOICE_PROMPT_TEXT", "").strip() or None
 COSYVOICE_BACKEND = os.environ.get("COSYVOICE_BACKEND", "native").lower().strip()
 COSYVOICE_FP16 = os.environ.get("COSYVOICE_FP16", "true").lower() in ("1", "true", "yes")
 COSYVOICE_LOAD_TRT = os.environ.get("COSYVOICE_LOAD_TRT", "false").lower() in ("1", "true", "yes")
@@ -146,38 +160,98 @@ def normalize_http_path(req: Request) -> str:
 
 class TTSStreamRequest(BaseModel):
     text: str
-    mode: str = "zero_shot"
-    lang: str | None = None
+    lang: str | None = DEFAULT_LANG
+    language: str | None = None
     speaker: str | None = None
     instruct: str | None = None
-    prompt_text: str | None = None
-    speed: float = 1.0
+    sample_rate_hz: int | None = None
+    codec: str | None = None
+    bitrate: int | None = None
+    bandwidth_hz_est: float | None = None
+    snr_db: float | None = None
+    silence_ratio: float | None = None
+    rms_dbfs: float | None = None
+    packet_loss_pct: float | None = None
+    jitter_ms: float | None = None
+    barge_in: bool = False
 
 
 class OpenAISpeechRequest(BaseModel):
     input: str
-    model: str = "cosyvoice3"
+    model: str = API_MODEL_NAME
     voice: str | None = None
     response_format: str = "pcm"
     stream: bool = True
-    mode: str = "zero_shot"
+    lang: str = DEFAULT_LANG
     instruct: str | None = None
-    prompt_text: str | None = None
-    lang: str | None = None
-    ref_audio: str | None = None
-    speed: float = 1.0
 
 
 def resolve_lang(lang: str | None) -> str:
-    resolved = (lang or "auto").strip().lower()
+    resolved = (lang or DEFAULT_LANG).strip().lower()
     if resolved not in LANGUAGE_MAP:
         raise HTTPException(status_code=400, detail=f"Unsupported lang: {resolved}")
     return resolved
 
 
+def get_request_lang(req: TTSStreamRequest) -> str:
+    return req.lang or req.language or DEFAULT_LANG
+
+
 def short_text_for_log(text: str, max_len: int = MAX_LOG_TEXT) -> str:
     normalized = text.replace("\n", " ").strip()
     return normalized if len(normalized) <= max_len else normalized[:max_len] + "... [truncated]"
+
+
+_COSYVOICE3_PREFIX = "You are a helpful assistant.<|endofprompt|>"
+
+
+def ensure_cv3_prefix(text: str) -> str:
+    if "<|endofprompt|>" in text:
+        return text
+    return _COSYVOICE3_PREFIX + text
+
+
+def current_sample_rate() -> int:
+    if engine is None:
+        return SAMPLE_RATE
+    candidates = [engine]
+    for attr in ("cosyvoice", "t2w"):
+        value = getattr(engine, attr, None)
+        if value is not None:
+            candidates.append(value)
+    for candidate in candidates:
+        for attr in ("sample_rate", "sampling_rate"):
+            value = getattr(candidate, attr, None)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+    return SAMPLE_RATE
+
+
+def get_default_speed() -> float:
+    if COSYVOICE_DEFAULT_SPEED is None:
+        return 1.0
+    return COSYVOICE_DEFAULT_SPEED
+
+
+def get_compat_mode() -> str:
+    return COSYVOICE_COMPAT_MODE
+
+
+def get_request_speaker(speaker: str | None = None) -> str | None:
+    return (speaker or COSYVOICE_DEFAULT_SPEAKER or "").strip() or None
+
+
+def get_request_instruct(instruct: str | None = None) -> str | None:
+    return (instruct or COSYVOICE_DEFAULT_INSTRUCT or "").strip() or None
+
+
+def load_default_prompt_audio() -> str | None:
+    if not DEFAULT_PROMPT_AUDIO:
+        return None
+    path = Path(DEFAULT_PROMPT_AUDIO).expanduser()
+    if not path.is_file():
+        return None
+    return str(path)
 
 
 def slugify_text(text: str, max_len: int = 48) -> str:
@@ -199,7 +273,7 @@ def audio_save_worker() -> None:
     while True:
         path_str, pcm_bytes = audio_save_queue.get()
         try:
-            wav_bytes = pcm_bytes_to_wav_bytes(pcm_bytes)
+            wav_bytes = pcm_bytes_to_wav_bytes(pcm_bytes, sample_rate=current_sample_rate())
             Path(path_str).parent.mkdir(parents=True, exist_ok=True)
             with open(path_str, "wb") as f:
                 f.write(wav_bytes)
@@ -242,8 +316,8 @@ def generate_audio_stream(
     speaker: str | None,
     instruct: str | None,
     prompt_text: str | None,
-    prompt_audio: io.BytesIO | None,
-    source_audio: io.BytesIO | None,
+    prompt_audio: str | io.BytesIO | None,
+    source_audio: str | io.BytesIO | None,
     speed: float,
     req_id: str,
     endpoint: str,
@@ -279,7 +353,8 @@ def generate_audio_stream(
             saved_chunks.append(chunk)
             if first_chunk_at is None:
                 first_chunk_at = time.perf_counter()
-                first_chunk_audio_sec = len(chunk) / 2.0 / SAMPLE_RATE if chunk else 0.0
+                sample_rate = current_sample_rate()
+                first_chunk_audio_sec = len(chunk) / 2.0 / sample_rate if chunk else 0.0
                 first_chunk_latency_sec = first_chunk_at - started
                 first_chunk_rtf = (
                     first_chunk_latency_sec / first_chunk_audio_sec if first_chunk_audio_sec > 0 else 0.0
@@ -303,7 +378,8 @@ def generate_audio_stream(
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {exc}") from exc
     finally:
         elapsed = time.perf_counter() - started
-        audio_sec = total_bytes / 2.0 / SAMPLE_RATE if total_bytes else 0.0
+        sample_rate = current_sample_rate()
+        audio_sec = total_bytes / 2.0 / sample_rate if total_bytes else 0.0
         rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
         if saved_chunks and output_path:
             audio_save_queue.put((str(output_path), b"".join(saved_chunks)))
@@ -331,8 +407,8 @@ def fetch_audio_bytes(
     speaker: str | None,
     instruct: str | None,
     prompt_text: str | None,
-    prompt_audio: io.BytesIO | None,
-    source_audio: io.BytesIO | None,
+    prompt_audio: str | io.BytesIO | None,
+    source_audio: str | io.BytesIO | None,
     speed: float,
     req_id: str,
     endpoint: str,
@@ -376,7 +452,8 @@ def fetch_audio_bytes(
     if pcm_bytes:
         audio_save_queue.put((str(output_path), pcm_bytes))
 
-    audio_sec = len(pcm_bytes) / 2.0 / SAMPLE_RATE if pcm_bytes else 0.0
+    sample_rate = current_sample_rate()
+    audio_sec = len(pcm_bytes) / 2.0 / sample_rate if pcm_bytes else 0.0
     rtf = elapsed / audio_sec if audio_sec > 0 else 0.0
     if audio_sec > 0:
         TTS_AUDIO_DURATION_SEC.labels(endpoint, mode, lang, status).observe(audio_sec)
@@ -389,12 +466,25 @@ def fetch_audio_bytes(
 
 
 def validate_config() -> None:
+    global COSYVOICE_DEFAULT_SPEED
+
     if not COSYVOICE_MODEL_DIR:
         raise RuntimeError("COSYVOICE_MODEL_DIR is required")
     if not os.path.isdir(COSYVOICE_MODEL_DIR):
         raise RuntimeError(f"COSYVOICE_MODEL_DIR does not exist: {COSYVOICE_MODEL_DIR}")
     if COSYVOICE_BACKEND not in ("native", "vllm", "trtllm", "trtllm-serve"):
         raise RuntimeError(f"Unsupported COSYVOICE_BACKEND: {COSYVOICE_BACKEND}")
+    if COSYVOICE_COMPAT_MODE not in ("sft", "zero_shot", "cross_lingual", "instruct2", "vc"):
+        raise RuntimeError(f"Unsupported COSYVOICE_COMPAT_MODE: {COSYVOICE_COMPAT_MODE}")
+    raw_speed = os.environ.get("COSYVOICE_DEFAULT_SPEED", COSYVOICE_DEFAULT_SPEED_RAW or "")
+    if not raw_speed.strip():
+        raise RuntimeError("COSYVOICE_DEFAULT_SPEED is required")
+    try:
+        COSYVOICE_DEFAULT_SPEED = float(raw_speed)
+    except ValueError as exc:
+        raise RuntimeError("COSYVOICE_DEFAULT_SPEED must be a float") from exc
+    if COSYVOICE_DEFAULT_SPEED <= 0:
+        raise RuntimeError("COSYVOICE_DEFAULT_SPEED must be greater than 0")
     if COSYVOICE_BACKEND == "trtllm" and not COSYVOICE_TRT_ENGINE_DIR:
         raise RuntimeError("COSYVOICE_TRT_ENGINE_DIR is required for trtllm backend")
     if COSYVOICE_BACKEND == "trtllm-serve" and not COSYVOICE_TRT_SERVE_URL:
@@ -410,17 +500,23 @@ def run_warmup() -> None:
         return
 
     voices = engine.list_voices()
-    mode = "sft" if voices else "zero_shot"
-    speaker = voices[0] if voices else None
+    mode = get_compat_mode()
+    speaker = get_request_speaker(voices[0] if mode == "sft" and voices else None)
     text = "Hello, this is a warmup." if mode == "sft" else "Hello."
 
     logger.info("Running TTS warmup (mode=%s, speaker=%s)...", mode, speaker)
     try:
         if mode == "sft":
-            engine.warmup(text=text, mode=mode)
+            engine.warmup(text=text, mode=mode, speaker=speaker, speed=get_default_speed())
         else:
-            ref_audio_path = "/workspace/Qwen3-TTS-streaming-custom/tts/wavs/qwen/ref_4.wav"
-            engine.warmup(text=text, mode=mode, prompt_text="", prompt_audio=ref_audio_path, speed=1.0)
+            engine.warmup(
+                text=text,
+                mode=mode,
+                instruct=get_request_instruct(),
+                prompt_text=COSYVOICE_PROMPT_TEXT,
+                prompt_audio=load_default_prompt_audio(),
+                speed=get_default_speed(),
+            )
         warmup_completed = True
     except Exception:
         logger.exception("Warmup failed")
@@ -492,6 +588,54 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    client = request.client.host if request.client else "unknown"
+
+    body_info = exc.body
+
+    # Convert FormData to a plain dict for logging
+    if hasattr(body_info, "multi_items"):
+        form_dict = {}
+        for key, value in body_info.multi_items():
+            if hasattr(value, "filename"):
+                form_dict[key] = f"<UploadFile filename={value.filename}>"
+            else:
+                form_dict[key] = str(value)
+        body_info = form_dict
+
+    # If body is missing/empty, try to read raw body or parsed form
+    if not body_info:
+        try:
+            form = await request.form()
+            body_info = {}
+            for key, value in form.multi_items():
+                if hasattr(value, "filename"):
+                    body_info[key] = f"<UploadFile filename={value.filename}>"
+                else:
+                    body_info[key] = str(value)
+        except Exception:
+            try:
+                raw = await request.body()
+                body_info = raw.decode("utf-8", errors="replace") if raw else "<empty body>"
+            except Exception:
+                body_info = "<unable to read body>"
+
+    logger.warning(
+        "422 Validation Error | client=%s | path=%s | method=%s | content_type=%s | body=%s | errors=%s",
+        client,
+        request.url.path,
+        request.method,
+        request.headers.get("content-type", "unknown"),
+        body_info,
+        exc.errors(),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
+
+
 @app.middleware("http")
 async def prometheus_http_middleware(request: Request, call_next):
     started = time.perf_counter()
@@ -524,7 +668,8 @@ def root():
         "openai_wav": "/v1/audio/speech/wav",
         "voices": "/v1/audio/voices",
         "demo": "/demo",
-        "sample_rate": SAMPLE_RATE,
+        "sample_rate": current_sample_rate(),
+        "api_model": API_MODEL_NAME,
     }
 
 
@@ -538,7 +683,7 @@ def health():
         "normalizer_available": normalizer_pipeline is not None and any(
             n.supports_language(lang) for lang, normalizers in normalizer_pipeline._normalizers.items() for n in normalizers
         ) if normalizer_pipeline else False,
-        "sample_rate": SAMPLE_RATE,
+        "sample_rate": current_sample_rate(),
         "audio_format": "int16",
         "max_text_length": MAX_TEXT_LENGTH,
         "generated_audio_dir": str(GENERATED_AUDIO_DIR),
@@ -562,42 +707,40 @@ def list_voices():
 
 
 @app.post("/tts-stream")
-async def tts_stream(
-    text: str = Form(...),
-    mode: str = Form("zero_shot"),
-    lang: str | None = Form(None),
-    speaker: str | None = Form(None),
-    instruct: str | None = Form(None),
-    prompt_text: str | None = Form(None),
-    speed: float = Form(1.0),
-    prompt_audio: UploadFile | None = File(None),
-    source_audio: UploadFile | None = File(None),
-):
+async def tts_stream(req: TTSStreamRequest):
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
-    text = (text or "").strip()
+    text = (req.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Empty text")
     if len(text) > MAX_TEXT_LENGTH:
         raise HTTPException(status_code=400, detail=f"Text too long (max {MAX_TEXT_LENGTH} chars)")
 
     req_id = str(uuid.uuid4())
-    resolved_lang = resolve_lang(lang)
+    resolved_lang = resolve_lang(get_request_lang(req))
+    mode = get_compat_mode()
+    speaker = get_request_speaker(req.speaker)
+    instruct = get_request_instruct(req.instruct)
 
     if normalizer_pipeline:
         text = normalizer_pipeline.normalize(text, resolved_lang)
+    text = ensure_cv3_prefix(text)
 
-    prompt_audio_path = None
-    source_audio_path = None
-    if prompt_audio is not None:
-        prompt_audio_path = resolve_prompt_audio(prompt_audio_file=prompt_audio)
-    if source_audio is not None:
-        source_audio_path = resolve_prompt_audio(prompt_audio_file=source_audio)
+    prompt_audio_path = load_default_prompt_audio()
+    sample_rate = current_sample_rate()
 
     logger.info(
-        "[%s] /tts-stream | mode=%s | lang=%s | speaker=%s | chars=%s",
-        req_id, mode, resolved_lang, speaker, len(text),
+        "[%s] /tts-stream | mode=%s | request_lang=%s | lang=%s | speaker=%s | chars=%s | sr=%s | barge_in=%s | text=%s",
+        req_id,
+        mode,
+        get_request_lang(req),
+        resolved_lang,
+        speaker,
+        len(text),
+        req.sample_rate_hz,
+        bool(req.barge_in),
+        short_text_for_log(text),
     )
 
     return StreamingResponse(
@@ -607,16 +750,16 @@ async def tts_stream(
             lang=resolved_lang,
             speaker=speaker,
             instruct=instruct,
-            prompt_text=prompt_text,
+            prompt_text=COSYVOICE_PROMPT_TEXT,
             prompt_audio=prompt_audio_path,
-            source_audio=source_audio_path,
-            speed=speed,
+            source_audio=None,
+            speed=get_default_speed(),
             req_id=req_id,
             endpoint="tts_stream",
         ),
         media_type="application/octet-stream",
         headers={
-            "X-Sample-Rate": str(SAMPLE_RATE),
+            "X-Sample-Rate": str(sample_rate),
             "X-Audio-Format": "int16",
             "X-Channels": "1",
         },
@@ -633,6 +776,8 @@ async def openai_compatible_tts(req: OpenAISpeechRequest):
         raise HTTPException(status_code=400, detail="Empty input")
     if len(text) > MAX_TEXT_LENGTH:
         raise HTTPException(status_code=400, detail=f"Input too long (max {MAX_TEXT_LENGTH} chars)")
+    if req.model != API_MODEL_NAME:
+        raise HTTPException(status_code=400, detail=f"Only model={API_MODEL_NAME} is supported")
     if req.response_format.lower() != "pcm":
         raise HTTPException(status_code=400, detail="Only response_format=pcm is supported for streaming")
     if not req.stream:
@@ -640,36 +785,38 @@ async def openai_compatible_tts(req: OpenAISpeechRequest):
 
     req_id = str(uuid.uuid4())
     lang = resolve_lang(req.lang)
-
-    prompt_audio = None
-    if req.ref_audio:
-        prompt_audio = decode_base64_audio(req.ref_audio)
+    mode = get_compat_mode()
+    speaker = get_request_speaker(req.voice)
+    instruct = get_request_instruct(req.instruct)
+    prompt_audio = load_default_prompt_audio()
 
     if normalizer_pipeline:
         text = normalizer_pipeline.normalize(text, lang)
+    text = ensure_cv3_prefix(text)
+    sample_rate = current_sample_rate()
 
     logger.info(
         "[%s] /v1/audio/speech | mode=%s | lang=%s | voice=%s | chars=%s",
-        req_id, req.mode, lang, req.voice, len(text),
+        req_id, mode, lang, speaker, len(text),
     )
 
     return StreamingResponse(
         generate_audio_stream(
             text=text,
-            mode=req.mode,
+            mode=mode,
             lang=lang,
-            speaker=req.voice,
-            instruct=req.instruct,
-            prompt_text=req.prompt_text,
+            speaker=speaker,
+            instruct=instruct,
+            prompt_text=COSYVOICE_PROMPT_TEXT,
             prompt_audio=prompt_audio,
             source_audio=None,
-            speed=req.speed,
+            speed=get_default_speed(),
             req_id=req_id,
             endpoint="openai_speech",
         ),
         media_type="application/octet-stream",
         headers={
-            "X-Sample-Rate": str(SAMPLE_RATE),
+            "X-Sample-Rate": str(sample_rate),
             "X-Audio-Format": "int16",
             "X-Channels": "1",
         },
@@ -686,41 +833,45 @@ async def openai_compatible_tts_wav(req: OpenAISpeechRequest):
         raise HTTPException(status_code=400, detail="Empty input")
     if len(text) > MAX_TEXT_LENGTH:
         raise HTTPException(status_code=400, detail=f"Input too long (max {MAX_TEXT_LENGTH} chars)")
+    if req.model != API_MODEL_NAME:
+        raise HTTPException(status_code=400, detail=f"Only model={API_MODEL_NAME} is supported")
 
     req_id = str(uuid.uuid4())
     lang = resolve_lang(req.lang)
-
-    prompt_audio = None
-    if req.ref_audio:
-        prompt_audio = decode_base64_audio(req.ref_audio)
+    mode = get_compat_mode()
+    speaker = get_request_speaker(req.voice)
+    instruct = get_request_instruct(req.instruct)
+    prompt_audio = load_default_prompt_audio()
 
     if normalizer_pipeline:
         text = normalizer_pipeline.normalize(text, lang)
+    text = ensure_cv3_prefix(text)
+    sample_rate = current_sample_rate()
 
     logger.info(
         "[%s] /v1/audio/speech/wav | mode=%s | lang=%s | voice=%s | chars=%s",
-        req_id, req.mode, lang, req.voice, len(text),
+        req_id, mode, lang, speaker, len(text),
     )
 
     pcm_bytes = fetch_audio_bytes(
         text=text,
-        mode=req.mode,
+        mode=mode,
         lang=lang,
-        speaker=req.voice,
-        instruct=req.instruct,
-        prompt_text=req.prompt_text,
+        speaker=speaker,
+        instruct=instruct,
+        prompt_text=COSYVOICE_PROMPT_TEXT,
         prompt_audio=prompt_audio,
         source_audio=None,
-        speed=req.speed,
+        speed=get_default_speed(),
         req_id=req_id,
         endpoint="openai_speech_wav",
     )
-    wav_bytes = pcm_bytes_to_wav_bytes(pcm_bytes)
+    wav_bytes = pcm_bytes_to_wav_bytes(pcm_bytes, sample_rate=sample_rate)
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
         headers={
-            "X-Sample-Rate": str(SAMPLE_RATE),
+            "X-Sample-Rate": str(sample_rate),
             "X-Audio-Format": "wav",
             "X-Channels": "1",
         },
@@ -751,13 +902,7 @@ def demo():
   <body>
     <h1>CosyVoice3 TTS</h1>
     <div class="row">
-      <select id="mode">
-        <option value="zero_shot">Zero Shot</option>
-        <option value="sft">SFT</option>
-        <option value="cross_lingual">Cross Lingual</option>
-        <option value="instruct2">Instruct2</option>
-      </select>
-      <input id="speaker" placeholder="Speaker ID (sft mode)" />
+      <input id="speaker" placeholder="Speaker ID" />
     </div>
     <textarea id="text">Hello, this is a test of the CosyVoice3 text to speech system.</textarea>
     <button id="go">Synthesize</button>
@@ -770,12 +915,14 @@ def demo():
         button.textContent = "Synthesizing...";
         player.removeAttribute("src");
         try {
-          const formData = new FormData();
-          formData.append("text", document.getElementById("text").value);
-          formData.append("mode", document.getElementById("mode").value);
+          const payload = { text: document.getElementById("text").value };
           const speaker = document.getElementById("speaker").value;
-          if (speaker) formData.append("speaker", speaker);
-          const response = await fetch("/tts-stream", { method: "POST", body: formData });
+          if (speaker) payload.speaker = speaker;
+          const response = await fetch("/tts-stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
           if (!response.ok) {
             alert(await response.text());
             return;

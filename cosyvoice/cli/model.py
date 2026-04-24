@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import json
 from typing import Generator
 import torch
 import numpy as np
@@ -24,6 +25,54 @@ import uuid
 from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
 from cosyvoice.utils.common import TrtContextWrapper
+
+
+def _register_cosyvoice2_vllm_model():
+    from vllm import ModelRegistry
+
+    try:
+        registered = ModelRegistry.is_registered("CosyVoice2ForCausalLM")
+    except AttributeError:
+        registered = False
+
+    if registered:
+        return
+
+    try:
+        ModelRegistry.register_model(
+            "CosyVoice2ForCausalLM",
+            "cosyvoice.vllm.cosyvoice2:CosyVoice2ForCausalLM",
+        )
+    except ValueError as exc:
+        if "already" not in str(exc).lower() and "registered" not in str(exc).lower():
+            raise
+
+
+def _ensure_cosyvoice2_vllm_config(model_dir):
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError("{} not found after vLLM export".format(config_path))
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    if config.get("architectures") == ["CosyVoice2ForCausalLM"]:
+        return
+
+    config["architectures"] = ["CosyVoice2ForCausalLM"]
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+
+
+def _get_vllm_gpu_memory_utilization(gpu_memory_utilization=None):
+    value = gpu_memory_utilization
+    if value is None:
+        value = os.environ.get("COSYVOICE_GPU_MEM", "0.2")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("COSYVOICE_GPU_MEM must be a float, got {!r}".format(value)) from exc
 
 
 class CosyVoiceModel:
@@ -278,13 +327,16 @@ class CosyVoice2Model(CosyVoiceModel):
         flow_encoder = torch.jit.load(flow_encoder_model, map_location=self.device)
         self.flow.encoder = flow_encoder
 
-    def load_vllm(self, model_dir):
+    def load_vllm(self, model_dir, gpu_memory_utilization=None):
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
+        _register_cosyvoice2_vllm_model()
+        _ensure_cosyvoice2_vllm_config(model_dir)
+        gpu_memory_utilization = _get_vllm_gpu_memory_utilization(gpu_memory_utilization)
         from vllm import EngineArgs, LLMEngine
         engine_args = EngineArgs(model=model_dir,
                                  skip_tokenizer_init=True,
                                  enable_prompt_embeds=True,
-                                 gpu_memory_utilization=0.2)
+                                 gpu_memory_utilization=gpu_memory_utilization)
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers

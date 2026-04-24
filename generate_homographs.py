@@ -1,12 +1,30 @@
-import requests
-import wave
 import os
+import wave
 
-host = "127.0.0.1"
-url = f"http://{host}:8000/tts-stream"
-ref_audio = "/workspace/Qwen3-TTS-streaming-custom/tts/wavs/qwen/ref_4.wav"
-output_dir = "/workspace/CosyVoice/generated_homographs"
+import requests
+
+host = os.environ.get("TTS_HOST", "127.0.0.1")
+port = os.environ.get("TTS_PORT", "8000")
+url = os.environ.get("TTS_URL", f"http://{host}:{port}/tts-stream")
+output_dir = os.environ.get("OUTPUT_DIR", "/workspace/CosyVoice/generated_homographs")
 os.makedirs(output_dir, exist_ok=True)
+
+
+def save_pcm_stream_as_wav(response, wav_path):
+    sample_rate = int(response.headers.get("X-Sample-Rate", "24000"))
+    total_bytes = 0
+
+    with wave.open(wav_path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                wav_file.writeframes(chunk)
+                total_bytes += len(chunk)
+
+    return total_bytes / 2 / sample_rate
 
 sentences = [
     "Я регулярно плачу за ваши услуги без задержек, но последний счёт вызвал у меня такое недоумение, что я готов плакать от бессилия, ведь сумма не соответствует нашему договору.",
@@ -23,32 +41,15 @@ sentences = [
 
 for idx, text in enumerate(sentences, 1):
     print(f"Generating {idx}/10...")
-    full_text = f"You are a helpful assistant.<|endofprompt|>{text}"
-    files = {"prompt_audio": open(ref_audio, "rb")}
-    data = {
-        "text": full_text,
-        "mode": "cross_lingual",
+    payload = {
+        "text": text,
         "lang": "ru",
-        "speed": "1.0",
     }
     try:
-        r = requests.post(url, data=data, files=files, timeout=300, stream=True)
+        r = requests.post(url, json=payload, timeout=300, stream=True)
         if r.status_code == 200:
-            raw_path = os.path.join(output_dir, f"homograph_{idx:02d}.raw")
             wav_path = os.path.join(output_dir, f"homograph_{idx:02d}.wav")
-            with open(raw_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            # convert raw int16 pcm to wav
-            with open(raw_path, "rb") as f:
-                pcm = f.read()
-            with wave.open(wav_path, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(24000)
-                w.writeframes(pcm)
-            duration = len(pcm) / 2 / 24000
+            duration = save_pcm_stream_as_wav(r, wav_path)
             print(f"  -> {wav_path} ({duration:.1f}s)")
         else:
             print(f"  -> FAILED: {r.status_code} {r.text[:200]}")

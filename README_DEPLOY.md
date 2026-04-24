@@ -56,6 +56,11 @@ EOF
 
 uv pip install --python .venv/bin/python --index-strategy unsafe-best-match \
   -r requirements_filtered.txt
+
+uv pip install --python .venv/bin/python \
+  vllm==0.11.0 transformers==4.57.1 numpy==1.26.4
+
+uv pip install --python .venv/bin/python -e ./vllm_cosyvoice_plugin
 ```
 
 If `openai-whisper==20231117` fails to build, install it separately:
@@ -88,21 +93,26 @@ cd "$(dirname "$0")"
 
 export PYTHONPATH="$(pwd):$(pwd)/third_party/Matcha-TTS:$(pwd)/runtime/python/fastapi"
 
-export COSYVOICE_MODEL_DIR="$(pwd)/pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512"
-export COSYVOICE_BACKEND="native"
-export COSYVOICE_FP16="true"
-export COSYVOICE_LOAD_TRT="false"
-export TTS_PORT="8000"
-export TTS_HOST="[IP_ADDRESS]"
-export TTS_WARMUP_ENABLED="false"
-export MAX_TEXT_LENGTH="5000"
-export ENABLE_TEXT_NORMALIZATION="true"
-export GENERATED_AUDIO_DIR="$(pwd)/generated"
+export COSYVOICE_MODEL_DIR="${COSYVOICE_MODEL_DIR:-$(pwd)/pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512}"
+export COSYVOICE_BACKEND="${COSYVOICE_BACKEND:-vllm}"
+export COSYVOICE_FP16="${COSYVOICE_FP16:-true}"
+export COSYVOICE_LOAD_TRT="${COSYVOICE_LOAD_TRT:-false}"
+export COSYVOICE_DEFAULT_SPEED="${COSYVOICE_DEFAULT_SPEED:-1.0}"
+export COSYVOICE_GPU_MEM="${COSYVOICE_GPU_MEM:-0.4}"
+export VLLM_PLUGINS="${VLLM_PLUGINS:-cosyvoice}"
+export TTS_PORT="${TTS_PORT:-8000}"
+export TTS_HOST="${TTS_HOST:-0.0.0.0}"
+export TTS_WARMUP_ENABLED="${TTS_WARMUP_ENABLED:-false}"
+export MAX_TEXT_LENGTH="${MAX_TEXT_LENGTH:-5000}"
+export ENABLE_TEXT_NORMALIZATION="${ENABLE_TEXT_NORMALIZATION:-true}"
+export GENERATED_AUDIO_DIR="${GENERATED_AUDIO_DIR:-$(pwd)/generated}"
 
 mkdir -p "$GENERATED_AUDIO_DIR"
 
 exec .venv/bin/python runtime/python/fastapi/server_cosyvoice3.py
 ```
+
+The checked-in launchers default to `COSYVOICE_BACKEND=vllm`, `COSYVOICE_DEFAULT_SPEED=1.0`, and `VLLM_PLUGINS=cosyvoice`; set these before launching to override them. `COSYVOICE_GPU_MEM` is passed to vLLM as `gpu_memory_utilization`.
 
 Run it:
 
