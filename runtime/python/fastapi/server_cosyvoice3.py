@@ -45,9 +45,10 @@ COSYVOICE_FP16 = os.environ.get("COSYVOICE_FP16", "true").lower() in ("1", "true
 COSYVOICE_LOAD_TRT = os.environ.get("COSYVOICE_LOAD_TRT", "false").lower() in ("1", "true", "yes")
 COSYVOICE_TRT_ENGINE_DIR = os.environ.get("COSYVOICE_TRT_ENGINE_DIR", "")
 COSYVOICE_TRT_SERVE_URL = os.environ.get("COSYVOICE_TRT_SERVE_URL", "")
+COSYVOICE_TRT_SERVE_MODEL_NAME = os.environ.get("COSYVOICE_TRT_SERVE_MODEL_NAME", "").strip()
 COSYVOICE_HF_MODEL_DIR = os.environ.get("COSYVOICE_HF_MODEL_DIR", "")
 COSYVOICE_GPU_MEM = float(os.environ.get("COSYVOICE_GPU_MEM", "0.4"))
-TTS_PORT = int(os.environ.get("TTS_PORT", "8000"))
+TTS_PORT = int(os.environ.get("TTS_PORT", "8003"))
 TTS_HOST = os.environ.get("TTS_HOST", "0.0.0.0")
 TTS_WARMUP_ENABLED = os.environ.get("TTS_WARMUP_ENABLED", "true").lower() in ("1", "true", "yes")
 MAX_TEXT_LENGTH = int(os.environ.get("MAX_TEXT_LENGTH", "5000"))
@@ -550,6 +551,8 @@ async def lifespan(app: FastAPI):
                 "hf_model_dir": COSYVOICE_HF_MODEL_DIR or None,
                 "enable_trt_flow": COSYVOICE_LOAD_TRT,
             }
+            if COSYVOICE_TRT_SERVE_MODEL_NAME:
+                engine_kwargs["model_name"] = COSYVOICE_TRT_SERVE_MODEL_NAME
 
         engine = create_engine(
             backend=COSYVOICE_BACKEND,

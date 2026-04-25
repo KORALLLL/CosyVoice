@@ -51,3 +51,16 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# Local runtime/debug artifacts
+*.log
+*.pid
+model.cache
+generated/
+generated_homographs*/
+*.manifest.jsonl
+
+# Local TensorRT-LLM runtime artifacts
+runtime/triton_trtllm/hf_cosyvoice3_llm/
+runtime/triton_trtllm/trt_engines_*/
+runtime/triton_trtllm/trt_weights_*/

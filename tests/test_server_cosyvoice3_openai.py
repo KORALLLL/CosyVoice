@@ -5,6 +5,7 @@ import importlib.util
 import io
 import os
 import sys
+import tempfile
 import types
 import unittest
 import wave
@@ -19,6 +20,14 @@ MODULE_PATH = (
     / "fastapi"
     / "server_cosyvoice3.py"
 )
+ENGINE_MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "runtime"
+    / "python"
+    / "fastapi"
+    / "tts_engine.py"
+)
+LONG_TEST_PCM = b"\x01\x00" * 2400
 
 
 def _pcm_bytes_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
@@ -193,6 +202,135 @@ def load_module():
     return module
 
 
+def load_tts_engine_module():
+    fake_transformers = types.ModuleType("transformers")
+    fake_httpx = types.ModuleType("httpx")
+    fake_torch = types.ModuleType("torch")
+    fake_numpy = types.ModuleType("numpy")
+
+    class FakeAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class FakeHttpClient:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    fake_transformers.AutoTokenizer = FakeAutoTokenizer
+    fake_httpx.Client = FakeHttpClient
+    fake_torch.Tensor = object
+    fake_torch.zeros = lambda *args, **kwargs: {"zeros": args, "kwargs": kwargs}
+    fake_torch.tensor = lambda value, *args, **kwargs: value
+    fake_torch.load = lambda *args, **kwargs: {}
+    fake_numpy.int16 = int
+    fake_numpy.ceil = lambda value: value
+
+    spec = importlib.util.spec_from_file_location(
+        "tts_engine_test_module",
+        ENGINE_MODULE_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None
+    assert spec.loader is not None
+    patched_modules = {
+        "transformers": fake_transformers,
+        "httpx": fake_httpx,
+        "torch": fake_torch,
+        "numpy": fake_numpy,
+    }
+    with mock.patch.dict(sys.modules, patched_modules):
+        spec.loader.exec_module(module)
+    return module
+
+
+class FakeToken2WavRunner:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.extracted_prompt_audio: bytes | None = None
+        self.stream_calls: list[dict] = []
+        self.full_calls: list[dict] = []
+        self.full_pcm = LONG_TEST_PCM
+
+    def extract_prompt_features(self, prompt_audio_bytes: bytes):
+        self.extracted_prompt_audio = prompt_audio_bytes
+        return {
+            "prompt_speech_tokens": [41, 42],
+            "prompt_mels": "prompt-mels",
+            "prompt_mels_lens": "prompt-mels-lens",
+            "spk_emb": "speaker-embedding",
+        }
+
+    def stream_token2wav(
+        self,
+        speech_token_ids,
+        prompt_speech_tokens,
+        prompt_mels,
+        prompt_mels_lens,
+        spk_emb,
+    ):
+        self.stream_calls.append(
+            {
+                "speech_token_ids": speech_token_ids,
+                "prompt_speech_tokens": prompt_speech_tokens,
+                "prompt_mels": prompt_mels,
+                "prompt_mels_lens": prompt_mels_lens,
+                "spk_emb": spk_emb,
+            }
+        )
+        yield b"stream-pcm"
+
+    def full_token2wav(
+        self,
+        speech_token_ids,
+        prompt_speech_tokens,
+        prompt_mels,
+        prompt_mels_lens,
+        spk_emb,
+    ):
+        self.full_calls.append(
+            {
+                "speech_token_ids": speech_token_ids,
+                "prompt_speech_tokens": prompt_speech_tokens,
+                "prompt_mels": prompt_mels,
+                "prompt_mels_lens": prompt_mels_lens,
+                "spk_emb": spk_emb,
+            }
+        )
+        return self.full_pcm
+
+
+class FakeServeResponse:
+    def __init__(self, status_code: int = 200, content: str = "<|s_7|><|s_8|>"):
+        self.status_code = status_code
+        self.content = content
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return {"choices": [{"message": {"content": self.content}}]}
+
+
+class FakeServeClient:
+    def __init__(self, content: str = "<|s_7|><|s_8|>", health_status: int = 200):
+        self.content = content
+        self.health_status = health_status
+        self.posts: list[dict] = []
+        self.gets: list[dict] = []
+
+    def post(self, url, json):
+        self.posts.append({"url": url, "json": json})
+        return FakeServeResponse(content=self.content)
+
+    def get(self, url, timeout):
+        self.gets.append({"url": url, "timeout": timeout})
+        return FakeServeResponse(status_code=self.health_status)
+
+
 class FakeEngine:
     def __init__(self, pcm: bytes = b"\x01\x00\x02\x00"):
         self.pcm = pcm
@@ -214,6 +352,231 @@ class FakeEngine:
 
     def health_check(self):
         return {"status": "healthy"}
+
+
+class TrtLlmServeEngineContractTests(unittest.TestCase):
+    def make_engine(self, content: str = "<|s_7|><|s_8|>", health_status: int = 200):
+        module = load_tts_engine_module()
+        fake_transformers = types.ModuleType("transformers")
+        fake_httpx = types.ModuleType("httpx")
+
+        class FakeAutoTokenizer:
+            @classmethod
+            def from_pretrained(cls, *_args, **_kwargs):
+                return cls()
+
+        fake_transformers.AutoTokenizer = FakeAutoTokenizer
+        fake_httpx.Client = lambda *args, **kwargs: FakeServeClient()
+        with mock.patch.object(module, "_Token2WavRunner", FakeToken2WavRunner):
+            with mock.patch.dict(sys.modules, {"transformers": fake_transformers, "httpx": fake_httpx}):
+                engine = module.TrtLlmServeEngine(
+                    model_dir="/models/cosyvoice3",
+                    serve_url="http://trtllm.test:8000/",
+                    model_name="configured-trt-model",
+                    hf_model_dir="/models/cosyvoice3/hf",
+                    timeout=12.5,
+                )
+        engine.http_client = FakeServeClient(content=content, health_status=health_status)
+        return engine
+
+    def test_prompt_audio_path_from_env_contract_is_accepted(self) -> None:
+        engine = self.make_engine()
+        with tempfile.NamedTemporaryFile(suffix=".wav") as prompt_audio:
+            prompt_audio.write(b"prompt-audio-from-env")
+            prompt_audio.flush()
+
+            pcm = engine.generate(
+                text="hello",
+                mode="cross_lingual",
+                prompt_audio=prompt_audio.name,
+            )
+
+        self.assertEqual(pcm, LONG_TEST_PCM)
+        self.assertEqual(engine.t2w.extracted_prompt_audio, b"prompt-audio-from-env")
+
+    def test_upstream_payload_uses_existing_config_not_request_params(self) -> None:
+        engine = self.make_engine()
+
+        pcm = engine.generate(
+            text="hello",
+            mode="cross_lingual",
+            prompt_audio=io.BytesIO(b"prompt-audio"),
+            model="request-model-must-not-leak",
+            temperature=0.01,
+            top_p=0.1,
+            speed=3.0,
+        )
+
+        self.assertEqual(pcm, LONG_TEST_PCM)
+        request = engine.http_client.posts[0]
+        self.assertEqual(request["url"], "http://trtllm.test:8000/v1/chat/completions")
+        self.assertEqual(request["json"]["model"], "configured-trt-model")
+        self.assertEqual(request["json"]["temperature"], 0.8)
+        self.assertEqual(request["json"]["top_p"], 0.95)
+        self.assertEqual(request["json"]["min_tokens"], 2)
+        self.assertEqual(request["json"]["max_tokens"], 20)
+        self.assertFalse(request["json"]["stream"])
+        self.assertNotIn("continue_final_message", request["json"])
+        self.assertNotIn("speed", request["json"])
+        self.assertNotIn("voice", request["json"])
+        self.assertNotIn("lang", request["json"])
+
+    def test_cross_lingual_does_not_leak_prompt_text_or_speech_tokens_to_llm(self) -> None:
+        engine = self.make_engine()
+
+        pcm = engine.generate(
+            text=f"{engine._COSYVOICE3_PREFIX}hello",
+            mode="cross_lingual",
+            prompt_text="reference prompt. ",
+            prompt_audio=io.BytesIO(b"prompt-audio"),
+        )
+
+        self.assertEqual(pcm, LONG_TEST_PCM)
+        messages = engine.http_client.posts[0]["json"]["messages"]
+        self.assertEqual(len(messages), 1)
+        content = messages[0]["content"]
+        self.assertEqual(content.count(engine._COSYVOICE3_PREFIX), 1)
+        self.assertTrue(content.startswith(engine._COSYVOICE3_PREFIX))
+        self.assertNotIn("reference prompt.", content)
+        self.assertEqual(content, f"{engine._COSYVOICE3_PREFIX}hello")
+
+    def test_zero_shot_still_conditions_llm_on_prompt_text_and_speech_tokens(self) -> None:
+        engine = self.make_engine()
+
+        pcm = engine.generate(
+            text="hello",
+            mode="zero_shot",
+            prompt_text="reference prompt. ",
+            prompt_audio=io.BytesIO(b"prompt-audio"),
+        )
+
+        self.assertEqual(pcm, LONG_TEST_PCM)
+        messages = engine.http_client.posts[0]["json"]["messages"]
+        self.assertEqual(messages[0]["content"], f"{engine._COSYVOICE3_PREFIX}reference prompt. hello")
+        self.assertEqual(messages[1], {"role": "assistant", "content": "<|s_41|><|s_42|>"})
+
+    def test_parses_contiguous_and_separated_speech_tokens(self) -> None:
+        cases = {
+            "contiguous": "<|s_7|><|s_8|><|s_9|>",
+            "separated": "<|s_7|> <|s_8|>\n<|s_9|>",
+            "stops_at_eos_marker": "<|s_7|><|s_8|><|eos1|><|s_99|> garbage <|s_100|>",
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                engine = self.make_engine(content=content)
+
+                pcm = engine.generate(
+                    text="hello",
+                    mode="cross_lingual",
+                    prompt_audio=io.BytesIO(b"prompt-audio"),
+                )
+
+                self.assertEqual(pcm, LONG_TEST_PCM)
+                expected_ids = [7, 8] if name == "stops_at_eos_marker" else [7, 8, 9]
+                self.assertEqual(engine.t2w.full_calls[0]["speech_token_ids"], expected_ids)
+
+    def test_raises_when_no_speech_tokens_are_returned(self) -> None:
+        engine = self.make_engine(content="plain text without speech tokens")
+
+        with self.assertRaisesRegex(RuntimeError, "generated no speech tokens"):
+            engine.generate(
+                text="hello",
+                mode="cross_lingual",
+                prompt_audio=io.BytesIO(b"prompt-audio"),
+            )
+        self.assertEqual(engine.t2w.full_calls, [])
+
+    def test_raises_when_trt_returns_fewer_tokens_than_requested_minimum(self) -> None:
+        engine = self.make_engine(content="<|s_7|><|s_8|>")
+
+        with self.assertRaisesRegex(RuntimeError, "too few speech tokens"):
+            engine.generate(
+                text="hello world",
+                mode="cross_lingual",
+                prompt_audio=io.BytesIO(b"prompt-audio"),
+            )
+        self.assertEqual(engine.t2w.full_calls, [])
+
+        request = engine.http_client.posts[0]["json"]
+        self.assertEqual(request["min_tokens"], 4)
+        self.assertEqual(request["max_tokens"], 40)
+
+    def test_raises_when_token2wav_returns_implausibly_short_pcm(self) -> None:
+        engine = self.make_engine(content="<|s_7|><|s_8|>")
+        engine.t2w.full_pcm = b"\x00\x00"
+
+        with self.assertRaisesRegex(RuntimeError, "too little PCM"):
+            engine.generate(
+                text="hello",
+                mode="cross_lingual",
+                prompt_audio=io.BytesIO(b"prompt-audio"),
+            )
+
+    def test_health_reports_trtllm_serve_status_from_models_endpoint(self) -> None:
+        healthy = self.make_engine(health_status=200)
+        unhealthy = self.make_engine(health_status=503)
+
+        self.assertEqual(
+            healthy.health_check(),
+            {
+                "status": "healthy",
+                "backend": "trtllm-serve",
+                "serve_url": "http://trtllm.test:8000",
+            },
+        )
+        self.assertEqual(healthy.http_client.gets[0]["url"], "http://trtllm.test:8000/v1/models")
+        self.assertEqual(healthy.http_client.gets[0]["timeout"], 5.0)
+        self.assertEqual(unhealthy.health_check()["status"], "error")
+
+
+class TrtLlmEngineContractTests(unittest.TestCase):
+    def test_prompt_audio_path_bytes_and_file_like_are_accepted(self) -> None:
+        module = load_tts_engine_module()
+
+        with tempfile.NamedTemporaryFile(suffix=".wav") as prompt_audio:
+            prompt_audio.write(b"path-audio")
+            prompt_audio.flush()
+
+            self.assertEqual(module.read_prompt_audio_bytes(prompt_audio.name), b"path-audio")
+
+        self.assertEqual(module.read_prompt_audio_bytes(b"bytes-audio"), b"bytes-audio")
+        self.assertEqual(module.read_prompt_audio_bytes(io.BytesIO(b"file-like-audio")), b"file-like-audio")
+
+    def test_tokenizer_loader_tries_mistral_regex_fix_then_falls_back(self) -> None:
+        module = load_tts_engine_module()
+        fake_transformers = types.ModuleType("transformers")
+        calls: list[dict] = []
+
+        class FakeAutoTokenizer:
+            @classmethod
+            def from_pretrained(cls, *_args, **kwargs):
+                calls.append(kwargs)
+                if kwargs.get("fix_mistral_regex"):
+                    raise TypeError("unsupported kwarg")
+                return cls()
+
+        fake_transformers.AutoTokenizer = FakeAutoTokenizer
+
+        with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
+            tokenizer = module.load_trt_tokenizer("/models/cosyvoice3/hf")
+
+        self.assertIsInstance(tokenizer, FakeAutoTokenizer)
+        self.assertEqual(calls[0]["fix_mistral_regex"], True)
+        self.assertEqual(calls[0]["trust_remote_code"], True)
+        self.assertEqual(calls[1], {"trust_remote_code": True})
+
+    def test_text_with_cosyvoice3_prefix_is_not_prefixed_again(self) -> None:
+        module = load_tts_engine_module()
+        engine = object.__new__(module.TrtLlmEngine)
+
+        chat = engine._build_chat(
+            text=f"{engine._COSYVOICE3_PREFIX}hello",
+            mode="cross_lingual",
+        )
+
+        content = chat[0]["content"]
+        self.assertEqual(content.count(engine._COSYVOICE3_PREFIX), 1)
+        self.assertEqual(content, f"{engine._COSYVOICE3_PREFIX}hello")
 
 
 class OpenAICompatibilityTests(unittest.TestCase):
@@ -289,6 +652,36 @@ class OpenAICompatibilityTests(unittest.TestCase):
                 module.validate_config()
 
         self.assertIn("COSYVOICE_DEFAULT_SPEED is required", str(ctx.exception))
+
+    def test_lifespan_passes_trtllm_serve_model_name_override(self) -> None:
+        module = load_module()
+        calls = []
+
+        def fake_create_engine(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return FakeEngine()
+
+        async def enter_lifespan():
+            cm = module.lifespan(None)
+            await cm.__aenter__()
+            await cm.__aexit__(None, None, None)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module.create_engine = fake_create_engine
+            module.COSYVOICE_MODEL_DIR = str(Path(__file__).resolve().parents[1])
+            module.COSYVOICE_BACKEND = "trtllm-serve"
+            module.COSYVOICE_TRT_SERVE_URL = "http://trtllm.test:8000"
+            module.COSYVOICE_TRT_SERVE_MODEL_NAME = "serve-env-model"
+            module.COSYVOICE_DEFAULT_SPEED_RAW = "1.0"
+            module.TTS_WARMUP_ENABLED = False
+            module.GENERATED_AUDIO_DIR = Path(tmpdir)
+            module.ensure_audio_save_worker = lambda: None
+
+            asyncio.run(enter_lifespan())
+
+        self.assertEqual(calls[0]["kwargs"]["backend"], "trtllm-serve")
+        self.assertEqual(calls[0]["kwargs"]["serve_url"], "http://trtllm.test:8000")
+        self.assertEqual(calls[0]["kwargs"]["model_name"], "serve-env-model")
 
     def test_wrong_model_is_rejected(self) -> None:
         module = load_module()

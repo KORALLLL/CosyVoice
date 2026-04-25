@@ -7,13 +7,25 @@ COSYVOICE_DEFAULT_SPEED="${COSYVOICE_DEFAULT_SPEED:-1.0}"
 VLLM_PLUGINS="${VLLM_PLUGINS:-cosyvoice}"
 COSYVOICE_TRT_ENGINE_DIR="${COSYVOICE_TRT_ENGINE_DIR:-}"
 COSYVOICE_TRT_SERVE_URL="${COSYVOICE_TRT_SERVE_URL:-}"
+COSYVOICE_TRT_SERVE_MODEL_NAME="${COSYVOICE_TRT_SERVE_MODEL_NAME:-}"
 COSYVOICE_HF_MODEL_DIR="${COSYVOICE_HF_MODEL_DIR:-}"
-TTS_PORT="${TTS_PORT:-8000}"
+TTS_PORT="${TTS_PORT:-8003}"
 TTS_HOST="${TTS_HOST:-0.0.0.0}"
+TRTLLM_SERVE_HOST="${TRTLLM_SERVE_HOST:-0.0.0.0}"
+TRTLLM_SERVE_PORT="${TRTLLM_SERVE_PORT:-8000}"
+TLLM_WORKER_USE_SINGLE_PROCESS="${TLLM_WORKER_USE_SINGLE_PROCESS:-1}"
 
 export COSYVOICE_BACKEND
 export COSYVOICE_DEFAULT_SPEED
+export COSYVOICE_MODEL_DIR
+export COSYVOICE_TRT_ENGINE_DIR
+export COSYVOICE_TRT_SERVE_URL
+export COSYVOICE_TRT_SERVE_MODEL_NAME
+export COSYVOICE_HF_MODEL_DIR
 export VLLM_PLUGINS
+export TTS_PORT
+export TTS_HOST
+export TLLM_WORKER_USE_SINGLE_PROCESS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_ENTRYPOINT="${SCRIPT_DIR}/server_cosyvoice3.py"
@@ -67,12 +79,18 @@ fi
 
 if [[ "${COSYVOICE_BACKEND}" == "trtllm-serve" ]]; then
     if [[ -z "${COSYVOICE_TRT_SERVE_URL}" ]]; then
-        echo "ERROR: COSYVOICE_TRT_SERVE_URL is required for trtllm-serve backend" >&2
-        exit 1
+        COSYVOICE_TRT_SERVE_URL="http://127.0.0.1:${TRTLLM_SERVE_PORT}"
+        export COSYVOICE_TRT_SERVE_URL
     fi
 
     # Check if trtllm-serve is already running at the URL
     if ! curl -sf "${COSYVOICE_TRT_SERVE_URL}/v1/models" >/dev/null 2>&1; then
+        if [[ -z "${COSYVOICE_TRT_ENGINE_DIR}" ]]; then
+            echo "ERROR: COSYVOICE_TRT_ENGINE_DIR is required to auto-start trtllm-serve" >&2
+            echo "Set COSYVOICE_TRT_SERVE_URL to use an already-running service instead." >&2
+            exit 1
+        fi
+
         echo "Starting trtllm-serve in background..."
         HF_OUTPUT_DIR="${COSYVOICE_HF_MODEL_DIR:-${COSYVOICE_MODEL_DIR}/hf_merged}"
 
@@ -83,11 +101,15 @@ if [[ "${COSYVOICE_BACKEND}" == "trtllm-serve" ]]; then
                 --output-dir "${HF_OUTPUT_DIR}"
         fi
 
-        trtllm-serve "${HF_OUTPUT_DIR}" \
-            --host "${TTS_HOST}" \
-            --port "${TTS_PORT}" \
+        trtllm-serve serve \
+            --backend tensorrt \
+            --tokenizer "${HF_OUTPUT_DIR}" \
+            "${COSYVOICE_TRT_ENGINE_DIR}" \
+            --host "${TRTLLM_SERVE_HOST}" \
+            --port "${TRTLLM_SERVE_PORT}" \
             --max_batch_size 1 \
-            --max_num_tokens 2048 &
+            --max_num_tokens 4096 \
+            --kv_cache_free_gpu_memory_fraction "${TRTLLM_KV_CACHE_FREE_GPU_MEMORY_FRACTION:-0.3}" &
         TRTLLM_SERVE_PID="$!"
 
         echo "Waiting for trtllm-serve readiness..."
@@ -102,10 +124,17 @@ if [[ "${COSYVOICE_BACKEND}" == "trtllm-serve" ]]; then
             fi
             sleep 2
         done
+        if ! curl -sf "${COSYVOICE_TRT_SERVE_URL}/v1/models" >/dev/null 2>&1; then
+            echo "ERROR: trtllm-serve did not become ready at ${COSYVOICE_TRT_SERVE_URL}" >&2
+            exit 1
+        fi
     else
         echo "trtllm-serve already running at ${COSYVOICE_TRT_SERVE_URL}"
     fi
 fi
 
-echo "Starting CosyVoice3 TTS server (backend=${COSYVOICE_BACKEND})..."
+echo "Starting CosyVoice3 TTS server (backend=${COSYVOICE_BACKEND}) on ${TTS_HOST}:${TTS_PORT}..."
+if [[ "${COSYVOICE_BACKEND}" == "trtllm-serve" ]]; then
+    echo "Using trtllm-serve at ${COSYVOICE_TRT_SERVE_URL} (default port ${TRTLLM_SERVE_PORT})"
+fi
 exec python3 "${SERVER_ENTRYPOINT}"

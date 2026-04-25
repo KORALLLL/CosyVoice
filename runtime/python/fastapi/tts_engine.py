@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -54,6 +55,61 @@ def pcm_bytes_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> 
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
+
+
+def load_trt_tokenizer(hf_model_dir: str):
+    from transformers import AutoTokenizer
+
+    try:
+        return AutoTokenizer.from_pretrained(
+            hf_model_dir,
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.info(
+            "Tokenizer load with fix_mistral_regex failed for %s (%s); retrying without it",
+            hf_model_dir,
+            exc,
+        )
+        return AutoTokenizer.from_pretrained(hf_model_dir, trust_remote_code=True)
+
+
+def log_trt_tokenizer_metadata(engine_name: str, tokenizer, speech_token_offset: int) -> None:
+    special_token_ids = {
+        name: getattr(tokenizer, name, None)
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
+    }
+    for token in ("<|eos|>", "<|eos1|>"):
+        try:
+            special_token_ids[token] = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            special_token_ids[token] = None
+    chat_template = getattr(tokenizer, "chat_template", None)
+    logger.info(
+        "%s tokenizer metadata: class=%s chat_template=%r special_token_ids=%s speech_token_offset=%s",
+        engine_name,
+        tokenizer.__class__.__name__,
+        chat_template,
+        special_token_ids,
+        speech_token_offset,
+    )
+
+
+def read_prompt_audio_bytes(prompt_audio) -> bytes:
+    if isinstance(prompt_audio, (bytes, bytearray, memoryview)):
+        return bytes(prompt_audio)
+    if isinstance(prompt_audio, (str, os.PathLike)):
+        with open(os.fspath(prompt_audio), "rb") as f:
+            return f.read()
+    if hasattr(prompt_audio, "seek"):
+        prompt_audio.seek(0)
+    if hasattr(prompt_audio, "read"):
+        data = prompt_audio.read()
+        if isinstance(data, str):
+            return data.encode()
+        return bytes(data)
+    raise TypeError(f"Unsupported prompt_audio type: {type(prompt_audio).__name__}")
 
 
 class TTSEngine(ABC):
@@ -285,7 +341,12 @@ class _Token2WavRunner:
 
     def extract_prompt_features(self, prompt_audio_bytes: bytes, prompt_audio_sr: int = 16000):
         import torchaudio
-        audio, sr = torchaudio.load(io.BytesIO(prompt_audio_bytes), backend="soundfile")
+        try:
+            import soundfile as sf
+            audio_np, sr = sf.read(io.BytesIO(prompt_audio_bytes), dtype="float32", always_2d=True)
+            audio = torch.from_numpy(audio_np).transpose(0, 1)
+        except Exception:
+            audio, sr = torchaudio.load(io.BytesIO(prompt_audio_bytes), backend="soundfile")
         audio = audio.mean(dim=0)
         if sr != prompt_audio_sr:
             audio = torchaudio.transforms.Resample(sr, prompt_audio_sr)(audio.unsqueeze(0)).squeeze(0)
@@ -387,12 +448,14 @@ class _Token2WavRunner:
 
 
 class TrtLlmEngine(TTSEngine):
+    _COSYVOICE3_PREFIX = "You are a helpful assistant.<|endofprompt|>"
+    _COSYVOICE3_PROMPT_MARKER = "<|endofprompt|>"
+
     def __init__(self, model_dir: str, engine_dir: str, hf_model_dir: str | None = None,
                  enable_trt_flow: bool = False, device_id: int = 0,
                  gpu_memory_utilization: float = 0.6, max_batch_size: int = 1):
         import tensorrt_llm
         from tensorrt_llm.runtime import ModelRunnerCpp
-        from transformers import AutoTokenizer
 
         self.model_dir = model_dir
         self.engine_dir = engine_dir
@@ -402,7 +465,7 @@ class TrtLlmEngine(TTSEngine):
             hf_model_dir = os.path.join(model_dir, "hf_merged")
 
         logger.info("Loading TRT-LLM engine from %s", engine_dir)
-        self.tokenizer = AutoTokenizer.from_pretrained(hf_model_dir, trust_remote_code=True)
+        self.tokenizer = load_trt_tokenizer(hf_model_dir)
 
         runtime_rank = 0
         runner_kwargs = dict(
@@ -431,18 +494,28 @@ class TrtLlmEngine(TTSEngine):
         self.speech_token_offset = self.metadata.get("speech_token_offset", 0)
         self.base_speech_token_size = self.metadata.get("base_speech_token_size", 6561)
         self.eos_speech_idx = self.base_speech_token_size + 1
+        log_trt_tokenizer_metadata("TrtLlmEngine", self.tokenizer, self.speech_token_offset)
 
         logger.info("TrtLlmEngine ready")
+
+    @classmethod
+    def _ensure_single_cv3_prefix(cls, content: str) -> str:
+        if content.startswith(cls._COSYVOICE3_PREFIX):
+            return content
+        if cls._COSYVOICE3_PREFIX in content:
+            return cls._COSYVOICE3_PREFIX + content.replace(cls._COSYVOICE3_PREFIX, "", 1)
+        if cls._COSYVOICE3_PROMPT_MARKER in content:
+            return content
+        return cls._COSYVOICE3_PREFIX + content
 
     def _build_chat(self, text: str, mode: str, prompt_text: str | None = None,
                     instruct: str | None = None,
                     prompt_speech_token_ids: list[int] | None = None) -> list[dict]:
-        system_prefix = "You are a helpful assistant.<|endofprompt|>"
         if mode == "sft":
-            content = f"{system_prefix}{text}"
+            content = self._ensure_single_cv3_prefix(text)
             chat = [{"role": "user", "content": content}]
         elif mode == "zero_shot":
-            content = f"{system_prefix}{prompt_text or ''}{text}"
+            content = self._ensure_single_cv3_prefix(f"{prompt_text or ''}{text}")
             assistant_content = ""
             if prompt_speech_token_ids:
                 assistant_content = "".join(f"<|s_{tid}|>" for tid in prompt_speech_token_ids)
@@ -450,7 +523,7 @@ class TrtLlmEngine(TTSEngine):
             if assistant_content:
                 chat.append({"role": "assistant", "content": assistant_content})
         elif mode == "cross_lingual":
-            content = f"{system_prefix}{text}"
+            content = self._ensure_single_cv3_prefix(text)
             assistant_content = ""
             if prompt_speech_token_ids:
                 assistant_content = "".join(f"<|s_{tid}|>" for tid in prompt_speech_token_ids)
@@ -458,7 +531,7 @@ class TrtLlmEngine(TTSEngine):
             if assistant_content:
                 chat.append({"role": "assistant", "content": assistant_content})
         elif mode == "instruct2":
-            content = f"{system_prefix}{prompt_text or instruct or ''}{text}"
+            content = self._ensure_single_cv3_prefix(f"{prompt_text or instruct or ''}{text}")
             chat = [{"role": "user", "content": content}]
         else:
             raise ValueError(f"Unsupported mode for TRT-LLM: {mode}")
@@ -512,8 +585,7 @@ class TrtLlmEngine(TTSEngine):
         prompt_features = None
         prompt_speech_token_ids = None
         if prompt_audio is not None and mode in ("zero_shot", "cross_lingual", "instruct2"):
-            prompt_audio.seek(0)
-            prompt_audio_bytes = prompt_audio.read()
+            prompt_audio_bytes = read_prompt_audio_bytes(prompt_audio)
             prompt_features = self.t2w.extract_prompt_features(prompt_audio_bytes)
             prompt_speech_token_ids = prompt_features["prompt_speech_tokens"]
 
@@ -584,10 +656,17 @@ class TrtLlmEngine(TTSEngine):
 
 
 class TrtLlmServeEngine(TTSEngine):
+    _SPEECH_TOKEN_RE = re.compile(r"<\|s_(\d+)\|>")
+    _EOS_TOKEN_RE = re.compile(r"<\|eos\d*\|>")
+    _COSYVOICE3_PREFIX = "You are a helpful assistant.<|endofprompt|>"
+    _COSYVOICE3_PROMPT_MARKER = "<|endofprompt|>"
+    _MAX_NEW_SPEECH_TOKENS = 2048
+    _MIN_TOKEN_TEXT_RATIO = 2
+    _MAX_TOKEN_TEXT_RATIO = 20
+
     def __init__(self, model_dir: str, serve_url: str, model_name: str = "trt_engines_bfloat16",
                  enable_trt_flow: bool = False, device_id: int = 0,
                  hf_model_dir: str | None = None, timeout: float = 300.0):
-        from transformers import AutoTokenizer
         import httpx
 
         self.model_dir = model_dir
@@ -598,7 +677,7 @@ class TrtLlmServeEngine(TTSEngine):
         if hf_model_dir is None:
             hf_model_dir = os.path.join(model_dir, "hf_merged")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(hf_model_dir, trust_remote_code=True)
+        self.tokenizer = load_trt_tokenizer(hf_model_dir)
         self.http_client = httpx.Client(timeout=timeout)
 
         self.t2w = _Token2WavRunner(model_dir=model_dir, enable_trt=enable_trt_flow, device_id=device_id, streaming=True)
@@ -613,26 +692,39 @@ class TrtLlmServeEngine(TTSEngine):
         self.speech_token_offset = self.metadata.get("speech_token_offset", 0)
         self.base_speech_token_size = self.metadata.get("base_speech_token_size", 6561)
         self.eos_speech_idx = self.base_speech_token_size + 1
+        log_trt_tokenizer_metadata("TrtLlmServeEngine", self.tokenizer, self.speech_token_offset)
 
         logger.info("TrtLlmServeEngine ready (url=%s)", serve_url)
+
+    @classmethod
+    def _ensure_single_cv3_prefix(cls, content: str) -> str:
+        if content.startswith(cls._COSYVOICE3_PREFIX):
+            return content
+        if cls._COSYVOICE3_PREFIX in content:
+            return cls._COSYVOICE3_PREFIX + content.replace(cls._COSYVOICE3_PREFIX, "", 1)
+        if cls._COSYVOICE3_PROMPT_MARKER in content:
+            return content
+        return cls._COSYVOICE3_PREFIX + content
 
     def _build_chat(self, text: str, mode: str, prompt_text: str | None = None,
                     instruct: str | None = None,
                     prompt_speech_token_ids: list[int] | None = None) -> list[dict]:
-        system_prefix = "You are a helpful assistant.<|endofprompt|>"
         if mode == "sft":
-            content = f"{system_prefix}{text}"
+            content = self._ensure_single_cv3_prefix(text)
             chat = [{"role": "user", "content": content}]
-        elif mode in ("zero_shot", "cross_lingual"):
-            content = f"{system_prefix}{prompt_text or ''}{text}"
+        elif mode == "zero_shot":
+            content = self._ensure_single_cv3_prefix(f"{prompt_text or ''}{text}")
             assistant_content = ""
             if prompt_speech_token_ids:
                 assistant_content = "".join(f"<|s_{tid}|>" for tid in prompt_speech_token_ids)
             chat = [{"role": "user", "content": content}]
             if assistant_content:
                 chat.append({"role": "assistant", "content": assistant_content})
+        elif mode == "cross_lingual":
+            content = self._ensure_single_cv3_prefix(text)
+            chat = [{"role": "user", "content": content}]
         elif mode == "instruct2":
-            content = f"{system_prefix}{instruct or prompt_text or ''}{text}"
+            content = self._ensure_single_cv3_prefix(f"{instruct or prompt_text or ''}{text}")
             chat = [{"role": "user", "content": content}]
         else:
             raise ValueError(f"Unsupported mode for trtllm-serve: {mode}")
@@ -641,20 +733,62 @@ class TrtLlmServeEngine(TTSEngine):
     def _extract_speech_ids_from_str(self, token_strs: list[str]) -> list[int]:
         speech_ids = []
         for s in token_strs:
-            if s.startswith("<|s_") and s.endswith("|>"):
-                try:
-                    num = int(s[4:-2])
-                    if num < self.base_speech_token_size:
-                        speech_ids.append(num)
-                except ValueError:
-                    pass
+            s = self._EOS_TOKEN_RE.split(s, maxsplit=1)[0]
+            for match in self._SPEECH_TOKEN_RE.finditer(s):
+                num = int(match.group(1))
+                if num == self.eos_speech_idx:
+                    return speech_ids
+                if num < self.base_speech_token_size:
+                    speech_ids.append(num)
         return speech_ids
 
-    def _run_llm_serve(self, chat: list[dict], continue_final: bool = True) -> list[int]:
+    @classmethod
+    def _strip_generation_prefix(cls, text: str) -> str:
+        if text.startswith(cls._COSYVOICE3_PREFIX):
+            return text[len(cls._COSYVOICE3_PREFIX):]
+        marker_index = text.rfind(cls._COSYVOICE3_PROMPT_MARKER)
+        if marker_index >= 0:
+            return text[marker_index + len(cls._COSYVOICE3_PROMPT_MARKER):]
+        return text
+
+    def _count_text_tokens(self, text: str) -> int:
+        text = text or ""
+        encode = getattr(self.tokenizer, "encode", None)
+        if callable(encode):
+            try:
+                return len(encode(text, add_special_tokens=False))
+            except TypeError:
+                return len(encode(text))
+        tokenize = getattr(self.tokenizer, "tokenize", None)
+        if callable(tokenize):
+            return len(tokenize(text))
+        return max(1, len(text.split()))
+
+    def _speech_token_bounds(self, text: str, mode: str, prompt_text: str | None, instruct: str | None) -> tuple[int, int]:
+        target_text = self._strip_generation_prefix(text)
+        target_token_count = max(1, self._count_text_tokens(target_text))
+        min_tokens = max(1, target_token_count * self._MIN_TOKEN_TEXT_RATIO)
+        max_tokens = min(self._MAX_NEW_SPEECH_TOKENS, max(min_tokens, target_token_count * self._MAX_TOKEN_TEXT_RATIO))
+        return min_tokens, max_tokens
+
+    @staticmethod
+    def _min_pcm_bytes_for_tokens(min_tokens: int) -> int:
+        min_audio_sec = max(0.05, min_tokens / 25.0 * 0.5)
+        return int(min_audio_sec * SAMPLE_RATE * 2)
+
+    def _validate_pcm_length(self, pcm: bytes, min_tokens: int) -> None:
+        min_bytes = self._min_pcm_bytes_for_tokens(min_tokens)
+        if len(pcm) < min_bytes:
+            raise RuntimeError(
+                f"TRT token2wav produced too little PCM: {len(pcm)} bytes < {min_bytes} bytes"
+            )
+
+    def _run_llm_serve(self, chat: list[dict], min_tokens: int, max_tokens: int) -> list[int]:
         payload = {
             "model": self.model_name,
             "messages": chat,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
+            "min_tokens": min_tokens,
             "temperature": 0.8,
             "top_p": 0.95,
             "top_k": 25,
@@ -662,8 +796,6 @@ class TrtLlmServeEngine(TTSEngine):
             "stop": ["<|eos1|>", "<|eos|>"],
             "stream": False,
         }
-        if continue_final and len(chat) > 1:
-            payload["continue_final_message"] = True
 
         response = self.http_client.post(
             f"{self.serve_url}/v1/chat/completions",
@@ -672,17 +804,16 @@ class TrtLlmServeEngine(TTSEngine):
         response.raise_for_status()
         result = response.json()
         generated_content = result["choices"][0]["message"]["content"]
-
-        token_strs = []
-        parts = generated_content.strip().split("><")
-        for i, part in enumerate(parts):
-            if i == 0 and not part.startswith("<"):
-                part = "<" + part
-            if i == len(parts) - 1 and not part.endswith(">"):
-                part = part + ">"
-            token_strs.append(part)
-
-        return self._extract_speech_ids_from_str(token_strs)
+        speech_ids = self._extract_speech_ids_from_str([generated_content])
+        logger.info(
+            "TRT-LLM serve generated %s speech tokens (min=%s, max=%s, content_chars=%s, preview=%r)",
+            len(speech_ids),
+            min_tokens,
+            max_tokens,
+            len(generated_content),
+            generated_content[:160],
+        )
+        return speech_ids
 
     def _run_pipeline(self, stream: bool, **kwargs):
         text = kwargs["text"]
@@ -694,18 +825,20 @@ class TrtLlmServeEngine(TTSEngine):
         prompt_features = None
         prompt_speech_token_ids = None
         if prompt_audio is not None and mode in ("zero_shot", "cross_lingual", "instruct2"):
-            prompt_audio.seek(0)
-            prompt_audio_bytes = prompt_audio.read()
+            prompt_audio_bytes = read_prompt_audio_bytes(prompt_audio)
             prompt_features = self.t2w.extract_prompt_features(prompt_audio_bytes)
             prompt_speech_token_ids = prompt_features["prompt_speech_tokens"]
 
         chat = self._build_chat(text, mode, prompt_text, instruct, prompt_speech_token_ids)
-        continue_final = len(chat) > 1
-        speech_ids = self._run_llm_serve(chat, continue_final=continue_final)
+        min_tokens, max_tokens = self._speech_token_bounds(text, mode, prompt_text, instruct)
+        speech_ids = self._run_llm_serve(chat, min_tokens=min_tokens, max_tokens=max_tokens)
 
         if not speech_ids:
-            logger.warning("No speech tokens generated for text: %s", text[:100])
-            return iter([]) if stream else b""
+            raise RuntimeError(f"TRT-LLM serve generated no speech tokens for text: {text[:100]}")
+        if len(speech_ids) < min_tokens:
+            raise RuntimeError(
+                f"TRT-LLM serve generated too few speech tokens: {len(speech_ids)} < {min_tokens}"
+            )
 
         if prompt_features is None:
             prompt_features = self._get_default_prompt_features()
@@ -719,13 +852,20 @@ class TrtLlmServeEngine(TTSEngine):
                 prompt_features["spk_emb"],
             )
         else:
-            return self.t2w.full_token2wav(
+            pcm = self.t2w.full_token2wav(
                 speech_ids,
                 prompt_features["prompt_speech_tokens"],
                 prompt_features["prompt_mels"],
                 prompt_features["prompt_mels_lens"],
                 prompt_features["spk_emb"],
             )
+            self._validate_pcm_length(pcm, min_tokens)
+            logger.info(
+                "TRT-LLM serve token2wav produced %s bytes (%.2fs)",
+                len(pcm),
+                len(pcm) / 2.0 / SAMPLE_RATE,
+            )
+            return pcm
 
     def _get_default_prompt_features(self):
         if not hasattr(self, "_default_prompt_features"):

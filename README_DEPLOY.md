@@ -100,7 +100,7 @@ export COSYVOICE_LOAD_TRT="${COSYVOICE_LOAD_TRT:-false}"
 export COSYVOICE_DEFAULT_SPEED="${COSYVOICE_DEFAULT_SPEED:-1.0}"
 export COSYVOICE_GPU_MEM="${COSYVOICE_GPU_MEM:-0.4}"
 export VLLM_PLUGINS="${VLLM_PLUGINS:-cosyvoice}"
-export TTS_PORT="${TTS_PORT:-8000}"
+export TTS_PORT="${TTS_PORT:-8003}"
 export TTS_HOST="${TTS_HOST:-0.0.0.0}"
 export TTS_WARMUP_ENABLED="${TTS_WARMUP_ENABLED:-false}"
 export MAX_TEXT_LENGTH="${MAX_TEXT_LENGTH:-5000}"
@@ -113,6 +113,66 @@ exec .venv/bin/python runtime/python/fastapi/server_cosyvoice3.py
 ```
 
 The checked-in launchers default to `COSYVOICE_BACKEND=vllm`, `COSYVOICE_DEFAULT_SPEED=1.0`, and `VLLM_PLUGINS=cosyvoice`; set these before launching to override them. `COSYVOICE_GPU_MEM` is passed to vLLM as `gpu_memory_utilization`.
+
+### Run with vLLM
+
+Use this mode when you want FastAPI to host the HTTP API and run the CosyVoice3 LLM through the local vLLM plugin in the same server process. No separate OpenAI/vLLM HTTP server is needed.
+
+```bash
+export PYTHONPATH="$(pwd):$(pwd)/third_party/Matcha-TTS:$(pwd)/runtime/python/fastapi"
+export COSYVOICE_MODEL_DIR="$(pwd)/pretrained_models/FunAudioLLM/Fun-CosyVoice3-0___5B-2512"
+export COSYVOICE_BACKEND=vllm
+export VLLM_PLUGINS=cosyvoice
+export COSYVOICE_GPU_MEM="${COSYVOICE_GPU_MEM:-0.4}"
+export COSYVOICE_FP16="${COSYVOICE_FP16:-true}"
+export COSYVOICE_LOAD_TRT="${COSYVOICE_LOAD_TRT:-false}"
+export COSYVOICE_DEFAULT_SPEED="${COSYVOICE_DEFAULT_SPEED:-1.0}"
+export TTS_HOST="${TTS_HOST:-0.0.0.0}"
+export TTS_PORT="${TTS_PORT:-8003}"
+export TTS_WARMUP_ENABLED="${TTS_WARMUP_ENABLED:-false}"
+
+.venv/bin/python runtime/python/fastapi/server_cosyvoice3.py
+```
+
+Or run the checked-in launcher, which sets the same vLLM defaults:
+
+```bash
+COSYVOICE_BACKEND=vllm TTS_PORT=8003 ./run_server.sh
+```
+
+Validate vLLM mode:
+
+```bash
+curl -s http://localhost:8003/health | python3 -m json.tool
+curl -s http://localhost:8003/v1/audio/voices | python3 -m json.tool
+curl -X POST http://localhost:8003/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"optimized_short","input":"Привет, это тест.","response_format":"pcm","stream":true,"lang":"ru"}' \
+  -o output.raw
+```
+
+The health response should show `"backend": "vllm"`. If startup fails because the vLLM plugin is missing, reinstall it with:
+
+```bash
+uv pip install --python .venv/bin/python -e ./vllm_cosyvoice_plugin
+```
+
+To use a TensorRT-LLM Serve process for the LLM stage, keep it on its own port and point FastAPI at it:
+
+```bash
+export COSYVOICE_BACKEND=trtllm-serve
+export COSYVOICE_TRT_SERVE_URL=http://127.0.0.1:8000
+export COSYVOICE_TRT_SERVE_MODEL_NAME="${COSYVOICE_TRT_SERVE_MODEL_NAME:-trt_engines_bfloat16}"
+export TTS_PORT=8003
+```
+
+The FastAPI server still uses `COSYVOICE_DEFAULT_REF_AUDIO` for the prompt audio reference. `trtllm-serve` should listen on `8000`; the FastAPI TTS API should listen on `8003`.
+
+Or use the dedicated launcher, which starts only the FastAPI side on `8003` and defaults to `COSYVOICE_TRT_SERVE_URL=http://127.0.0.1:8000`, `COSYVOICE_TRT_SERVE_MODEL_NAME=trt_engines_bfloat16`, `COSYVOICE_DEFAULT_REF_AUDIO=asset/qwen_ref_4.wav`, `COSYVOICE_COMPAT_MODE=cross_lingual`, `COSYVOICE_LOAD_TRT=false`, and warmup disabled:
+
+```bash
+./start_trtllm_serve_fastapi.sh
+```
 
 Run it:
 
@@ -132,19 +192,21 @@ nohup .venv/bin/python run_uvicorn.py > server.log 2>&1 &
 ## 7. Verify
 
 ```bash
-curl -s http://localhost:8000/health | python3 -m json.tool
+curl -s http://localhost:8003/health | python3 -m json.tool
 ```
 
 ## 8. Generate TTS (example — Russian cross-lingual)
 
 ```bash
-curl -X POST http://localhost:8000/tts-stream \
-  -F "text=You are a helpful assistant.<|endofprompt|>Привет, это тест." \
-  -F "mode=cross_lingual" \
-  -F "lang=ru" \
-  -F "prompt_audio=@/path/to/reference.wav" \
+curl -X POST http://localhost:8003/tts-stream \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Привет, это тест.","lang":"ru"}' \
   -o output.raw
 ```
+
+Reference audio and TRT-specific settings are configured by environment variables such as
+`COSYVOICE_DEFAULT_REF_AUDIO`, `COSYVOICE_PROMPT_TEXT`, `COSYVOICE_COMPAT_MODE`,
+`COSYVOICE_TRT_SERVE_URL`, and `COSYVOICE_HF_MODEL_DIR`; they are not request fields.
 
 Convert raw int16 PCM @ 24 kHz to WAV:
 
@@ -161,9 +223,8 @@ with wave.open('output.wav','wb') as w:
 ## 9. Batch generation (Python script)
 
 Use the provided `generate_homographs.py` as a template. Key points:
-- Always prepend the system prefix for CosyVoice3: `You are a helpful assistant.<|endofprompt|>`
-- Upload prompt audio as `prompt_audio` file
-- Use `mode=zero_shot` or `mode=cross_lingual`
+- Send JSON requests matching the Qwen-compatible endpoint schema
+- Configure prompt/reference audio and mode through environment variables
 - Response is raw int16 PCM, 24 kHz, mono
 
 ## Known issues & fixes applied
@@ -192,6 +253,7 @@ Use the provided `generate_homographs.py` as a template. Key points:
 ## File reference
 
 - `run_server.sh` — bash launcher
-- `run_uvicorn.py` — Python launcher (binds `0.0.0.0:8000`)
+- `run_uvicorn.py` — Python launcher (binds `0.0.0.0:8003` by default)
+- `start_trtllm_serve_fastapi.sh` — FastAPI launcher for an existing `trtllm-serve` process
 - `generate_homographs.py` — batch generation example
 - `server.log` — runtime logs
