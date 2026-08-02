@@ -33,3 +33,29 @@
 - `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -q` — 142 passed before the final zero-shot registration fix; rerun after the fix recorded below.
 - `rtk python -m compileall -q cosyvoice/finetune/balalaika/evaluation.py tests/finetune/balalaika/test_evaluation.py` and `rtk git diff --check` passed before the final fix and were rerun after it.
 - Final fresh verification after all production/test edits: exact Task 10/metrics suite 20/20 passed; complete Balalaika suite 142/142 passed; compileall and diff-check exited 0.
+
+## Fix Round 1: immutable validation evidence and remote W&B commits
+
+### Root cause and changes
+
+- The original resume boundary trusted syntactically valid WAVs and a shallow local summary instead of binding every reusable artifact to one immutable evaluation identity. The identity now recursively freezes and hashes checkpoint/model/adapter/base checksums, benchmark snapshot/revision, validation index, all row/voice/prompt semantics, ASR and synthesis configuration, and code/config versions.
+- Rank journals now carry identity, item, audio, and record seals. Only a fully sealed journal row may authorize WAV reuse; orphan or mismatched WAVs are removed and regenerated. Main-rank reconciliation additionally verifies every gathered WAV is present, checksum-identical, mono 24 kHz PCM.
+- Published JSONL rows, the summary, the deterministic listening-panel manifest/content, and a final success seal are checksum-linked. A committed resume revalidates all 2,000 rows, recalculates edit counts and aggregate metrics, checks the exact panel mapping and WAV bytes, and rejects any changed artifact.
+- W&B is a mandatory preflight dependency. Local and remote commit evidence binds the evaluation identity, assignment, artifact checksums, and metrics. Deterministic media/scalar markers are queried before logging and verified afterward; media uses the underlying active run while scalars use `Accelerator.log`. Retry after scalar or local-ledger failure is idempotent. Durable history queries use `wandb.Api().run(...).scan_history`, because the active SDK run has no `scan_history` method.
+- GigaAM construction is bound to `accelerator.local_process_index`, and runtime recognizer/synthesizer provenance must exactly match the requested identity.
+
+### TDD and adversarial evidence
+
+1. RED: an unjournaled valid WAV skipped synthesis; missing W&B reached distributed work; a recognizer/local-rank mismatch reached gather. GREEN: all three focused tests passed after sealed journal-only reuse and pre-generation W&B/rank validation.
+2. RED: W&B crash tests lacked an injectable ledger writer and a scalar retry produced no durable remote marker group. GREEN: remote-success/local-ledger-crash and media-pending/scalar-retry both commit exactly one remote step and avoid duplicate calls.
+3. RED: marker-query instrumentation observed only two reads around a commit. GREEN: remote state is queried before each component and after the atomic scalar commit.
+4. RED: the identity's nested ASR configuration remained mutable, and the production logger attempted the unsupported active-run `scan_history` API. GREEN: the identity is recursively immutable and remote reads use the public API run; focused SDK-boundary and crash tests pass.
+5. Adversarial validation passes for identity changes, orphan WAVs, missing/checksum-changed gathered audio, resealed-but-corrupt JSONL/summary data, and modified listening-panel content.
+
+### Final verification
+
+- `rtk python -m py_compile cosyvoice/finetune/balalaika/evaluation.py tests/finetune/balalaika/test_evaluation.py` — passed.
+- `rtk git diff --check` — passed.
+- `rtk python -m unittest tests.finetune.balalaika.test_evaluation tests.finetune.balalaika.test_metrics -v` — 30/30 passed.
+- `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -q` — 152/152 passed (exit 0).
+- Verification remained fake/local only: no private benchmark, GPU/model run, W&B network call, credential use, or upload occurred.

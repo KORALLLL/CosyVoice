@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -62,9 +64,42 @@ def _write_wav(path: Path) -> None:
         output.writeframes(b"\0\0" * 8)
 
 
+def _remote_records(root: Path) -> list[dict[str, object]]:
+    path = root / "remote.wav"
+    _write_wav(path)
+    checksum = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+    return [
+        {
+            "benchmark_id": index,
+            "hypothesis": "код семь готов",
+            "audio_path": str(path),
+            "audio_sha256": checksum,
+            "generation_latency_seconds": 0.0,
+            "asr_latency_seconds": 0.0,
+        }
+        for index in range(251, 2_001)
+    ]
+
+
+def _seal_remote_records(api, records, rows, prompts, provenance, validation_index=0):
+    items = api.build_voice_assignment(rows, prompts)
+    identity = api.build_evaluation_identity(validation_index, items, provenance)
+    by_id = {item.benchmark_id: item for item in items}
+    for record in records:
+        record["evaluation_identity_sha256"] = identity.sha256
+        record["item_sha256"] = api._item_sha256(by_id[record["benchmark_id"]])
+        record["record_sha256"] = api._journal_record_sha256(record)
+    return records
+
+
 class _FakeRecognizer:
+    local_rank = 0
+
     def transcribe(self, paths):
         return ["код семь готов" for _ in paths]
+
+    def provenance(self):
+        return {"model": "gigaam-v3-rnnt", "provider": "CUDAExecutionProvider", "device_id": self.local_rank, "max_batch_size": 8}
 
 
 class _FakeSynthesizer:
@@ -75,6 +110,26 @@ class _FakeSynthesizer:
         self.generated.append(item.benchmark_id)
         _write_wav(destination)
 
+    def provenance(self):
+        return {"method": "inference_zero_shot", "sample_rate": 24_000, "stream": False}
+
+
+def _provenance(api, recognizer=None, synthesizer=None, *, checkpoint="1" * 64):
+    recognizer = recognizer or _FakeRecognizer()
+    synthesizer = synthesizer or _FakeSynthesizer()
+    return api.EvaluationProvenance(
+        checkpoint_sha256=checkpoint,
+        model_state_sha256="2" * 64,
+        adapter_sha256="3" * 64,
+        base_checkpoint_sha256="4" * 64,
+        benchmark_snapshot_sha256="5" * 64,
+        benchmark_revision="private-revision-1",
+        asr_config=recognizer.provenance(),
+        synthesis_config=synthesizer.provenance(),
+        code_version="commit-a",
+        config_version="balalaika-v1",
+    )
+
 
 class _FakeAccelerator:
     num_processes = 8
@@ -84,6 +139,8 @@ class _FakeAccelerator:
 
     def __init__(self, remote_records=None) -> None:
         self.remote_records = list(remote_records or [])
+        self.run = _FakeRun()
+        self.scalar_logs = []
 
     @contextmanager
     def split_between_processes(self, items):
@@ -98,6 +155,99 @@ class _FakeAccelerator:
     def broadcast_object_list(self, values, from_process=0) -> None:
         return None
 
+    def get_tracker(self, name, unwrap=False):
+        if (name, unwrap) != ("wandb", True):
+            raise AssertionError((name, unwrap))
+        return self.run
+
+    def log(self, values, step=None, log_kwargs=None) -> None:
+        if self.run.fail_scalars:
+            raise RuntimeError("scalar network failure")
+        self.scalar_logs.append((dict(values), step))
+        self.run.pending.update(values)
+        if (log_kwargs or {}).get("wandb", {}).get("commit"):
+            self.run.history.append({**self.run.pending, "_step": step})
+            self.run.pending.clear()
+
+
+class _FakeRun:
+    id = "run-123"
+    resumed = False
+
+    def __init__(self) -> None:
+        self.dir = "wandb/run-123/files"
+        self.media_logs = []
+        self.pending = {}
+        self.history = []
+        self.fail_media = False
+        self.fail_scalars = False
+        self.scan_calls = 0
+
+    def log(self, values, *, step=None, commit=None) -> None:
+        if self.fail_media:
+            raise RuntimeError("media network failure")
+        self.media_logs.append((dict(values), {"step": step, "commit": commit}))
+        self.pending.update(values)
+        if commit:
+            self.history.append({**self.pending, "_step": step})
+            self.pending.clear()
+
+    def scan_history(self, keys=None):
+        self.scan_calls += 1
+        for row in self.history:
+            yield {key: row.get(key) for key in keys or row}
+
+
+def _logger(api, accelerator, root):
+    return api.WandbValidationLogger(
+        accelerator,
+        root / "wandb-run.json",
+        table_factory=lambda rows: ("table", tuple(row["benchmark_id"] for row in rows)),
+        audio_factory=lambda path: ("audio", Path(path).name),
+        remote_history_reader=lambda run, keys: run.scan_history(keys=keys),
+    )
+
+
+def _wandb_report(api, root, prompts):
+    output = root / "results.jsonl"
+    summary = root / "summary.json"
+    panel_dir = root / "panel"
+    panel_dir.mkdir(exist_ok=True)
+    panel_manifest = panel_dir / "manifest.json"
+    seal = root / "validation-success.json"
+    output.write_text("{}\n", encoding="utf-8")
+    summary.write_text("{}\n", encoding="utf-8")
+    panel_manifest.write_text("{}\n", encoding="utf-8")
+    seal.write_text("{}\n", encoding="utf-8")
+    checksums = {
+        "results_jsonl": __import__("hashlib").sha256(output.read_bytes()).hexdigest(),
+        "summary_json": __import__("hashlib").sha256(summary.read_bytes()).hexdigest(),
+        "panel_manifest": __import__("hashlib").sha256(panel_manifest.read_bytes()).hexdigest(),
+        "validation_seal": __import__("hashlib").sha256(seal.read_bytes()).hexdigest(),
+    }
+    return api.EvaluationReport(
+        validation_index=0,
+        output_jsonl=output,
+        summary_json=summary,
+        panel_dir=panel_dir,
+        assignment_checksum="a" * 64,
+        identity_checksum="b" * 64,
+        artifact_checksums=checksums,
+        metrics={
+            "utt-wer": 0.1,
+            "utt-cer": 0.2,
+            "num-wer": 0.3,
+            "num-cer": 0.4,
+            "macro-utt-wer": 0.5,
+            "by_category": {"code": {"num-wer": 0.6}},
+        },
+        row_count=2_000,
+        worst_errors=({"benchmark_id": 1, "hypothesis": "семь"},),
+        panel_audio={f"voice_{index:02d}": prompts[index]["audio_path"] for index in range(20)},
+        generation_latency_seconds=1.25,
+        asr_latency_seconds=0.25,
+    )
+
 
 class _FailingLogger:
     def log(self, report, validation_index) -> None:
@@ -110,8 +260,11 @@ class EvaluationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.rows_2000 = _rows()
         self.prompts_20 = _prompts(self.root / "prompts")
+        self.environment = mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"})
+        self.environment.start()
 
     def tearDown(self) -> None:
+        self.environment.stop()
         self.temporary.cleanup()
 
     def test_each_benchmark_row_is_generated_once(self) -> None:
@@ -139,6 +292,74 @@ class EvaluationTests(unittest.TestCase):
         duplicate = [*self.rows_2000[:-1], dict(self.rows_2000[0])]
         with self.assertRaisesRegex(api.EvaluationIntegrityError, "IDs"):
             api.build_voice_assignment(duplicate, self.prompts_20)
+
+    def test_evaluation_identity_binds_every_semantic_and_model_input(self) -> None:
+        api = _api()
+        items = api.build_voice_assignment(self.rows_2000, self.prompts_20)
+        provenance = api.EvaluationProvenance(
+            checkpoint_sha256="1" * 64,
+            model_state_sha256="2" * 64,
+            adapter_sha256="3" * 64,
+            base_checkpoint_sha256="4" * 64,
+            benchmark_snapshot_sha256="5" * 64,
+            benchmark_revision="private-revision-1",
+            asr_config={"model": "gigaam-v3-rnnt", "provider": "CUDAExecutionProvider", "device_id": 0, "max_batch_size": 8},
+            synthesis_config={"method": "inference_zero_shot", "sample_rate": 24_000, "stream": False},
+            code_version="commit-a",
+            config_version="balalaika-v1",
+        )
+
+        identity = api.build_evaluation_identity(0, items, provenance)
+
+        self.assertEqual(
+            set(identity.payload),
+            {
+                "format_version",
+                "validation_index",
+                "checkpoint_sha256",
+                "model_state_sha256",
+                "adapter_sha256",
+                "base_checkpoint_sha256",
+                "benchmark_snapshot_sha256",
+                "benchmark_revision",
+                "semantic_assignment_sha256",
+                "asr_config",
+                "synthesis_config",
+                "code_version",
+                "config_version",
+            },
+        )
+        changed = [
+            replace(provenance, checkpoint_sha256="a" * 64),
+            replace(provenance, model_state_sha256="a" * 64),
+            replace(provenance, adapter_sha256="a" * 64),
+            replace(provenance, base_checkpoint_sha256="a" * 64),
+            replace(provenance, benchmark_snapshot_sha256="a" * 64),
+            replace(provenance, benchmark_revision="private-revision-2"),
+            replace(provenance, asr_config={**provenance.asr_config, "max_batch_size": 4}),
+            replace(provenance, synthesis_config={**provenance.synthesis_config, "stream": True}),
+            replace(provenance, code_version="commit-b"),
+            replace(provenance, config_version="balalaika-v2"),
+        ]
+        self.assertEqual(len({api.build_evaluation_identity(0, items, value).sha256 for value in changed}), len(changed))
+        self.assertNotIn(identity.sha256, {api.build_evaluation_identity(0, items, value).sha256 for value in changed})
+        self.assertNotEqual(identity.sha256, api.build_evaluation_identity(1, items, provenance).sha256)
+        semantic_change = list(items)
+        semantic_change[0] = replace(items[0], hard_number="изменено")
+        self.assertNotEqual(identity.sha256, api.build_evaluation_identity(0, semantic_change, provenance).sha256)
+        with self.assertRaises(TypeError):
+            identity.payload["asr_config"]["max_batch_size"] = 4
+
+    def test_wandb_remote_history_uses_api_run_not_active_run(self) -> None:
+        api = _api()
+        rows = [{"marker": "sealed"}]
+        api_run = type("ApiRun", (), {"scan_history": lambda self, keys=None: iter(rows)})()
+        client = type("Api", (), {"run": lambda self, path: api_run})()
+        active = type("Run", (), {"entity": "team", "project": "project", "id": "run-123"})()
+
+        fake_wandb = type("Wandb", (), {"Api": staticmethod(lambda: client)})()
+        with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+            self.assertEqual(list(api._wandb_api_history(active, ["marker"])), rows)
 
     def test_gigaam_loads_v3_rnnt_on_local_cuda_and_preserves_batch_order(self) -> None:
         api = _api()
@@ -235,23 +456,17 @@ class EvaluationTests(unittest.TestCase):
     def test_results_publish_before_wandb_failure_and_resume_without_regeneration(self) -> None:
         api = _api()
         synthesizer = _FakeSynthesizer()
-        remote = [
-            {
-                "benchmark_id": index,
-                "hypothesis": "код семь готов",
-                "audio_path": str(self.root / "missing-remote-audio.wav"),
-                "audio_sha256": "a" * 64,
-                "generation_latency_seconds": 0.0,
-                "asr_latency_seconds": 0.0,
-            }
-            for index in range(251, 2_001)
-        ]
+        provenance = _provenance(api, synthesizer=synthesizer)
+        remote = _seal_remote_records(api, _remote_records(self.root), self.rows_2000, self.prompts_20, provenance)
+        accelerator = _FakeAccelerator(remote)
+        accelerator.run.fail_media = True
         request = api.EvaluationRequest(
             rows=self.rows_2000,
             prompts=self.prompts_20,
-            accelerator=_FakeAccelerator(remote),
+            accelerator=accelerator,
             synthesizer=synthesizer,
             recognizer=_FakeRecognizer(),
+            provenance=provenance,
             validation_index=0,
             output_jsonl=self.root / "validation-00/results.jsonl",
             summary_json=self.root / "validation-00/summary.json",
@@ -259,7 +474,7 @@ class EvaluationTests(unittest.TestCase):
             temporary_audio_dir=self.root / "validation-00/audio",
             assignment_manifest=self.root / "voice-assignment.json",
             memorization_path=self.root / "memorization",
-            wandb_logger=_FailingLogger(),
+            wandb_logger=_logger(api, accelerator, self.root),
         )
 
         with mock.patch.object(api, "require_memorization_gate", return_value=object()):
@@ -274,6 +489,7 @@ class EvaluationTests(unittest.TestCase):
             set(first),
             {
                 "benchmark_id",
+                "evaluation_identity_sha256",
                 "voice_id",
                 "prompt_wav",
                 "prompt_text",
@@ -289,6 +505,7 @@ class EvaluationTests(unittest.TestCase):
                 "audio_sha256",
                 "generation_latency_seconds",
                 "asr_latency_seconds",
+                "row_sha256",
             },
         )
         self.assertEqual(first["number_span"]["hypothesis_text"], "семь")
@@ -297,12 +514,10 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(synthesizer.generated, list(range(1, 251)))
         self.assertFalse(request.temporary_audio_dir.exists())
 
-        successful = []
-        resumed = api.EvaluationRequest(**{**request.__dict__, "wandb_logger": type("Logger", (), {"log": lambda _, report, index: successful.append((report.row_count, index))})()})
+        accelerator.run.fail_media = False
         with mock.patch.object(api, "require_memorization_gate", return_value=object()):
-            report = api.evaluate_checkpoint(resumed)
+            report = api.evaluate_checkpoint(request)
         self.assertEqual(synthesizer.generated, list(range(1, 251)))
-        self.assertEqual(successful, [(2_000, 0)])
         self.assertEqual(report.metrics["utt-wer"], 0.0)
         self.assertEqual(report.metrics["num-wer"], 0.0)
 
@@ -314,12 +529,14 @@ class EvaluationTests(unittest.TestCase):
             def split_between_processes(self, items):
                 yield list(items)[:249]
 
+        accelerator = ShortAccelerator()
         request = api.EvaluationRequest(
             rows=self.rows_2000,
             prompts=self.prompts_20,
-            accelerator=ShortAccelerator(),
+            accelerator=accelerator,
             synthesizer=_FakeSynthesizer(),
             recognizer=_FakeRecognizer(),
+            provenance=_provenance(api),
             validation_index=0,
             output_jsonl=self.root / "results.jsonl",
             summary_json=self.root / "summary.json",
@@ -327,31 +544,28 @@ class EvaluationTests(unittest.TestCase):
             temporary_audio_dir=self.root / "audio",
             assignment_manifest=self.root / "mapping.json",
             memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
         )
         with mock.patch.object(api, "require_memorization_gate", return_value=object()):
             with self.assertRaisesRegex(api.EvaluationIntegrityError, "250"):
                 api.evaluate_checkpoint(request)
 
-    def test_partial_local_publication_resumes_without_regeneration(self) -> None:
+    def test_unjournaled_valid_wav_is_replaced_not_reused(self) -> None:
         api = _api()
         synthesizer = _FakeSynthesizer()
-        remote = [
-            {
-                "benchmark_id": index,
-                "hypothesis": "код семь готов",
-                "audio_path": str(self.root / "remote.wav"),
-                "audio_sha256": "a" * 64,
-                "generation_latency_seconds": 0.0,
-                "asr_latency_seconds": 0.0,
-            }
-            for index in range(251, 2_001)
-        ]
+        stale = self.root / "validation/audio/rank-00/benchmark-0001.wav"
+        _write_wav(stale)
+        stale.write_bytes(stale.read_bytes() + b"stale")
+        provenance = _provenance(api, synthesizer=synthesizer)
+        remote = _seal_remote_records(api, _remote_records(self.root), self.rows_2000, self.prompts_20, provenance)
+        accelerator = _FakeAccelerator(remote)
         request = api.EvaluationRequest(
             rows=self.rows_2000,
             prompts=self.prompts_20,
-            accelerator=_FakeAccelerator(remote),
+            accelerator=accelerator,
             synthesizer=synthesizer,
             recognizer=_FakeRecognizer(),
+            provenance=provenance,
             validation_index=0,
             output_jsonl=self.root / "validation/results.jsonl",
             summary_json=self.root / "validation/summary.json",
@@ -359,6 +573,88 @@ class EvaluationTests(unittest.TestCase):
             temporary_audio_dir=self.root / "validation/audio",
             assignment_manifest=self.root / "voice-assignment.json",
             memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
+        )
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            api.evaluate_checkpoint(request)
+
+        self.assertEqual(synthesizer.generated, list(range(1, 251)))
+
+    def test_evaluation_requires_wandb_before_distributed_work(self) -> None:
+        api = _api()
+
+        class ExplodingAccelerator(_FakeAccelerator):
+            @contextmanager
+            def split_between_processes(self, items):
+                raise AssertionError("generation must not start")
+                yield
+
+        request = api.EvaluationRequest(
+            rows=self.rows_2000,
+            prompts=self.prompts_20,
+            accelerator=ExplodingAccelerator(),
+            synthesizer=_FakeSynthesizer(),
+            recognizer=_FakeRecognizer(),
+            provenance=_provenance(api),
+            validation_index=0,
+            output_jsonl=self.root / "results.jsonl",
+            summary_json=self.root / "summary.json",
+            panel_dir=self.root / "panel",
+            temporary_audio_dir=self.root / "audio",
+            assignment_manifest=self.root / "mapping.json",
+            memorization_path=self.root / "memorization",
+            wandb_logger=None,
+        )
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            with self.assertRaisesRegex(api.WandbSyncError, "mandatory"):
+                api.evaluate_checkpoint(request)
+
+    def test_recognizer_local_rank_must_match_accelerator_local_process(self) -> None:
+        api = _api()
+        recognizer = _FakeRecognizer()
+        recognizer.local_rank = 1
+        accelerator = _FakeAccelerator()
+        request = api.EvaluationRequest(
+            rows=self.rows_2000,
+            prompts=self.prompts_20,
+            accelerator=accelerator,
+            synthesizer=_FakeSynthesizer(),
+            recognizer=recognizer,
+            provenance=_provenance(api, recognizer=recognizer),
+            validation_index=0,
+            output_jsonl=self.root / "results.jsonl",
+            summary_json=self.root / "summary.json",
+            panel_dir=self.root / "panel",
+            temporary_audio_dir=self.root / "audio",
+            assignment_manifest=self.root / "mapping.json",
+            memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
+        )
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            with self.assertRaisesRegex(api.EvaluationIntegrityError, "local rank"):
+                api.evaluate_checkpoint(request)
+
+    def test_partial_local_publication_resumes_without_regeneration(self) -> None:
+        api = _api()
+        synthesizer = _FakeSynthesizer()
+        provenance = _provenance(api, synthesizer=synthesizer)
+        remote = _seal_remote_records(api, _remote_records(self.root), self.rows_2000, self.prompts_20, provenance)
+        accelerator = _FakeAccelerator(remote)
+        request = api.EvaluationRequest(
+            rows=self.rows_2000,
+            prompts=self.prompts_20,
+            accelerator=accelerator,
+            synthesizer=synthesizer,
+            recognizer=_FakeRecognizer(),
+            provenance=provenance,
+            validation_index=0,
+            output_jsonl=self.root / "validation/results.jsonl",
+            summary_json=self.root / "validation/summary.json",
+            panel_dir=self.root / "validation/listening-panel",
+            temporary_audio_dir=self.root / "validation/audio",
+            assignment_manifest=self.root / "voice-assignment.json",
+            memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
         )
         with mock.patch.object(api, "require_memorization_gate", return_value=object()):
             with mock.patch.object(api, "_publish_listening_panel", side_effect=OSError("disk full")):
@@ -371,21 +667,151 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(report.row_count, 2_000)
         self.assertTrue(request.summary_json.exists())
 
-    def test_existing_assignment_manifest_rejects_changed_mapping(self) -> None:
+    def test_changed_identity_discards_sealed_journal_and_its_wav(self) -> None:
         api = _api()
+        item = api.build_voice_assignment(self.rows_2000, self.prompts_20)[0]
+        provenance = _provenance(api)
+        identity = api.build_evaluation_identity(0, api.build_voice_assignment(self.rows_2000, self.prompts_20), provenance)
+        changed = api.build_evaluation_identity(
+            0,
+            api.build_voice_assignment(self.rows_2000, self.prompts_20),
+            replace(provenance, checkpoint_sha256="a" * 64),
+        )
+        journal = self.root / "audio/rank-00/records.jsonl"
+        wav = journal.parent / "benchmark-0001.wav"
+        _write_wav(wav)
+        record = {
+            "benchmark_id": 1,
+            "evaluation_identity_sha256": identity.sha256,
+            "item_sha256": api._item_sha256(item),
+            "hypothesis": "код семь готов",
+            "audio_path": str(wav),
+            "audio_sha256": __import__("hashlib").sha256(wav.read_bytes()).hexdigest(),
+            "generation_latency_seconds": 0.0,
+            "asr_latency_seconds": 0.0,
+        }
+        record["record_sha256"] = api._journal_record_sha256(record)
+        api._atomic_write_jsonl(journal, [record])
+
+        loaded = api._load_rank_journal(journal, [item], changed)
+
+        self.assertEqual(loaded, {})
+        self.assertFalse(wav.exists())
+
+    def test_main_rank_rejects_missing_or_checksum_changed_remote_audio(self) -> None:
+        api = _api()
+        synthesizer = _FakeSynthesizer()
+        provenance = _provenance(api, synthesizer=synthesizer)
+        remote = _seal_remote_records(api, _remote_records(self.root), self.rows_2000, self.prompts_20, provenance)
+        Path(remote[0]["audio_path"]).unlink()
+        accelerator = _FakeAccelerator(remote)
         request = api.EvaluationRequest(
             rows=self.rows_2000,
             prompts=self.prompts_20,
-            accelerator=_FakeAccelerator(),
+            accelerator=accelerator,
+            synthesizer=synthesizer,
+            recognizer=_FakeRecognizer(),
+            provenance=provenance,
+            validation_index=0,
+            output_jsonl=self.root / "validation/results.jsonl",
+            summary_json=self.root / "validation/summary.json",
+            panel_dir=self.root / "validation/listening-panel",
+            temporary_audio_dir=self.root / "validation/audio",
+            assignment_manifest=self.root / "voice-assignment.json",
+            memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
+        )
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            with self.assertRaisesRegex(api.EvaluationIntegrityError, "record/audio"):
+                api.evaluate_checkpoint(request)
+
+    def test_committed_resume_recomputes_rows_metrics_and_panel_content(self) -> None:
+        api = _api()
+        synthesizer = _FakeSynthesizer()
+        provenance = _provenance(api, synthesizer=synthesizer)
+        remote = _seal_remote_records(api, _remote_records(self.root), self.rows_2000, self.prompts_20, provenance)
+        accelerator = _FakeAccelerator(remote)
+        request = api.EvaluationRequest(
+            rows=self.rows_2000,
+            prompts=self.prompts_20,
+            accelerator=accelerator,
+            synthesizer=synthesizer,
+            recognizer=_FakeRecognizer(),
+            provenance=provenance,
+            validation_index=0,
+            output_jsonl=self.root / "validation/results.jsonl",
+            summary_json=self.root / "validation/summary.json",
+            panel_dir=self.root / "validation/listening-panel",
+            temporary_audio_dir=self.root / "validation/audio",
+            assignment_manifest=self.root / "voice-assignment.json",
+            memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
+        )
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            api.evaluate_checkpoint(request)
+        tracked = [request.output_jsonl, request.summary_json, request.panel_dir / "voice_00.wav", request.panel_dir / "manifest.json", request.summary_json.with_name("validation-success.json")]
+        original = {path: path.read_bytes() for path in tracked}
+
+        def restore():
+            for path, content in original.items():
+                path.write_bytes(content)
+
+        def reseal():
+            seal_path = request.summary_json.with_name("validation-success.json")
+            seal = json.loads(seal_path.read_text())
+            seal["artifacts"]["results_jsonl"] = __import__("hashlib").sha256(request.output_jsonl.read_bytes()).hexdigest()
+            seal["artifacts"]["summary_json"] = __import__("hashlib").sha256(request.summary_json.read_bytes()).hexdigest()
+            api.atomic_write_json(seal_path, seal)
+
+        with self.subTest("summary"):
+            summary = json.loads(request.summary_json.read_text())
+            summary["metrics"]["utt-wer"] = 99.0
+            api.atomic_write_json(request.summary_json, summary)
+            reseal()
+            with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+                with self.assertRaisesRegex(api.EvaluationIntegrityError, "recomputed"):
+                    api.evaluate_checkpoint(request)
+            restore()
+
+        with self.subTest("jsonl"):
+            rows = [json.loads(line) for line in request.output_jsonl.read_text().splitlines()]
+            rows[0]["hypothesis"] = "подмена"
+            api._atomic_write_jsonl(request.output_jsonl, rows)
+            summary = json.loads(request.summary_json.read_text())
+            summary["results_sha256"] = __import__("hashlib").sha256(request.output_jsonl.read_bytes()).hexdigest()
+            api.atomic_write_json(request.summary_json, summary)
+            reseal()
+            with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+                with self.assertRaisesRegex(api.EvaluationIntegrityError, "row semantics"):
+                    api.evaluate_checkpoint(request)
+            restore()
+
+        with self.subTest("panel"):
+            panel = request.panel_dir / "voice_00.wav"
+            panel.write_bytes(panel.read_bytes() + b"tampered-but-still-pcm")
+            with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+                with self.assertRaisesRegex(api.EvaluationIntegrityError, "panel WAV"):
+                    api.evaluate_checkpoint(request)
+            restore()
+
+    def test_existing_assignment_manifest_rejects_changed_mapping(self) -> None:
+        api = _api()
+        accelerator = _FakeAccelerator()
+        request = api.EvaluationRequest(
+            rows=self.rows_2000,
+            prompts=self.prompts_20,
+            accelerator=accelerator,
             synthesizer=_FakeSynthesizer(),
             recognizer=_FakeRecognizer(),
-            validation_index=1,
+            provenance=_provenance(api),
+            validation_index=0,
             output_jsonl=self.root / "results.jsonl",
             summary_json=self.root / "summary.json",
             panel_dir=self.root / "panel",
             temporary_audio_dir=self.root / "audio",
             assignment_manifest=self.root / "mapping.json",
             memorization_path=self.root / "memorization",
+            wandb_logger=_logger(api, accelerator, self.root),
         )
         request.assignment_manifest.write_text(
             json.dumps({"format_version": 1, "assignment_sha256": "0" * 64, "rows": 2_000, "voices": 20}),
@@ -397,68 +823,16 @@ class EvaluationTests(unittest.TestCase):
 
     def test_wandb_logger_uses_existing_run_and_commits_each_index_once(self) -> None:
         api = _api()
-        output = self.root / "results.jsonl"
-        output.write_text("{}\n", encoding="utf-8")
-        panel = {f"voice_{index:02d}": self.prompts_20[index]["audio_path"] for index in range(20)}
-        report = api.EvaluationReport(
-            validation_index=0,
-            output_jsonl=output,
-            summary_json=self.root / "summary.json",
-            panel_dir=self.root / "panel",
-            assignment_checksum="a" * 64,
-            metrics={
-                "utt-wer": 0.1,
-                "utt-cer": 0.2,
-                "num-wer": 0.3,
-                "num-cer": 0.4,
-                "macro-utt-wer": 0.5,
-                "by_category": {"code": {"num-wer": 0.6}},
-            },
-            row_count=2_000,
-            worst_errors=({"benchmark_id": 1, "hypothesis": "семь"},),
-            panel_audio=panel,
-            generation_latency_seconds=1.25,
-            asr_latency_seconds=0.25,
-        )
+        report = _wandb_report(api, self.root, self.prompts_20)
+        accelerator = _FakeAccelerator()
+        logger = _logger(api, accelerator, self.root)
 
-        class Run:
-            id = "run-123"
-            dir = str(self.root / "wandb/run-123/files")
-            resumed = False
+        logger.log(report, 0)
+        self.assertGreaterEqual(accelerator.run.scan_calls, 3)
+        logger.log(report, 0)
 
-            def __init__(self) -> None:
-                self.media_logs = []
-
-            def log(self, values, **kwargs) -> None:
-                self.media_logs.append((values, kwargs))
-
-        run = Run()
-
-        class Accelerator:
-            def __init__(self) -> None:
-                self.scalar_logs = []
-
-            def get_tracker(self, name, unwrap=False):
-                if (name, unwrap) != ("wandb", True):
-                    raise AssertionError((name, unwrap))
-                return run
-
-            def log(self, values, step=None) -> None:
-                self.scalar_logs.append((values, step))
-
-        accelerator = Accelerator()
-        logger = api.WandbValidationLogger(
-            accelerator,
-            self.root / "wandb-run.json",
-            table_factory=lambda rows: ("table", tuple(row["benchmark_id"] for row in rows)),
-            audio_factory=lambda path: ("audio", Path(path).name),
-        )
-        with mock.patch.dict(os.environ, {"WANDB_API_KEY": "secret"}, clear=True):
-            logger.log(report, 0)
-            logger.log(report, 0)
-
-        self.assertEqual(len(run.media_logs), 1)
-        self.assertEqual(run.media_logs[0][1], {"step": 0, "commit": False})
+        self.assertEqual(len(accelerator.run.media_logs), 1)
+        self.assertEqual(accelerator.run.media_logs[0][1], {"step": 0, "commit": False})
         self.assertEqual(len(accelerator.scalar_logs), 1)
         self.assertEqual(accelerator.scalar_logs[0][1], 0)
         self.assertEqual(accelerator.scalar_logs[0][0]["utt-wer"], 0.1)
@@ -468,6 +842,56 @@ class EvaluationTests(unittest.TestCase):
         commit = json.loads((self.root / "wandb-validation-commits/validation-00.json").read_text(encoding="utf-8"))
         self.assertTrue(commit["committed"])
         self.assertNotIn("secret", json.dumps(manifest) + json.dumps(commit))
+
+    def test_wandb_remote_marker_survives_success_then_local_ledger_crash(self) -> None:
+        api = _api()
+        report = _wandb_report(api, self.root, self.prompts_20)
+        accelerator = _FakeAccelerator()
+        writes = 0
+
+        def crash_once(path, value):
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise OSError("ledger disk failure")
+            api.atomic_write_json(path, value)
+
+        logger = api.WandbValidationLogger(
+            accelerator,
+            self.root / "wandb-run.json",
+            table_factory=lambda rows: ("table",),
+            audio_factory=lambda path: ("audio", Path(path).name),
+            ledger_writer=crash_once,
+            remote_history_reader=lambda run, keys: run.scan_history(keys=keys),
+        )
+        with self.assertRaisesRegex(api.WandbSyncError, "preserved"):
+            logger.log(report, 0)
+        self.assertEqual(len(accelerator.run.history), 1)
+        scalar_calls = len(accelerator.scalar_logs)
+        media_calls = len(accelerator.run.media_logs)
+
+        _logger(api, accelerator, self.root).log(report, 0)
+
+        self.assertEqual(len(accelerator.scalar_logs), scalar_calls)
+        self.assertEqual(len(accelerator.run.media_logs), media_calls)
+        self.assertTrue(json.loads((self.root / "wandb-validation-commits/validation-00.json").read_text())["committed"])
+
+    def test_wandb_scalar_failure_after_media_attempt_resumes_one_remote_step(self) -> None:
+        api = _api()
+        report = _wandb_report(api, self.root, self.prompts_20)
+        accelerator = _FakeAccelerator()
+        accelerator.run.fail_scalars = True
+        logger = _logger(api, accelerator, self.root)
+
+        with self.assertRaises(api.WandbSyncError):
+            logger.log(report, 0)
+        accelerator.run.fail_scalars = False
+        logger.log(report, 0)
+
+        self.assertEqual(len(accelerator.run.history), 1)
+        history = accelerator.run.history[0]
+        self.assertEqual(history["_step"], 0)
+        self.assertEqual(history["validation/commit/00/scalars"], history["validation/commit/00/media"])
 
     def test_wandb_later_launch_requires_resume_must_for_persisted_run(self) -> None:
         api = _api()
