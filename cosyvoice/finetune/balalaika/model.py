@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Literal, TypeAlias
+from typing import Literal, Mapping, Sequence, TypeAlias
 
 import torch
 from torch import nn
@@ -226,13 +226,77 @@ def audit_trainable_parameters(model: nn.Module) -> TrainableAudit:
         if name not in approved_parameter_names:
             raise RuntimeError(f"trainable LoRA parameter is not part of the approved default adapter: {name}")
 
-    return TrainableAudit(
+    audit = TrainableAudit(
         target_modules=inventory,
         trainable_parameters=trainable,
         unexpected_dense_parameters=(),
         trainable_parameter_count=sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
         total_parameter_count=sum(parameter.numel() for parameter in model.parameters()),
     )
+    validate_trainable_audit_payload(asdict(audit))
+    return audit
+
+
+def validate_trainable_audit_payload(payload: Mapping[str, object]) -> None:
+    """Validate the exact persisted production ``TrainableAudit`` schema."""
+
+    required = {
+        "target_modules",
+        "trainable_parameters",
+        "unexpected_dense_parameters",
+        "trainable_parameter_count",
+        "total_parameter_count",
+    }
+    if set(payload) != required:
+        raise ValueError("trainable audit fields are invalid")
+    targets = _audit_names(payload["target_modules"], "target_modules")
+    trainable = _audit_names(payload["trainable_parameters"], "trainable_parameters")
+    unexpected = payload["unexpected_dense_parameters"]
+    trainable_count = payload["trainable_parameter_count"]
+    total_count = payload["total_parameter_count"]
+    if (
+        not isinstance(unexpected, Sequence)
+        or isinstance(unexpected, (str, bytes))
+        or tuple(unexpected) != ()
+        or isinstance(trainable_count, bool)
+        or not isinstance(trainable_count, int)
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or trainable_count < len(trainable)
+        or trainable_count >= total_count
+    ):
+        raise ValueError("trainable audit counts or dense inventory are invalid")
+    required_targets = {"speech_embedding", "llm_decoder", "llm.model.model.embed_tokens"}
+    if not required_targets.issubset(targets) or any(name.endswith("llm.model.lm_head") for name in targets):
+        raise ValueError("trainable audit target coverage is invalid")
+    for name in trainable:
+        matches = tuple(target for target in targets if name.startswith(f"{target}."))
+        if len(matches) != 1:
+            raise ValueError("trainable LoRA tensor does not map to exactly one approved target")
+        suffix = name[len(matches[0]) + 1:]
+        if suffix not in {
+            "lora_A.default.weight",
+            "lora_B.default.weight",
+            "lora_embedding_A.default",
+            "lora_embedding_B.default",
+        }:
+            raise ValueError("trainable audit contains an unapproved LoRA tensor")
+    for target in targets:
+        suffixes = {name[len(target) + 1:] for name in trainable if name.startswith(f"{target}.")}
+        if suffixes not in (
+            {"lora_A.default.weight", "lora_B.default.weight"},
+            {"lora_embedding_A.default", "lora_embedding_B.default"},
+        ):
+            raise ValueError("approved target lacks one complete default LoRA tensor pair")
+
+
+def _audit_names(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"trainable audit {field} must be a sequence")
+    names = tuple(value)
+    if not names or any(not isinstance(name, str) or not name for name in names) or len(names) != len(set(names)):
+        raise ValueError(f"trainable audit {field} must contain unique nonempty names")
+    return names
 
 
 def _default_lora_parameters(wrapper: nn.Module) -> tuple[tuple[str, nn.Parameter], ...]:

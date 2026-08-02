@@ -71,3 +71,22 @@ No real model, GPU, corpus, training run, install, upload, or credential access 
 
 - `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -v` — 32 passed.
 - Full Balalaika/compile/diff verification was run after the final implementation changes before commit.
+
+## Fix Round 3: exact adapter audit and root-only evidence exclusions
+
+### Root cause
+
+- The manifest verifier accepted a minimal `trainable_parameters` list instead of the complete production `TrainableAudit` schema, allowing unverifiable target coverage and unapproved tensor names.
+- `_evidence_checksums` excluded every file whose basename was `memorization_manifest.json` or `memorization_success.json`, including nested diagnostic files that must remain sealed evidence.
+
+### TDD evidence
+
+1. RED: a production-shaped audit fixture plus forbidden `llm.model.lm_head`, dense-tensor, and malformed-audit mutations showed that the old verifier accepted audit structures beyond the production contract. A nested generated diagnostic named `memorization_manifest.json` and a sibling named `memorization_success.json` were absent from the evidence map.
+2. GREEN: `model.validate_trainable_audit_payload` is the shared production validator. It enforces the exact five-field schema, required active targets, complete approved LoRA pairs, no dense trainables, unique names, forbidden-Qwen-head exclusion, and coherent parameter totals. `audit_trainable_parameters` invokes it before returning; the memorization verifier uses the same helper and requires exact fixed `LoraSettings`.
+3. GREEN: evidence exclusion now compares only `root / _MANIFEST_NAME` and `root / _SEAL_NAME`. Nested diagnostics of any basename are checksummed. Regression coverage verifies nested manifest/seal-named diagnostics are recorded and that tampering, removing, or adding any nested diagnostic causes `require_memorization_gate` to reject the evidence.
+
+### Verification
+
+- `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -q` — 32 passed.
+- `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -q` — 127 passed.
+- `rtk python -m compileall -q cosyvoice/finetune/balalaika/memorization.py cosyvoice/finetune/balalaika/model.py cosyvoice/llm/llm.py` and `rtk git diff --check` passed.

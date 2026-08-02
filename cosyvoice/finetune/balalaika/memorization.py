@@ -20,7 +20,7 @@ from .artifacts import atomic_write_json, sha256_file
 from .cache import CacheManifest, TOKEN_MAX, TOKEN_MIN
 from .config import DEFAULT_SEED
 from .data import CachedRow
-from .model import LoraSettings, audit_trainable_parameters, inject_lora, load_base_llm
+from .model import LoraSettings, audit_trainable_parameters, inject_lora, load_base_llm, validate_trainable_audit_payload
 from .training import SchedulerSpec, _build_scheduler
 
 
@@ -463,13 +463,14 @@ def _run_config(request: MemorizationRequest) -> dict[str, object]:
 
 
 def _evidence_checksums(root: Path) -> dict[str, dict[str, str]]:
+    excluded = {root / _MANIFEST_NAME, root / _SEAL_NAME}
     return {
         str(path.relative_to(root)): {
             "path": str(path.relative_to(root)),
             "sha256": sha256_file(path),
         }
         for path in sorted(root.rglob("*"))
-        if path.is_file() and path.name not in {_MANIFEST_NAME, _SEAL_NAME}
+        if path.is_file() and path not in excluded
     }
 
 
@@ -562,9 +563,12 @@ def _validate_adapter(adapter: Mapping[str, object]) -> None:
     if set(adapter) != {"settings", "trainable_inventory"} or adapter.get("settings") != asdict(LoraSettings()):
         raise ValueError("memorization adapter settings are invalid")
     audit = adapter.get("trainable_inventory")
-    trainable = audit.get("trainable_parameters") if isinstance(audit, dict) else None
-    if not isinstance(trainable, list) or not trainable or any(not isinstance(name, str) or not name for name in trainable):
+    if not isinstance(audit, dict):
         raise ValueError("memorization adapter audit is invalid")
+    try:
+        validate_trainable_audit_payload(audit)
+    except ValueError as exc:
+        raise ValueError("memorization adapter audit is invalid") from exc
 
 
 def _validate_run_config(config: object) -> None:

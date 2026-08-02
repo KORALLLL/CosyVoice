@@ -130,11 +130,14 @@ class MemorizationSelectionTests(unittest.TestCase):
             max_grad_norm=0.7,
             model_loader=lambda _: model,
             adapter_injector=lambda value, _: value,
-            audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+            audit_fn=lambda _: _audit_payload(),
             dataloader_factory=_fixture_loader,
             accelerator_factory=lambda **_: _FakeAccelerator(),
             wav_writer=lambda _, rows, root: [
                 (root / f"{index}.wav").write_bytes(b"RIFF") for index, _ in enumerate(rows)
+            ] + [
+                (root / "memorization_manifest.json").write_bytes(b"nested-manifest"),
+                (root / "memorization_success.json").write_bytes(b"nested-seal"),
             ],
         )
 
@@ -184,12 +187,24 @@ class MemorizationSelectionTests(unittest.TestCase):
             manifest["provenance"]["adapter"],
             {
                 "settings": {"r": 64, "alpha": 128, "dropout": 0.05, "bias": "none"},
-                "trainable_inventory": {"trainable_parameters": ["lora.fixture"]},
+                "trainable_inventory": _audit_payload(),
             },
         )
         verified = require_memorization_gate(report.path, expected_provenance=manifest["provenance"])
         self.assertEqual(verified.path, report.path)
         self.assertEqual(set(manifest["evidence"]), {"cross_entropy.json", "teacher_forced_tokens.json", *manifest["generated_wavs"]})
+        nested = report.path / "generated_wavs" / "memorization_manifest.json"
+        nested.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            require_memorization_gate(report.path, expected_provenance=manifest["provenance"])
+        nested.write_bytes(b"nested-manifest")
+        nested.unlink()
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            require_memorization_gate(report.path, expected_provenance=manifest["provenance"])
+        nested.write_bytes(b"nested-manifest")
+        (report.path / "generated_wavs" / "added-diagnostic.bin").write_bytes(b"added")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            require_memorization_gate(report.path, expected_provenance=manifest["provenance"])
         token_evidence = json.loads((output / "memorization" / "teacher_forced_tokens.json").read_text())
         self.assertEqual(set(token_evidence), {row.source_relative_path for row in selected})
         self.assertTrue(all("predictions" in item and "targets" in item for item in token_evidence.values()))
@@ -206,7 +221,7 @@ class MemorizationSelectionTests(unittest.TestCase):
             check_every=1,
             model_loader=lambda _: _MemorizingModel({row.source_relative_path: row.speech_token_len for row in selected}),
             adapter_injector=lambda value, _: value,
-            audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+            audit_fn=lambda _: _audit_payload(),
             dataloader_factory=_fixture_loader,
             accelerator_factory=lambda **_: _FakeAccelerator(),
         )
@@ -240,7 +255,7 @@ class MemorizationSelectionTests(unittest.TestCase):
         report = _publish_success(
             root, request, selected,
             [MemorizationCheck(index, index, exact) for index in (1, 2, 3)],
-            {}, [0.0, 0.0, 0.0], {"trainable_parameters": ["lora.fixture"]},
+            {}, [0.0, 0.0, 0.0], _audit_payload(),
             "b" * 64, _MemorizingModel({}), 3,
         )
 
@@ -253,7 +268,7 @@ class MemorizationSelectionTests(unittest.TestCase):
             split_plan=self.plan, cache=self.cache, output_root=self.root / "self-validate",
             base_model_dir=self.root / "base", max_steps=3, check_every=1,
             model_loader=lambda _: _MemorizingModel({row.source_relative_path: row.speech_token_len for row in selected}),
-            adapter_injector=lambda value, _: value, audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+            adapter_injector=lambda value, _: value, audit_fn=lambda _: _audit_payload(),
             dataloader_factory=_fixture_loader, accelerator_factory=lambda **_: _FakeAccelerator(),
         )
         report = run_memorization_gate(request)
@@ -274,6 +289,9 @@ class MemorizationSelectionTests(unittest.TestCase):
             "base": lambda value: value["provenance"].update(base_checkpoint_sha256="BAD"),
             "tokenizer": lambda value: value["provenance"]["run_config"].update(tokenizer_identity=""),
             "adapter": lambda value: value["provenance"].update(adapter={"settings": {}, "trainable_inventory": []}),
+            "audit-schema": lambda value: value["provenance"]["adapter"].update(trainable_inventory={}),
+            "audit-target": lambda value: value["provenance"]["adapter"]["trainable_inventory"]["target_modules"].append("llm.model.lm_head"),
+            "audit-trainable": lambda value: value["provenance"]["adapter"]["trainable_inventory"].update(trainable_parameters=["speech_embedding.dense.weight"]),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):
@@ -295,7 +313,7 @@ class MemorizationSelectionTests(unittest.TestCase):
             check_every=1,
             model_loader=lambda _: _MemorizingModel({}, exact_after=99),
             adapter_injector=lambda value, _: value,
-            audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+            audit_fn=lambda _: _audit_payload(),
             dataloader_factory=_fixture_loader,
             accelerator_factory=lambda **_: _FakeAccelerator(),
             wav_writer=lambda *_: None,
@@ -324,7 +342,7 @@ class MemorizationSelectionTests(unittest.TestCase):
                     check_every=1,
                     model_loader=lambda _, model=model: model,
                     adapter_injector=lambda value, _: value,
-                    audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+                    audit_fn=lambda _: _audit_payload(),
                     dataloader_factory=_fixture_loader,
                     accelerator_factory=lambda **_: accelerator,
                 )
@@ -348,7 +366,7 @@ class MemorizationSelectionTests(unittest.TestCase):
             check_every=1,
             model_loader=lambda _: _MemorizingModel({row.source_relative_path: row.speech_token_len for row in selected}),
             adapter_injector=lambda value, _: value,
-            audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+            audit_fn=lambda _: _audit_payload(),
             dataloader_factory=_fixture_loader,
             accelerator_factory=lambda **_: _FakeAccelerator(),
         )
@@ -417,6 +435,24 @@ class _MemorizingModel(torch.nn.Module):
 
 def _fixture_loader(rows, **_):
     return [{"utts": [row.source_relative_path]} for row in rows]
+
+
+def _audit_payload() -> dict[str, object]:
+    targets = ["speech_embedding", "llm_decoder", "llm.model.model.embed_tokens"]
+    return {
+        "target_modules": targets,
+        "trainable_parameters": [
+            "speech_embedding.lora_embedding_A.default",
+            "speech_embedding.lora_embedding_B.default",
+            "llm_decoder.lora_A.default.weight",
+            "llm_decoder.lora_B.default.weight",
+            "llm.model.model.embed_tokens.lora_embedding_A.default",
+            "llm.model.model.embed_tokens.lora_embedding_B.default",
+        ],
+        "unexpected_dense_parameters": [],
+        "trainable_parameter_count": 12,
+        "total_parameter_count": 120,
+    }
 
 
 def _write_test_seal(root: Path) -> None:
