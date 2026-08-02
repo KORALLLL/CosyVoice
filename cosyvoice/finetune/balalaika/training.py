@@ -602,6 +602,23 @@ def _callable_fingerprint(value: Callable[..., object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_DYNAMIC_NAME_BUILTINS = frozenset(
+    {
+        "__import__",
+        "delattr",
+        "dir",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "hasattr",
+        "locals",
+        "setattr",
+        "vars",
+    }
+)
+
+
 def _callable_semantics(value: Callable[..., object], active: set[int]) -> dict[str, object]:
     identity = id(value)
     if identity in active:
@@ -624,6 +641,11 @@ def _callable_semantics(value: Callable[..., object], active: set[int]) -> dict[
         if isinstance(value, types.FunctionType):
             return _function_semantics(value, active)
         if isinstance(value, types.BuiltinFunctionType):
+            if (
+                value.__module__ == "builtins"
+                and value.__qualname__ in _DYNAMIC_NAME_BUILTINS
+            ):
+                raise ValueError("scheduler callable uses dynamic name resolution")
             return {
                 "kind": "builtin",
                 "module": value.__module__,
@@ -685,6 +707,11 @@ def _referenced_global_names(value: types.CodeType) -> set[str]:
                 raise ValueError("scheduler callable has an invalid global reference")
             names.add(instruction.argval)
         elif instruction.opname in {"LOAD_NAME", "LOAD_FROM_DICT_OR_GLOBALS"}:
+            raise ValueError("scheduler callable uses dynamic name resolution")
+        elif (
+            instruction.opname in {"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"}
+            and instruction.argval == "__dict__"
+        ):
             raise ValueError("scheduler callable uses dynamic name resolution")
     for constant in value.co_consts:
         if isinstance(constant, types.CodeType):

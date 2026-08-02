@@ -191,10 +191,56 @@ def _module_backed_schedule(step: int) -> float:
 
 
 _NESTED_GLOBAL_MULTIPLIER = 0.5
+_DYNAMIC_SCHEDULER_GLOBAL_NAME = "_NESTED_GLOBAL_MULTIPLIER"
+_DYNAMIC_SCHEDULER_ATTRIBUTE = "multiplier"
+_DYNAMIC_SCHEDULER_LOCAL_NAME = "step"
 
 
 def _nested_global_schedule(step: int) -> float:
     return 1.0 if step < 2 else (lambda: _NESTED_GLOBAL_MULTIPLIER)()
+
+
+def _globals_backed_schedule(step: int) -> float:
+    return 1.0 if step < 2 else globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+
+
+def _aliased_globals_schedule(step: int, namespace=globals) -> float:
+    return 1.0 if step < 2 else namespace()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+
+
+def _locals_backed_schedule(step: int) -> float:
+    return 1.0 if step < 2 else locals()[_DYNAMIC_SCHEDULER_LOCAL_NAME]
+
+
+def _dynamic_scheduler_holder() -> None:
+    return None
+
+
+setattr(_dynamic_scheduler_holder, _DYNAMIC_SCHEDULER_ATTRIBUTE, 0.5)
+
+
+def _vars_backed_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else vars(_dynamic_scheduler_holder)[_DYNAMIC_SCHEDULER_ATTRIBUTE]
+    )
+
+
+def _getattr_backed_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else getattr(_dynamic_scheduler_holder, _DYNAMIC_SCHEDULER_ATTRIBUTE)
+    )
+
+
+def _dunder_dict_backed_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else _dynamic_scheduler_holder.__dict__[_DYNAMIC_SCHEDULER_ATTRIBUTE]
+    )
 
 
 def _constant_lambda_scheduler(parameter: torch.nn.Parameter):
@@ -204,6 +250,35 @@ def _constant_lambda_scheduler(parameter: torch.nn.Parameter):
 
 
 class AccelerateTrainingTests(unittest.TestCase):
+    def test_scheduler_identity_rejects_globals_dynamic_name_lookup(self) -> None:
+        api = _api()
+        parameter = torch.nn.Parameter(torch.tensor(0.0))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            torch.optim.AdamW([parameter], lr=1e-4), _globals_backed_schedule
+        )
+
+        with self.assertRaisesRegex(ValueError, "dynamic name resolution"):
+            api._scheduler_identity(scheduler)
+
+    def test_scheduler_identity_rejects_equivalent_dynamic_name_lookups(self) -> None:
+        api = _api()
+
+        for schedule in (
+            _aliased_globals_schedule,
+            _locals_backed_schedule,
+            _vars_backed_schedule,
+            _getattr_backed_schedule,
+            _dunder_dict_backed_schedule,
+        ):
+            with self.subTest(schedule=schedule.__name__):
+                parameter = torch.nn.Parameter(torch.tensor(0.0))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    torch.optim.AdamW([parameter], lr=1e-4), schedule
+                )
+
+                with self.assertRaisesRegex(ValueError, "dynamic name resolution"):
+                    api._scheduler_identity(scheduler)
+
     def test_scheduler_identity_fingerprints_globals_in_nested_code(self) -> None:
         api = _api()
         first_parameter = torch.nn.Parameter(torch.tensor(0.0))
