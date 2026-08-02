@@ -239,3 +239,72 @@ exit 0
 The new resolver keys identity from semantic global loads rather than every `co_names` entry, so attribute names are not mistaken for independent globals. Nested code is traversed, actual builtin bindings are fingerprinted when supported, and unresolved or dynamic lookup is rejected. No source path, line number, object `repr`, or module-name-only fallback is used.
 
 No real eight-GPU, BF16 model, production corpus, credential, installation, or upload was used. The passing smoke remains real two-process CPU DDP through Accelerate, not eight-GPU hardware qualification.
+
+## Fix Round 4
+
+### Finding addressed
+
+Scheduler callable identity now rejects dynamic namespace and name discovery instead of fingerprinting only the lookup builtin. Direct and aliased `globals`, `locals`, `vars`, and `getattr` paths fail closed, as do direct `__dict__` reads and the closely equivalent dynamic builtins `__import__`, `delattr`, `dir`, `eval`, `exec`, `hasattr`, and `setattr`.
+
+Builtin validation happens in the recursive semantic serializer, so the rule also covers aliases stored in defaults, closures, nested functions, tuples, and mappings. Bytecode validation rejects `__dict__` loads in the root function or any nested code object. Statically referenced immutable globals, closures, defaults, and nested code retain their existing semantic fingerprints, and equivalent default constant schedules remain stable.
+
+### TDD evidence
+
+The production change that makes the regressions pass is rejection of dynamic lookup at the builtin-semantic and `__dict__` bytecode boundaries. Before that change, direct `globals()[dynamic_name]`, an aliased `globals` default, `locals`, `vars`, `getattr`, and `__dict__` were all accepted:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_globals_dynamic_name_lookup tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_equivalent_dynamic_name_lookups -v
+Ran 2 tests in 0.050s
+FAILED (failures=6)
+```
+
+After the minimal fail-closed validation:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_globals_dynamic_name_lookup tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_equivalent_dynamic_name_lookups -v
+Ran 2 tests in 0.077s
+OK
+```
+
+### Files and commit
+
+- `cosyvoice/finetune/balalaika/training.py`: rejects dynamic lookup builtins by resolved identity and rejects `__dict__` load bytecode.
+- `tests/finetune/balalaika/test_training.py`: covers direct and aliased `globals`, `locals`, `vars`, `getattr`, and `__dict__` lookup paths.
+- Code/tests commit: `d94e64d69f84f0fbb25e943230139299d38f72ee` (`fix: reject dynamic scheduler lookups`).
+
+### Verification
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_globals_dynamic_name_lookup tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_equivalent_dynamic_name_lookups tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_fingerprints_globals_in_nested_code tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_module_backed_mutable_attribute tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_default_lambda_scheduler_identity_is_stable_across_instances tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_lambda_scheduler_identity_includes_future_callable_semantics tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_resume_rejects_changed_lambda_scheduler_semantics -v
+Ran 7 tests in 1.074s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 25 tests in 2.162s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_artifacts tests.finetune.balalaika.test_cache tests.finetune.balalaika.test_data tests.finetune.balalaika.test_metrics tests.finetune.balalaika.test_model tests.finetune.balalaika.test_sources tests.finetune.balalaika.test_tokenizer tests.finetune.balalaika.test_training tests.finetune.balalaika.test_validation_data -v
+Ran 118 tests in 5.484s
+OK
+
+rtk accelerate launch --cpu --num_processes 2 -m tests.finetune.balalaika.accelerate_smoke
+exit 0
+
+rtk python -m py_compile cosyvoice/finetune/balalaika/training.py tests/finetune/balalaika/test_training.py tests/finetune/balalaika/accelerate_smoke.py
+exit 0
+
+rtk git diff --check
+exit 0
+```
+
+### Self-review
+
+- Dynamic lookup is rejected by the resolved builtin object, not merely its source-level name. A shadowed pure-Python function named `globals` can still be fingerprinted, while an actual `builtins.globals` alias cannot evade validation.
+- The same recursive callable serializer handles direct globals, defaults, closures, nested code, and values inside supported immutable containers, so there is no alias-specific partial fingerprint.
+- `__dict__` access is rejected recursively at bytecode inspection. No attempt is made to infer the runtime stack target or capture only part of a mutable namespace.
+- Existing nested immutable-global and equivalent default-scheduler controls passed unchanged.
+- The conservative rule also rejects some statically resolvable uses of `getattr`; this is intentional because the implementation does not claim a sound bytecode data-flow proof for attribute targets.
+
+### Concerns and qualification boundary
+
+No model checkpoint, production data, credential, installation, upload, or other external work was used. The smoke remains real two-process CPU DDP through Accelerate; real eight-GPU BF16 behavior remains a hardware qualification boundary rather than a claim of this fix round.
