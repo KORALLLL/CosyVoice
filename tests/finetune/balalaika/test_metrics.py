@@ -12,7 +12,7 @@ from cosyvoice.finetune.balalaika.metrics import (
 
 
 def validation_row(*, text: str, hard_number: str, normalized_gold: str, category: str = "cardinal") -> dict[str, object]:
-    return {"text": text, "hard_number": hard_number, "normalized_gold": normalized_gold, "category": category}
+    return {"stressed": text, "hard_number": hard_number, "normalized_gold": normalized_gold, "category": category}
 
 
 class MetricsTests(unittest.TestCase):
@@ -51,6 +51,17 @@ class MetricsTests(unittest.TestCase):
             normalized_gold="Код двадцать пять готов код двадцать пять готов",
         )
         with self.assertRaisesRegex(NumberSpanError, "ambiguous"):
+            extract_number_span(row)
+
+    def test_start_and_end_number_anchors_are_constrained_to_utterance_boundaries(self):
+        starts = validation_row(text="25 рублей", hard_number="25", normalized_gold="двадцать пять рублей")
+        ends = validation_row(text="Оплатите 25", hard_number="25", normalized_gold="Оплатите двадцать пять")
+        self.assertEqual((extract_number_span(starts).reference_start, extract_number_span(starts).reference_end), (0, 2))
+        self.assertEqual((extract_number_span(ends).reference_start, extract_number_span(ends).reference_end), (1, 3))
+
+    def test_number_span_requires_stressed_instead_of_falling_back_to_text(self):
+        row = {"text": "Оплатите 25 рублей", "hard_number": "25", "normalized_gold": "Оплатите двадцать пять рублей"}
+        with self.assertRaisesRegex(NumberSpanError, "missing required string: stressed"):
             extract_number_span(row)
 
     def test_alignment_counts_substitution_deletion_and_insertion(self):

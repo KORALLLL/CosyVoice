@@ -83,7 +83,7 @@ def normalize_asr_text(text: str) -> str:
 def extract_number_span(row: Mapping[str, object]) -> NumberSpan:
     """Locate one spoken number phrase using its raw-text context anchors."""
 
-    raw_text = _required_string(row, "stressed") if "stressed" in row else _required_string(row, "text")
+    raw_text = _required_string(row, "stressed")
     hard_number = _required_string(row, "hard_number")
     gold = _required_string(row, "normalized_gold")
     raw_tokens = normalize_asr_text(raw_text).split()
@@ -100,9 +100,12 @@ def extract_number_span(row: Mapping[str, object]) -> NumberSpan:
     for raw_start in raw_occurrences:
         raw_end = raw_start + len(number_tokens)
         prefix, suffix = raw_tokens[:raw_start], raw_tokens[raw_end:]
-        for prefix_start in _subsequence_starts(gold_tokens, prefix):
+        prefix_starts = (0,) if not prefix else _subsequence_starts(gold_tokens, prefix)
+        suffix_starts = (len(gold_tokens),) if not suffix else None
+        for prefix_start in prefix_starts:
             span_start = prefix_start + len(prefix)
-            for suffix_start in _subsequence_starts(gold_tokens, suffix, minimum=span_start):
+            candidate_suffix_starts = suffix_starts if suffix_starts is not None else _subsequence_starts(gold_tokens, suffix, minimum=span_start)
+            for suffix_start in candidate_suffix_starts:
                 if suffix_start > span_start:
                     candidates.add((span_start, suffix_start))
 
