@@ -59,6 +59,7 @@ class WorkflowOptions:
     keep_eval_audio: bool = False
     keep_checkpoints: int = 3
     resume_checkpoint: Path | None = None
+    allow_test_export: bool = False
 
     def __post_init__(self) -> None:
         if self.approve_pilot_sha256 is not None and _SHA256.fullmatch(self.approve_pilot_sha256) is None:
@@ -67,6 +68,8 @@ class WorkflowOptions:
             raise ValueError("token_limit, batch_limit, and accumulation_steps must be positive")
         if self.keep_checkpoints < 1:
             raise ValueError("keep_checkpoints must be positive")
+        if type(self.allow_test_export) is not bool:
+            raise ValueError("allow_test_export must be boolean")
         if not self.wandb_project.strip() or not self.wandb_name.strip():
             raise ValueError("W&B project and run name must be nonempty")
         if len(self.paths.visible_devices) != 8 or len(set(self.paths.visible_devices)) != 8:
@@ -156,6 +159,8 @@ class ProductionBackend:
     """
 
     def __init__(self, options: WorkflowOptions) -> None:
+        if options.allow_test_export:
+            raise StageRequirementError("ProductionBackend cannot enable test export")
         from accelerate import Accelerator
 
         self.accelerator = Accelerator(
@@ -462,6 +467,7 @@ class ProductionBackend:
             "output_dir": str(final.path.parent),
             "manifest": str(final.path),
             "manifest_sha256": sha256_file(final.path),
+            "mode": final.mode,
             "production_ready": final.production_ready,
         }
 
@@ -1160,6 +1166,7 @@ def _workflow_identity(options: WorkflowOptions) -> dict[str, object]:
         "wandb_name": options.wandb_name,
         "keep_eval_audio": options.keep_eval_audio,
         "keep_checkpoints": options.keep_checkpoints,
+        "allow_test_export": options.allow_test_export,
     }
 
 
@@ -1182,6 +1189,7 @@ def _options_from_workflow_payload(payload: Mapping[str, object]) -> WorkflowOpt
         wandb_name=cast(str, value.get("wandb_name")),
         keep_eval_audio=cast(bool, value.get("keep_eval_audio")),
         keep_checkpoints=cast(int, value.get("keep_checkpoints")),
+        allow_test_export=cast(bool, value.get("allow_test_export", False)),
     )
 
 
@@ -1303,8 +1311,14 @@ def run_phase2(args: argparse.Namespace) -> int:
         options, backend, "final_export", collective=False,
         operation=lambda: backend.export(options, trained),
     )
-    if exported.get("production_ready") is not True:
-        raise StageRequirementError("Task 11 final export is not production-ready")
+    production_export = exported.get("production_ready") is True and exported.get("mode") == "production"
+    authenticated_test_export = (
+        options.allow_test_export
+        and exported.get("production_ready") is False
+        and exported.get("mode") == "test"
+    )
+    if not production_export and not authenticated_test_export:
+        raise StageRequirementError("Task 11 final export is neither production-ready nor an authorized test export")
     _ensure_stage(options, backend, "complete", collective=False, operation=lambda: dict(exported))
     return int(ExitCode.SUCCESS)
 
@@ -1438,6 +1452,7 @@ def _options_from_namespace(args: argparse.Namespace) -> WorkflowOptions:
         wandb_project=args.wandb_project, wandb_name=args.wandb_name,
         keep_eval_audio=args.keep_eval_audio, keep_checkpoints=args.keep_checkpoints,
         resume_checkpoint=args.resume_checkpoint,
+        allow_test_export=False,
     )
 
 

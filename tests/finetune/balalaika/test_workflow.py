@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import io
 import json
 import os
@@ -143,7 +144,7 @@ class FakeBackend:
 
     def export(self, options: WorkflowOptions, phase2: dict[str, object]) -> dict[str, object]:
         result = self._call("export")
-        result.update({"production_ready": True, "final_manifest_sha256": "f" * 64})
+        result.update({"mode": "production", "production_ready": True, "final_manifest_sha256": "f" * 64})
         return result
 
 
@@ -553,6 +554,18 @@ class WorkflowTests(unittest.TestCase):
         source = (Path(__file__).parents[3] / "cosyvoice/finetune/balalaika/workflow.py").read_text(encoding="utf-8")
         for forbidden in ("upload_file", "upload_folder", "HfApi", "create_repo", "push_to_hub"):
             self.assertNotIn(forbidden, source)
+
+    def test_test_export_capability_is_not_cli_or_production_accessible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            options = _args(Path(directory), FakeBackend()).options
+            self.assertFalse(options.allow_test_export)
+            test_options = replace(options, allow_test_export=True)
+            with self.assertRaisesRegex(StageRequirementError, "test export"):
+                ProductionBackend(test_options)
+
+        parser_output = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(parser_output):
+            main(["phase2", "--allow-test-export"])
 
 
 if __name__ == "__main__":

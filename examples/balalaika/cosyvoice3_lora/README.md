@@ -260,7 +260,7 @@ The principal default tree is:
 /workspace/cosyvoice3-balalaika-lora/
 ├── split_plan/                 # immutable joined rows and 0.95 assignments
 ├── validation_data/            # authenticated hard-number rows/manifest
-├── tokenizer_qualification/    # ONNX/CUDA tokenizer evidence
+├── stages/tokenizer_qualification.json  # ONNX/CUDA tokenizer evidence
 ├── pilot/                      # A/B WAVs, token arrays, index.md
 ├── memorization_cache/         # exactly four tokenized real audios
 ├── memorization/               # 3x exact-accuracy evidence and seal
