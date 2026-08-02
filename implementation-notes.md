@@ -11,6 +11,12 @@
   installed distribution version before any source inventory begins.
 - No pilot, memorization, cache, validation, or training artifact was produced
   by the failed launch.
+- Runtime follow-up exposed an incompatibility in the upstream 20231117 pin:
+  it requires Triton below 3 and pip began replacing the qualified Torch 2.8
+  CUDA 12.8 stack. The install was interrupted, the exact Torch/Torchaudio
+  2.8.0+cu128 and Triton 3.4.0 stack was restored and requalified on all eight
+  GPUs, and the Blackwell override now selects OpenAI Whisper 20250625. That
+  release supports Python 3.12 and current Triton versions.
 
 ## 2026-08-02 - Execution setup
 

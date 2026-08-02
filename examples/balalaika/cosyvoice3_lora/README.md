@@ -37,13 +37,13 @@ does not substitute raw transcripts.
 
 ## CUDA 12.8 environment
 
-Use a clean Python 3.11 environment on a host with the CUDA 12.8 driver stack
+Use a clean Python 3.12 environment on a host with the CUDA 12.8 driver stack
 and eight RTX 5090 cards. Install the upstream dependencies first, then upgrade
 to the qualified Blackwell versions so the upstream CUDA 12.1 pins do not win.
 
 ```bash
 cd /workspace/CosyVoice
-python3.11 -m venv .venv-cu128
+python3.12 -m venv .venv-cu128
 source .venv-cu128/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
@@ -54,10 +54,11 @@ python -m pip install --upgrade \
 ```
 
 Do not downgrade Torch after this step. Confirm the qualified versions and
-providers before any run. The recipe requirements repeat the upstream
-`openai-whisper` pin deliberately because audio tokenization imports its
-`whisper` module directly; preflight records this version and fails before
-corpus hashing if it is absent.
+providers before any run. The recipe overrides upstream `openai-whisper`
+20231117 with 20250625: the older release caps Triton below 3, while Torch 2.8
+requires Triton 3.4. Audio tokenization imports the package's `whisper` module
+directly, so preflight records its version and fails before corpus hashing if
+it is absent.
 
 ```bash
 python - <<'PY'

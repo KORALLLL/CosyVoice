@@ -6,4 +6,4 @@ pyarrow==25.0.0
 wandb==0.28.1
 onnx-asr[gpu,hub]==0.12.0
 onnxruntime-gpu[cuda,cudnn]<1.27
-openai-whisper==20231117
+openai-whisper==20250625

@@ -131,7 +131,7 @@ class ArtifactTests(unittest.TestCase):
             "pyarrow": "25.0.0",
             "wandb": "0.28.1",
             "onnx-asr": "0.12.0",
-            "openai-whisper": "20231117",
+            "openai-whisper": "20250625",
         }
 
         with (
@@ -146,7 +146,16 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(environment["gpus"][0], {"name": "NVIDIA GeForce RTX 5090", "capability": [12, 0]})
         self.assertEqual(environment["onnxruntime"], "1.26.0")
         self.assertEqual(environment["onnx_asr"], "0.12.0")
-        self.assertEqual(environment["openai_whisper"], "20231117")
+        self.assertEqual(environment["openai_whisper"], "20250625")
+
+    def test_blackwell_requirements_override_whisper_for_python312_and_triton3(self):
+        requirements = (
+            Path(__file__).parents[3]
+            / "examples/balalaika/cosyvoice3_lora/requirements-cu128.txt"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("openai-whisper==20250625", requirements.splitlines())
+        self.assertNotIn("openai-whisper==20231117", requirements.splitlines())
 
     def test_collect_environment_rejects_missing_openai_whisper(self):
         cuda = types.SimpleNamespace(
