@@ -119,9 +119,11 @@ class FinalModelManifest:
     llm_sha256: str
     base_checkpoint_sha256: str
     adapter_weights_sha256: str
+    adapter_manifest_sha256: str
     target_modules: tuple[str, ...]
     phase2_checkpoint_sha256: str
     validation_summary_sha256: str
+    mode: Literal["test", "production"]
     production_ready: bool = False
     base_assets_sha256: str = ""
 
@@ -137,6 +139,8 @@ class VerifyRequest:
     output_dir: Path
     pipeline_factory: object | None = None
     test_mode: bool = False
+    artifact_root: Path | None = None
+    expected_local_rank: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_model_dir, Path) or not isinstance(self.output_dir, Path):
@@ -149,6 +153,10 @@ class VerifyRequest:
             raise ValueError("strict verification requires exactly twenty reserved voices")
         if self.test_mode is not True and self.pipeline_factory is not None:
             raise ValueError("production strict verification constructs normal CosyVoice3 directly")
+        if self.artifact_root is not None and not isinstance(self.artifact_root, Path):
+            raise TypeError("artifact_root must be a pathlib.Path")
+        if isinstance(self.expected_local_rank, bool) or not isinstance(self.expected_local_rank, int) or self.expected_local_rank < 0:
+            raise ValueError("expected_local_rank must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -161,7 +169,7 @@ class VerificationReport:
     audio_paths: tuple[Path, ...]
     audio_checksums: Mapping[str, str]
     asr_results: tuple[str, ...]
-    library_identities: Mapping[str, str]
+    library_identities: Mapping[str, object]
 
 
 AdapterModel: TypeAlias = CosyVoice3LM
@@ -492,10 +500,8 @@ def merge_adapter(base_dir: Path, adapter_dir: Path, output: Path) -> MergeRepor
     base_dir = Path(base_dir)
     adapter_dir = Path(adapter_dir)
     output = Path(output)
-    manifest = _read_adapter_manifest(adapter_dir / ADAPTER_MANIFEST_NAME)
+    manifest, _ = _require_exact_adapter_directory(adapter_dir)
     weights_path = adapter_dir / manifest["weights"]
-    if sha256_file(weights_path) != manifest["weights_sha256"]:
-        raise ValueError("adapter weights checksum does not match its manifest")
 
     model = load_base_llm(base_dir)
     base_checksum = getattr(model, "_balalaika_base_checkpoint_sha256", None)
@@ -542,24 +548,82 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
         raise TypeError("request must be ExportRequest")
     lineage = _require_final_export_lineage(request)
     base_assets = build_base_asset_manifest(request.base_model_dir)
+    base_assets_sha256 = _canonical_mapping_sha256(base_assets)
+    code_identity = _code_identity()
+    mode = "test" if request.test_mode else "production"
+    if request.test_mode:
+        verification_voices = _strict_smoke_voices(request.verification_voices)
+    else:
+        from cosyvoice.finetune.balalaika.evaluation import authenticated_prompt_inventory
+
+        verification_voices, _ = authenticated_prompt_inventory(request.validation_request.prompts)
+    prompt_inventory_sha256 = _prompt_inventory_sha256(verification_voices)
+    task10_evidence = _final_validation_payload(lineage["validation_evidence"])
+    expected_lineage = {
+        "mode": mode,
+        "production_ready": not request.test_mode,
+        "base_checkpoint_sha256": sha256_file(request.base_model_dir / "llm.pt"),
+        "adapter_weights_sha256": sha256_file(lineage["adapter_dir"] / ADAPTER_WEIGHTS_NAME),
+        "adapter_manifest_sha256": lineage["adapter_manifest_sha256"],
+        "phase2_checkpoint_manifest_sha256": lineage["checkpoint_sha256"],
+        "phase2_model_state_sha256": lineage["model_state_sha256"],
+        "validation_summary_sha256": lineage["validation_sha256"],
+        "base_assets": base_assets,
+        "base_assets_sha256": base_assets_sha256,
+        "task10_evidence": task10_evidence,
+        "prompt_inventory_sha256": prompt_inventory_sha256,
+        "code_identity": code_identity,
+    }
     output_dir = request.output_dir
     if output_dir.exists() or output_dir.is_symlink():
-        raise FileExistsError(f"final model output already exists: {output_dir}")
+        return require_committed_final(output_dir, expected_mode=mode, expected_lineage=expected_lineage)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
     try:
         copied_adapter = temporary / "adapter"
         shutil.copytree(lineage["adapter_dir"], copied_adapter)
+        retained_adapter, retained_manifest_sha256 = _require_exact_adapter_directory(copied_adapter)
+        if retained_manifest_sha256 != lineage["adapter_manifest_sha256"]:
+            raise ValueError("retained adapter manifest checksum differs from the source")
         merged_path = temporary / "llm.pt"
         merge = merge_adapter(request.base_model_dir, copied_adapter, merged_path)
         _require_original_key_layout(request.base_model_dir / "llm.pt", merged_path)
-        _verify_adapter_active_logits(request.base_model_dir, copied_adapter, merged_path)
+        logit_evidence = _verify_adapter_active_logits(request.base_model_dir, copied_adapter, merged_path)
+        manifest_path = temporary / "final_model_manifest.json"
+        staged_manifest = FinalModelManifest(
+            path=manifest_path, llm_path=merged_path, adapter_dir=copied_adapter,
+            llm_sha256=merge.output_sha256, base_checkpoint_sha256=merge.base_checkpoint_sha256,
+            adapter_weights_sha256=merge.adapter_weights_sha256, adapter_manifest_sha256=retained_manifest_sha256,
+            target_modules=merge.target_modules,
+            phase2_checkpoint_sha256=lineage["checkpoint_sha256"], validation_summary_sha256=lineage["validation_sha256"],
+            mode=mode, production_ready=not request.test_mode, base_assets_sha256=base_assets_sha256,
+        )
+        if request.test_mode:
+            report = strict_verify_final_model(VerifyRequest(
+                base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=request.recognizer,
+                voices=verification_voices, output_dir=temporary / "strict-verification",
+                pipeline_factory=request.pipeline_factory, test_mode=True, artifact_root=temporary,
+            ))
+        else:
+            from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer
+
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            report = strict_verify_final_model(VerifyRequest(
+                base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=GigaAmRecognizer(),
+                voices=verification_voices, output_dir=temporary / "strict-verification",
+                artifact_root=temporary, expected_local_rank=local_rank,
+            ))
+        strict_payload = _read_json_mapping(report.path, "strict verification report")
+        if strict_payload.get("prompt_inventory_sha256") != prompt_inventory_sha256:
+            raise ValueError("strict verification prompt inventory differs from Task 10")
         payload = {
-            "format_version": 1,
+            "format_version": 2,
             "llm": "llm.pt",
             "llm_sha256": merge.output_sha256,
             "adapter": "adapter",
             "adapter_weights_sha256": merge.adapter_weights_sha256,
+            "adapter_manifest_sha256": retained_manifest_sha256,
+            "adapter_code_revision": retained_adapter["code_revision"],
             "base_checkpoint_sha256": merge.base_checkpoint_sha256,
             "target_modules": list(merge.target_modules),
             "phase2_checkpoint": str(request.phase2_checkpoint),
@@ -567,65 +631,38 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "phase2_model_state_sha256": lineage["model_state_sha256"],
             "validation_summary": str(request.validation_summary),
             "validation_summary_sha256": lineage["validation_sha256"],
-            "mode": "test" if request.test_mode else "production",
-            "production_ready": False,
+            "mode": mode,
+            "production_ready": not request.test_mode,
             "base_assets": base_assets,
-            "base_assets_sha256": _canonical_mapping_sha256(base_assets),
-            "task10_evidence": _final_validation_payload(lineage["validation_evidence"]),
-            "code_revision": _code_revision(),
+            "base_assets_sha256": base_assets_sha256,
+            "task10_evidence": task10_evidence,
+            "code_identity": code_identity,
+            "logit_verification": logit_evidence,
+            "prompt_inventory_sha256": prompt_inventory_sha256,
+            "selected_voices": strict_payload["selected_voices"],
+            "strict_verification": {
+                "report": "strict-verification/strict-verification.json",
+                "report_sha256": sha256_file(report.path),
+                "audio": [str(path.relative_to(temporary)) for path in report.audio_paths],
+            },
         }
-        manifest_path = temporary / "final_model_manifest.json"
         atomic_write_json(manifest_path, payload)
-        staged_manifest = FinalModelManifest(
-            path=manifest_path, llm_path=merged_path, adapter_dir=copied_adapter,
-            llm_sha256=merge.output_sha256, base_checkpoint_sha256=merge.base_checkpoint_sha256,
-            adapter_weights_sha256=merge.adapter_weights_sha256, target_modules=merge.target_modules,
-            phase2_checkpoint_sha256=lineage["checkpoint_sha256"], validation_summary_sha256=lineage["validation_sha256"],
-            production_ready=False, base_assets_sha256=_canonical_mapping_sha256(base_assets),
-        )
-        if request.test_mode:
-            report = strict_verify_final_model(VerifyRequest(
-                base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=request.recognizer,
-                voices=request.verification_voices, output_dir=temporary / "strict-verification",
-                pipeline_factory=request.pipeline_factory, test_mode=True,
-            ))
-        else:
-            from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer, authenticated_prompt_inventory
-            production_voices, _ = authenticated_prompt_inventory(request.validation_request.prompts)
-            report = strict_verify_final_model(VerifyRequest(
-                base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=GigaAmRecognizer(),
-                voices=production_voices, output_dir=temporary / "strict-verification",
-            ))
-        payload["strict_verification"] = {
-            "report": "strict-verification/strict-verification.json",
-            "report_sha256": sha256_file(report.path),
-            "audio": [str(path.relative_to(temporary)) for path in report.audio_paths],
-        }
-        strict_payload = json.loads(report.path.read_text(encoding="utf-8"))
-        payload["prompt_inventory_sha256"] = strict_payload["prompt_inventory_sha256"]
-        payload["selected_voices"] = strict_payload["selected_voices"]
-        payload["production_ready"] = not request.test_mode
-        atomic_write_json(manifest_path, payload)
-        artifact_checksums = {str(path.relative_to(temporary)): sha256_file(path) for path in sorted(temporary.rglob("*")) if path.is_file()}
-        atomic_write_json(temporary / "final-success.json", {"format_version": 1, "mode": payload["mode"], "production_ready": payload["production_ready"], "artifacts": artifact_checksums})
+        artifact_checksums = _regular_file_inventory(temporary, excluded={"final-success.json"})
+        atomic_write_json(temporary / "final-success.json", {
+            "format_version": 2,
+            "mode": mode,
+            "production_ready": not request.test_mode,
+            "manifest": "final_model_manifest.json",
+            "manifest_sha256": sha256_file(manifest_path),
+            "logit_verification_sha256": _canonical_mapping_sha256(logit_evidence),
+            "artifacts": artifact_checksums,
+        })
         _publish_directory(temporary, output_dir)
     except Exception:
         if temporary.exists() and not temporary.is_symlink():
             shutil.rmtree(temporary)
         raise
-    return FinalModelManifest(
-        path=output_dir / "final_model_manifest.json",
-        llm_path=output_dir / "llm.pt",
-        adapter_dir=output_dir / "adapter",
-        llm_sha256=merge.output_sha256,
-        base_checkpoint_sha256=merge.base_checkpoint_sha256,
-        adapter_weights_sha256=merge.adapter_weights_sha256,
-        target_modules=merge.target_modules,
-        phase2_checkpoint_sha256=lineage["checkpoint_sha256"],
-        validation_summary_sha256=lineage["validation_sha256"],
-        production_ready=not request.test_mode,
-        base_assets_sha256=_canonical_mapping_sha256(base_assets),
-    )
+    return require_committed_final(output_dir, expected_mode=mode, expected_lineage=expected_lineage)
 
 
 def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
@@ -633,11 +670,14 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
 
     if not isinstance(request, VerifyRequest):
         raise TypeError("request must be VerifyRequest")
-    if request.final_manifest.production_ready and request.test_mode:
-        raise ValueError("test-double verification cannot satisfy a production-ready final manifest")
-    _require_final_manifest(request.final_manifest)
+    expected_mode = "test" if request.test_mode else "production"
+    if request.final_manifest.mode != expected_mode or request.final_manifest.production_ready != (not request.test_mode):
+        raise ValueError("strict verification mode differs from the final manifest")
+    _require_staged_final_inputs(request.final_manifest)
     if _canonical_mapping_sha256(build_base_asset_manifest(request.base_model_dir)) != request.final_manifest.base_assets_sha256:
         raise ValueError("strict verification base asset identity differs from exported base")
+    if not request.test_mode:
+        _require_production_recognizer(request.recognizer, request.expected_local_rank)
     inventory = _strict_smoke_voices(request.voices)
     voices = inventory[:4]
     if request.output_dir.exists() or request.output_dir.is_symlink():
@@ -669,23 +709,41 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
         ):
             raise ValueError("GigaAM strict-verification transcription is invalid")
         checksums = {path.name: sha256_file(path) for path in audio_paths}
-        libraries = _library_identities(request.recognizer)
+        libraries = _library_identities(request.recognizer, pipeline)
+        prompt_inventory_sha256 = _canonical_mapping_sha256([
+            {"voice_id": value["voice_id"], "prompt_text": value["prompt_text"], "prompt_sha256": value["prompt_sha256"]}
+            for value in inventory
+        ])
+        artifact_root = request.artifact_root or request.output_dir
+        try:
+            relative_audio = [
+                str((request.output_dir / "audio" / path.name).relative_to(artifact_root))
+                for path in audio_paths
+            ]
+        except ValueError as exc:
+            raise ValueError("strict verification output must remain under its artifact root") from exc
         payload = {
-            "format_version": 1,
-            "final_model_manifest_sha256": sha256_file(request.final_manifest.path),
-            "llm_sha256": request.final_manifest.llm_sha256,
+            "format_version": 2,
+            "mode": expected_mode,
+            "production_ready": not request.test_mode,
+            "immutable_inputs": {
+                "llm_sha256": request.final_manifest.llm_sha256,
+                "base_assets_sha256": request.final_manifest.base_assets_sha256,
+                "prompt_inventory_sha256": prompt_inventory_sha256,
+            },
             "strict_load": True,
             "smoke_utterances": 4,
-            "prompt_inventory_sha256": _canonical_mapping_sha256([
-                {"voice_id": value["voice_id"], "prompt_text": value["prompt_text"], "prompt_sha256": value["prompt_sha256"]}
-                for value in inventory
-            ]),
+            "prompt_inventory_sha256": prompt_inventory_sha256,
             "selected_voices": [value["voice_id"] for value in voices],
             "prompt_source": "test_fixture" if request.test_mode else "task10_validation_request",
             "audio": [
-                {"voice_id": voice["voice_id"], "prompt": prompt, "path": str(path), "sha256": checksums[path.name], "asr": asr}
-                for voice, prompt, path, asr in zip(voices, _SMOKE_PROMPTS, audio_paths, hypotheses, strict=True)
+                {"voice_id": voice["voice_id"], "prompt": prompt, "path": relative_path, "sha256": checksums[path.name], "asr": asr}
+                for voice, prompt, path, relative_path, asr in zip(voices, _SMOKE_PROMPTS, audio_paths, relative_audio, hypotheses, strict=True)
             ],
+            "recognizer": {
+                "class": f"{type(request.recognizer).__module__}.{type(request.recognizer).__qualname__}",
+                "provenance": dict(request.recognizer.provenance()) if callable(getattr(request.recognizer, "provenance", None)) else None,
+            },
             "libraries": libraries,
         }
         report_path = stage / "strict-verification.json"
@@ -725,14 +783,14 @@ def build_base_asset_manifest(base_dir: Path) -> dict[str, object]:
         raise ValueError("base model directory must be a real directory")
     entries: list[dict[str, str]] = []
     for path in sorted(base_dir.rglob("*")):
-        if len(entries) > 10_000:
-            raise ValueError("base model asset inventory exceeds safe bound")
         if path.is_symlink() or not path.resolve().is_relative_to(base_dir.resolve()):
             raise ValueError("base model assets must not contain symlinks or path escapes")
         if path.is_dir():
             continue
         if not path.is_file():
             raise ValueError("base model assets must be regular files")
+        if len(entries) >= 10_000:
+            raise ValueError("base model asset inventory exceeds safe bound")
         entries.append({"path": str(path.relative_to(base_dir)), "sha256": sha256_file(path)})
     names = {entry["path"] for entry in entries}
     if not required.issubset(names):
@@ -742,6 +800,345 @@ def build_base_asset_manifest(base_dir: Path) -> dict[str, object]:
 
 def _canonical_mapping_sha256(value: object) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _prompt_inventory_sha256(voices: Sequence[Mapping[str, object]]) -> str:
+    return _canonical_mapping_sha256([
+        {
+            "voice_id": voice["voice_id"],
+            "prompt_text": voice["prompt_text"],
+            "prompt_sha256": voice["prompt_sha256"],
+        }
+        for voice in voices
+    ])
+
+
+def _read_json_mapping(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is missing or invalid") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _regular_file_inventory(root: Path, *, excluded: set[str] | None = None) -> dict[str, str]:
+    """Hash every bounded regular file below ``root`` without following links."""
+
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("final artifact root must be a real directory")
+    excluded = excluded or set()
+    result: dict[str, str] = {}
+    directories: set[str] = set()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("final artifact inventory contains a symlink or path escape")
+        if path.is_dir():
+            directories.add(str(path.relative_to(root)))
+            continue
+        if not path.is_file():
+            raise ValueError("final artifact inventory contains a non-regular file")
+        relative = str(path.relative_to(root))
+        if relative in excluded:
+            continue
+        if len(result) >= 10_000:
+            raise ValueError("final artifact inventory exceeds safe bound")
+        result[relative] = sha256_file(path)
+    if directories != {"adapter", "strict-verification", "strict-verification/audio"}:
+        raise ValueError("final artifact directory inventory contains missing or extra directories")
+    return result
+
+
+def _require_digest(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _safe_final_path(root: Path, value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"{label} must be a safe relative path")
+    relative = Path(value)
+    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError(f"{label} must be a safe relative path")
+    path = root / relative
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"{label} escapes the final directory")
+    return path
+
+
+def _validate_base_asset_payload(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"format_version", "base_dir_name", "files"}:
+        raise ValueError("final base asset manifest schema is invalid")
+    files = value.get("files")
+    if value.get("format_version") != 1 or not isinstance(value.get("base_dir_name"), str) or not value["base_dir_name"]:
+        raise ValueError("final base asset manifest metadata is invalid")
+    if not isinstance(files, list) or not files or len(files) > 10_000:
+        raise ValueError("final base asset inventory size is invalid")
+    names: list[str] = []
+    for item in files:
+        if not isinstance(item, Mapping) or set(item) != {"path", "sha256"}:
+            raise ValueError("final base asset entry schema is invalid")
+        path = item.get("path")
+        if not isinstance(path, str) or Path(path).is_absolute() or ".." in Path(path).parts or "\\" in path:
+            raise ValueError("final base asset path is invalid")
+        _require_digest(item.get("sha256"), "base asset checksum")
+        names.append(path)
+    if len(names) != len(set(names)) or not {"cosyvoice3.yaml", "llm.pt", "flow.pt", "hift.pt"}.issubset(names):
+        raise ValueError("final base asset inventory is incomplete or duplicated")
+
+
+def _validate_code_identity(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {"head", "dirty", "diff_sha256"}:
+        raise ValueError("final code identity schema is invalid")
+    if not isinstance(value.get("head"), str) or not value["head"] or type(value.get("dirty")) is not bool:
+        raise ValueError("final code identity metadata is invalid")
+    _require_digest(value.get("diff_sha256"), "code diff checksum")
+
+
+def _validate_logit_evidence(value: object) -> None:
+    fields = {
+        "format_version", "probe", "probe_sha256", "atol", "rtol",
+        "max_abs_error", "max_relative_error", "finite", "pass",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields or value.get("format_version") != 1:
+        raise ValueError("logit verification schema is invalid")
+    probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
+    if value.get("probe") != probe or value.get("probe_sha256") != _canonical_mapping_sha256(probe):
+        raise ValueError("logit verification probe identity changed")
+    if value.get("atol") != 0.02 or value.get("rtol") != 0.02 or value.get("finite") is not True or value.get("pass") is not True:
+        raise ValueError("logit verification tolerance or result is invalid")
+    for name in ("max_abs_error", "max_relative_error"):
+        number = value.get(name)
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not torch.isfinite(torch.tensor(float(number))) or number < 0:
+            raise ValueError("logit verification error metrics are invalid")
+
+
+def _validate_task10_evidence(value: object, prompt_inventory_sha256: str) -> None:
+    fields = {
+        "evaluation_identity_sha256", "artifact_checksums", "checkpoint_sha256",
+        "model_state_sha256", "prompt_inventory_sha256", "wandb",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("production final Task 10 evidence schema is invalid")
+    for name in ("evaluation_identity_sha256", "checkpoint_sha256", "model_state_sha256"):
+        _require_digest(value.get(name), f"Task 10 {name}")
+    if value.get("prompt_inventory_sha256") != prompt_inventory_sha256:
+        raise ValueError("production final prompt identity differs from Task 10")
+    artifacts = value.get("artifact_checksums")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != {
+        "results_jsonl", "summary_json", "panel_manifest", "validation_seal"
+    }:
+        raise ValueError("production final Task 10 artifact evidence is invalid")
+    for digest in artifacts.values():
+        _require_digest(digest, "Task 10 artifact checksum")
+    wandb = value.get("wandb")
+    if not isinstance(wandb, Mapping) or set(wandb) != {
+        "run_id", "context", "marker", "run_manifest_sha256", "ledger_path",
+        "ledger_sha256", "remote_markers",
+    }:
+        raise ValueError("production final W&B evidence schema is invalid")
+    if not isinstance(wandb.get("run_id"), str) or not wandb["run_id"] or not isinstance(wandb.get("ledger_path"), str):
+        raise ValueError("production final W&B identity is invalid")
+    marker = _require_digest(wandb.get("marker"), "W&B commit marker")
+    run_manifest_sha256 = _require_digest(wandb.get("run_manifest_sha256"), "W&B run manifest checksum")
+    ledger_sha256 = _require_digest(wandb.get("ledger_sha256"), "W&B ledger checksum")
+    ledger_path = Path(wandb["ledger_path"])
+    run_manifest_path = ledger_path.parent.parent / "wandb-run.json"
+    if (
+        ledger_path.is_symlink() or not ledger_path.is_file() or sha256_file(ledger_path) != ledger_sha256
+        or run_manifest_path.is_symlink() or not run_manifest_path.is_file()
+        or sha256_file(run_manifest_path) != run_manifest_sha256
+    ):
+        raise ValueError("production final W&B local evidence changed")
+    if not isinstance(wandb.get("context"), Mapping) or not isinstance(wandb.get("remote_markers"), Mapping):
+        raise ValueError("production final W&B context is invalid")
+    expected_markers = {"validation/commit/40/scalars": marker, "validation/commit/40/media": marker}
+    if dict(wandb["remote_markers"]) != expected_markers or _canonical_mapping_sha256(wandb["context"]) != marker:
+        raise ValueError("production final W&B remote marker evidence changed")
+
+
+def require_committed_final(
+    output_dir: Path,
+    *,
+    expected_mode: Literal["test", "production"] | None = None,
+    expected_lineage: Mapping[str, object] | None = None,
+) -> FinalModelManifest:
+    """Fail closed unless ``output_dir`` is one complete immutable final export."""
+
+    output_dir = Path(output_dir)
+    inventory = _regular_file_inventory(output_dir, excluded={"final-success.json"})
+    seal_path = output_dir / "final-success.json"
+    if seal_path.is_symlink() or not seal_path.is_file():
+        raise ValueError("final success seal is missing or invalid")
+    seal = _read_json_mapping(seal_path, "final success seal")
+    if set(seal) != {
+        "format_version", "mode", "production_ready", "manifest", "manifest_sha256",
+        "logit_verification_sha256", "artifacts",
+    } or seal.get("format_version") != 2:
+        raise ValueError("final success seal schema is invalid")
+    if seal.get("manifest") != "final_model_manifest.json" or seal.get("artifacts") != inventory:
+        raise ValueError("final success seal artifact inventory changed")
+    manifest_path = output_dir / "final_model_manifest.json"
+    if inventory.get("final_model_manifest.json") != seal.get("manifest_sha256"):
+        raise ValueError("final success seal manifest checksum changed")
+    manifest = _read_json_mapping(manifest_path, "final model manifest")
+    manifest_fields = {
+        "format_version", "llm", "llm_sha256", "adapter", "adapter_weights_sha256",
+        "adapter_manifest_sha256", "adapter_code_revision", "base_checkpoint_sha256",
+        "target_modules", "phase2_checkpoint", "phase2_checkpoint_manifest_sha256",
+        "phase2_model_state_sha256", "validation_summary", "validation_summary_sha256",
+        "mode", "production_ready", "base_assets", "base_assets_sha256", "task10_evidence",
+        "code_identity", "logit_verification", "prompt_inventory_sha256", "selected_voices",
+        "strict_verification",
+    }
+    if set(manifest) != manifest_fields or manifest.get("format_version") != 2:
+        raise ValueError("final model manifest schema is invalid")
+    mode = manifest.get("mode")
+    production_ready = manifest.get("production_ready")
+    if mode not in ("test", "production") or production_ready is not (mode == "production"):
+        raise ValueError("final model mode and production-ready state disagree")
+    if seal.get("mode") != mode or seal.get("production_ready") is not production_ready:
+        raise ValueError("final success seal mode differs from the manifest")
+    if expected_mode is not None and mode != expected_mode:
+        raise ValueError("committed final mode differs from expected mode")
+    for name in (
+        "llm_sha256", "adapter_weights_sha256", "adapter_manifest_sha256",
+        "base_checkpoint_sha256", "phase2_checkpoint_manifest_sha256",
+        "phase2_model_state_sha256", "validation_summary_sha256", "base_assets_sha256",
+        "prompt_inventory_sha256",
+    ):
+        _require_digest(manifest.get(name), f"final {name}")
+    if manifest.get("llm") != "llm.pt" or manifest.get("adapter") != "adapter":
+        raise ValueError("final model artifact paths changed")
+    llm_path = output_dir / "llm.pt"
+    if llm_path.is_symlink() or not llm_path.is_file() or sha256_file(llm_path) != manifest["llm_sha256"]:
+        raise ValueError("final llm.pt checksum changed")
+    adapter_dir = output_dir / "adapter"
+    adapter, adapter_manifest_sha256 = _require_exact_adapter_directory(adapter_dir)
+    if (
+        adapter_manifest_sha256 != manifest["adapter_manifest_sha256"]
+        or adapter["weights_sha256"] != manifest["adapter_weights_sha256"]
+        or adapter["base_checkpoint_sha256"] != manifest["base_checkpoint_sha256"]
+        or adapter["code_revision"] != manifest["adapter_code_revision"]
+        or adapter["settings"] != asdict(LoraSettings())
+        or adapter["target_modules"] != manifest.get("target_modules")
+    ):
+        raise ValueError("final retained adapter provenance changed")
+    _validate_base_asset_payload(manifest["base_assets"])
+    if _canonical_mapping_sha256(manifest["base_assets"]) != manifest["base_assets_sha256"]:
+        raise ValueError("final base asset inventory checksum changed")
+    _validate_code_identity(manifest["code_identity"])
+    _validate_logit_evidence(manifest["logit_verification"])
+    if seal.get("logit_verification_sha256") != _canonical_mapping_sha256(manifest["logit_verification"]):
+        raise ValueError("final success seal logit evidence checksum changed")
+    strict = manifest.get("strict_verification")
+    if not isinstance(strict, Mapping) or set(strict) != {"report", "report_sha256", "audio"}:
+        raise ValueError("final strict verification inventory schema is invalid")
+    if strict.get("report") != "strict-verification/strict-verification.json":
+        raise ValueError("final strict verification report path changed")
+    report_path = _safe_final_path(output_dir, strict["report"], "strict report")
+    if not report_path.is_file() or sha256_file(report_path) != strict.get("report_sha256"):
+        raise ValueError("final strict verification report checksum changed")
+    report = _read_json_mapping(report_path, "strict verification report")
+    _validate_strict_report(output_dir, report, manifest)
+    report_audio = [row["path"] for row in report["audio"]]
+    if strict.get("audio") != report_audio:
+        raise ValueError("final strict verification audio inventory changed")
+    if mode == "production":
+        _validate_task10_evidence(manifest.get("task10_evidence"), manifest["prompt_inventory_sha256"])
+    elif manifest.get("task10_evidence") is not None:
+        raise ValueError("test final cannot carry production Task 10 evidence")
+    if expected_lineage is not None:
+        if any(manifest.get(name) != value for name, value in expected_lineage.items()):
+            raise ValueError("existing final export differs from the requested lineage")
+    return FinalModelManifest(
+        path=manifest_path,
+        llm_path=llm_path,
+        adapter_dir=adapter_dir,
+        llm_sha256=manifest["llm_sha256"],
+        base_checkpoint_sha256=manifest["base_checkpoint_sha256"],
+        adapter_weights_sha256=manifest["adapter_weights_sha256"],
+        adapter_manifest_sha256=manifest["adapter_manifest_sha256"],
+        target_modules=tuple(manifest["target_modules"]),
+        phase2_checkpoint_sha256=manifest["phase2_checkpoint_manifest_sha256"],
+        validation_summary_sha256=manifest["validation_summary_sha256"],
+        mode=mode,
+        production_ready=production_ready,
+        base_assets_sha256=manifest["base_assets_sha256"],
+    )
+
+
+def _validate_strict_report(root: Path, report: Mapping[str, object], manifest: Mapping[str, object]) -> None:
+    fields = {
+        "format_version", "mode", "production_ready", "immutable_inputs", "strict_load",
+        "smoke_utterances", "prompt_inventory_sha256", "selected_voices", "prompt_source",
+        "audio", "recognizer", "libraries",
+    }
+    if set(report) != fields or report.get("format_version") != 2:
+        raise ValueError("strict verification report schema is invalid")
+    mode = manifest["mode"]
+    if report.get("mode") != mode or report.get("production_ready") is not manifest["production_ready"]:
+        raise ValueError("strict verification report mode changed")
+    immutable = report.get("immutable_inputs")
+    expected_immutable = {
+        "llm_sha256": manifest["llm_sha256"],
+        "base_assets_sha256": manifest["base_assets_sha256"],
+        "prompt_inventory_sha256": manifest["prompt_inventory_sha256"],
+    }
+    if immutable != expected_immutable or report.get("prompt_inventory_sha256") != manifest["prompt_inventory_sha256"]:
+        raise ValueError("strict verification immutable input identity changed")
+    selected = [f"voice_{index:02d}" for index in range(4)]
+    if report.get("strict_load") is not True or report.get("smoke_utterances") != 4 or report.get("selected_voices") != selected:
+        raise ValueError("strict verification completion evidence is invalid")
+    if report.get("prompt_source") != ("task10_validation_request" if mode == "production" else "test_fixture"):
+        raise ValueError("strict verification prompt source differs from mode")
+    if manifest.get("selected_voices") != selected:
+        raise ValueError("final selected voice inventory changed")
+    audio = report.get("audio")
+    if not isinstance(audio, list) or len(audio) != 4:
+        raise ValueError("strict verification requires exactly four audio records")
+    for index, row in enumerate(audio, 1):
+        if not isinstance(row, Mapping) or set(row) != {"voice_id", "prompt", "path", "sha256", "asr"}:
+            raise ValueError("strict verification audio record schema is invalid")
+        expected_path = f"strict-verification/audio/smoke-{index:02d}.wav"
+        if row.get("voice_id") != selected[index - 1] or row.get("prompt") != _SMOKE_PROMPTS[index - 1] or row.get("path") != expected_path:
+            raise ValueError("strict verification audio identity changed")
+        path = _safe_final_path(root, row["path"], "strict audio")
+        if path.is_symlink() or not path.is_file() or sha256_file(path) != row.get("sha256"):
+            raise ValueError("strict verification audio checksum changed")
+        if not isinstance(row.get("asr"), str) or not row["asr"].strip():
+            raise ValueError("strict verification ASR result is empty")
+        _require_pcm_24khz_mono((path,))
+    recognizer = report.get("recognizer")
+    if not isinstance(recognizer, Mapping) or set(recognizer) != {"class", "provenance"}:
+        raise ValueError("strict verification recognizer schema is invalid")
+    libraries = report.get("libraries")
+    expected_libraries = {"torch", "pipeline_class", "recognizer_class", "peft", "transformers", "onnx-asr", "gigaam"}
+    if not isinstance(libraries, Mapping) or set(libraries) != expected_libraries:
+        raise ValueError("strict verification library identity schema is invalid")
+    if libraries.get("recognizer_class") != recognizer.get("class"):
+        raise ValueError("strict verification recognizer class identity changed")
+    if mode == "production":
+        if recognizer.get("class") != "cosyvoice.finetune.balalaika.evaluation.GigaAmRecognizer":
+            raise ValueError("production final was not verified by Task 10 GigaAmRecognizer")
+        provenance = recognizer.get("provenance")
+        if not isinstance(provenance, Mapping) or set(provenance) != {"model", "provider", "device_id", "max_batch_size"}:
+            raise ValueError("production strict recognizer provenance is invalid")
+        if provenance.get("model") != "gigaam-v3-rnnt" or provenance.get("provider") != "CUDAExecutionProvider":
+            raise ValueError("production strict recognizer is not GigaAM v3 RNN-T CUDA")
+        device = provenance.get("device_id")
+        batch = provenance.get("max_batch_size")
+        if (
+            isinstance(device, bool) or not isinstance(device, int) or device < 0
+            or isinstance(batch, bool) or not isinstance(batch, int) or batch < 1
+        ):
+            raise ValueError("production strict recognizer CUDA rank or batch size is invalid")
+        expected_gigaam = json.dumps(dict(provenance), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if libraries.get("gigaam") != expected_gigaam:
+            raise ValueError("production strict recognizer library provenance changed")
 
 
 def _final_validation_payload(evidence: object) -> object:
@@ -794,7 +1191,7 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
     if not request.test_mode and identity != request.expected_training_identity:
         raise ValueError("phase-2 checkpoint training identity differs from the workflow identity")
     adapter_dir = request.phase2_checkpoint / "adapter"
-    adapter = _read_adapter_manifest(adapter_dir / ADAPTER_MANIFEST_NAME)
+    adapter, adapter_manifest_sha256 = _require_exact_adapter_directory(adapter_dir)
     settings = LoraSettings(**adapter["settings"])
     if identity.get("lora") != asdict(settings):
         raise ValueError("phase-2 LoRA rank/alpha settings differ from the final adapter")
@@ -862,6 +1259,7 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
         raise ValueError("requested base checkpoint differs from the final adapter")
     return {
         "adapter_dir": adapter_dir,
+        "adapter_manifest_sha256": adapter_manifest_sha256,
         "checkpoint_sha256": checkpoint_sha256,
         "model_state_sha256": model_state_sha256,
         "validation_sha256": sha256_file(request.validation_summary),
@@ -878,13 +1276,13 @@ def _require_original_key_layout(base_path: Path, merged_path: Path) -> None:
         raise RuntimeError("merged checkpoint does not preserve the original state-dict key layout")
 
 
-def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path: Path) -> None:
+def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path: Path) -> dict[str, object]:
     """Prove the fresh adapter-active and standalone paths agree on fixed IDs."""
 
     from peft.utils import set_peft_model_state_dict
     from safetensors.torch import load_file
 
-    adapter = _read_adapter_manifest(adapter_dir / ADAPTER_MANIFEST_NAME)
+    adapter, _ = _require_exact_adapter_directory(adapter_dir)
     adapted = inject_lora(load_base_llm(base_dir), LoraSettings(**adapter["settings"])).eval()
     result = set_peft_model_state_dict(
         adapted,
@@ -898,8 +1296,30 @@ def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path
     merged.load_state_dict(torch.load(merged_path, map_location="cpu", weights_only=True), strict=True)
     expected = _fixed_probe_logits(adapted)
     actual = _fixed_probe_logits(merged)
-    if not torch.allclose(expected, actual, rtol=2e-2, atol=2e-2):
+    atol = 2e-2
+    rtol = 2e-2
+    finite = bool(torch.isfinite(expected).all() and torch.isfinite(actual).all())
+    if not finite:
+        raise RuntimeError("adapter-active and merged logits contain non-finite values")
+    difference = (expected - actual).abs()
+    denominator = expected.abs().clamp_min(torch.finfo(expected.dtype).eps)
+    max_abs_error = float(difference.max().item())
+    max_relative_error = float((difference / denominator).max().item())
+    passed = bool(torch.allclose(expected, actual, rtol=rtol, atol=atol))
+    if not passed:
         raise RuntimeError("adapter-active and merged logits exceed BF16 tolerance")
+    probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
+    return {
+        "format_version": 1,
+        "probe": probe,
+        "probe_sha256": _canonical_mapping_sha256(probe),
+        "atol": atol,
+        "rtol": rtol,
+        "max_abs_error": max_abs_error,
+        "max_relative_error": max_relative_error,
+        "finite": finite,
+        "pass": passed,
+    }
 
 
 def _fixed_probe_logits(model: CosyVoice3LM) -> torch.Tensor:
@@ -926,46 +1346,53 @@ def _publish_directory(temporary: Path, destination: Path) -> None:
 
 
 def _require_final_manifest(manifest: FinalModelManifest) -> None:
-    try:
-        payload = json.loads(manifest.path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("final model manifest is missing or invalid") from exc
-    required = {
-        "format_version", "llm", "llm_sha256", "adapter", "adapter_weights_sha256",
-        "base_checkpoint_sha256", "target_modules", "phase2_checkpoint",
-        "phase2_checkpoint_manifest_sha256", "validation_summary",
-        "phase2_model_state_sha256",
-        "validation_summary_sha256", "code_revision",
-        "production_ready",
-        "base_assets", "base_assets_sha256",
-    }
-    if not isinstance(payload, Mapping) or not required.issubset(payload) or payload.get("format_version") != 1:
-        raise ValueError("final model manifest schema is invalid")
-    if payload["llm"] != manifest.llm_path.name or payload["adapter"] != manifest.adapter_dir.name:
-        raise ValueError("final model manifest paths changed")
-    expected = {
-        "llm_sha256": manifest.llm_sha256,
-        "base_checkpoint_sha256": manifest.base_checkpoint_sha256,
-        "adapter_weights_sha256": manifest.adapter_weights_sha256,
-        "phase2_checkpoint_manifest_sha256": manifest.phase2_checkpoint_sha256,
-        "validation_summary_sha256": manifest.validation_summary_sha256,
-        "target_modules": list(manifest.target_modules),
-        "production_ready": manifest.production_ready,
-        "base_assets_sha256": manifest.base_assets_sha256,
-    }
-    if any(payload[name] != value for name, value in expected.items()):
-        raise ValueError("final model manifest provenance changed")
-    if _canonical_mapping_sha256(payload["base_assets"]) != manifest.base_assets_sha256:
-        raise ValueError("final model manifest base asset inventory changed")
-    if not manifest.llm_path.is_file() or sha256_file(manifest.llm_path) != manifest.llm_sha256:
-        raise ValueError("final llm.pt checksum changed")
-    adapter = _read_adapter_manifest(manifest.adapter_dir / ADAPTER_MANIFEST_NAME)
+    committed = require_committed_final(manifest.path.parent, expected_mode=manifest.mode)
+    if committed != manifest:
+        raise ValueError("final model manifest object differs from committed evidence")
+
+
+def _require_staged_final_inputs(manifest: FinalModelManifest) -> None:
+    """Authenticate immutable inputs used before a final manifest exists."""
+
+    if not manifest.llm_path.is_file() or manifest.llm_path.is_symlink() or sha256_file(manifest.llm_path) != manifest.llm_sha256:
+        raise ValueError("staged final llm.pt checksum changed")
+    adapter, adapter_manifest_sha256 = _require_exact_adapter_directory(manifest.adapter_dir)
     if (
-        adapter["weights_sha256"] != manifest.adapter_weights_sha256
+        adapter_manifest_sha256 != manifest.adapter_manifest_sha256
+        or adapter["weights_sha256"] != manifest.adapter_weights_sha256
         or adapter["base_checkpoint_sha256"] != manifest.base_checkpoint_sha256
         or tuple(adapter["target_modules"]) != manifest.target_modules
+        or adapter["settings"] != asdict(LoraSettings())
     ):
-        raise ValueError("retained adapter provenance differs from the final manifest")
+        raise ValueError("staged retained adapter provenance differs from the final manifest")
+
+
+def _require_production_recognizer(recognizer: object, expected_local_rank: int) -> dict[str, object]:
+    from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer
+
+    if type(recognizer) is not GigaAmRecognizer:
+        raise TypeError("production strict verification requires the exact Task 10 GigaAmRecognizer class")
+    provenance_method = getattr(recognizer, "provenance", None)
+    if not callable(provenance_method):
+        raise TypeError("production GigaAM recognizer has no provenance")
+    provenance = provenance_method()
+    if not isinstance(provenance, Mapping) or set(provenance) != {
+        "model", "provider", "device_id", "max_batch_size"
+    }:
+        raise ValueError("production GigaAM provenance schema is invalid")
+    batch = provenance.get("max_batch_size")
+    if (
+        provenance.get("model") != "gigaam-v3-rnnt"
+        or provenance.get("provider") != "CUDAExecutionProvider"
+        or provenance.get("device_id") != expected_local_rank
+        or getattr(recognizer, "local_rank", None) != expected_local_rank
+        or isinstance(batch, bool)
+        or not isinstance(batch, int)
+        or batch < 1
+        or getattr(recognizer, "max_batch_size", None) != batch
+    ):
+        raise ValueError("production GigaAM provenance does not match the expected CUDA local rank")
+    return dict(provenance)
 
 
 def _strict_smoke_voices(voices: Sequence[Mapping[str, object]]) -> tuple[dict[str, object], ...]:
@@ -1085,8 +1512,12 @@ def _require_pcm_24khz_mono(paths: Sequence[Path]) -> None:
             raise RuntimeError(f"strict verification audio is not nonempty 24 kHz mono PCM: {path}")
 
 
-def _library_identities(recognizer: object) -> dict[str, str]:
-    identities = {"torch": torch.__version__, "code_revision": _code_revision()}
+def _library_identities(recognizer: object, pipeline: object) -> dict[str, object]:
+    identities: dict[str, object] = {
+        "torch": torch.__version__,
+        "pipeline_class": f"{type(pipeline).__module__}.{type(pipeline).__qualname__}",
+        "recognizer_class": f"{type(recognizer).__module__}.{type(recognizer).__qualname__}",
+    }
     for package in ("peft", "transformers", "onnx-asr"):
         try:
             identities[package] = metadata.version(package)
@@ -1116,6 +1547,7 @@ def _read_adapter_manifest(path: Path) -> dict[str, object]:
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid adapter manifest: {path}") from exc
     required = {
+        "format_version",
         "weights",
         "weights_sha256",
         "base_checkpoint_sha256",
@@ -1123,19 +1555,50 @@ def _read_adapter_manifest(path: Path) -> dict[str, object]:
         "settings",
         "code_revision",
     }
-    if not isinstance(value, dict) or not required.issubset(value):
+    if not isinstance(value, dict) or set(value) != required:
         raise ValueError(f"invalid adapter manifest: {path}")
     if value.get("format_version") != 1:
         raise ValueError(f"invalid adapter manifest format version: {path}")
-    if not isinstance(value["weights"], str) or Path(value["weights"]).name != value["weights"]:
+    if value["weights"] != ADAPTER_WEIGHTS_NAME:
         raise ValueError("adapter manifest weights path must be a file name")
-    if not isinstance(value["target_modules"], list) or not all(isinstance(item, str) for item in value["target_modules"]):
+    for name in ("weights_sha256", "base_checkpoint_sha256"):
+        digest = value.get(name)
+        if not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"adapter {name} is invalid")
+    if (
+        not isinstance(value["target_modules"], list)
+        or not value["target_modules"]
+        or not all(isinstance(item, str) and item for item in value["target_modules"])
+        or len(value["target_modules"]) != len(set(value["target_modules"]))
+    ):
         raise ValueError("adapter target inventory is invalid")
     if any(_is_internal_qwen_lm_head_path(item) for item in value["target_modules"]):
         raise ValueError("adapter target inventory contains the internal Qwen lm_head subtree")
-    if not isinstance(value["settings"], dict):
+    if not isinstance(value["settings"], dict) or value["settings"] != asdict(LoraSettings()):
         raise ValueError("adapter settings are invalid")
+    if not isinstance(value.get("code_revision"), str) or not value["code_revision"].strip():
+        raise ValueError("adapter code metadata is invalid")
     return value
+
+
+def _require_exact_adapter_directory(path: Path) -> tuple[dict[str, object], str]:
+    """Authenticate the complete two-file adapter artifact without following links."""
+
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("adapter directory must be a regular directory without symlinks")
+    entries = tuple(path.iterdir())
+    expected = {ADAPTER_MANIFEST_NAME, ADAPTER_WEIGHTS_NAME}
+    if len(entries) != 2 or {entry.name for entry in entries} != expected:
+        raise ValueError("adapter directory inventory must contain exactly manifest and weights")
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        raise ValueError("adapter directory inventory cannot contain symlinks or non-regular files")
+    manifest_path = path / ADAPTER_MANIFEST_NAME
+    manifest = _read_adapter_manifest(manifest_path)
+    weights_path = path / ADAPTER_WEIGHTS_NAME
+    if sha256_file(weights_path) != manifest["weights_sha256"]:
+        raise ValueError("adapter weights checksum does not match its manifest")
+    return manifest, sha256_file(manifest_path)
 
 
 def _atomic_safetensors(path: Path, tensors: dict[str, torch.Tensor], save_file) -> None:
@@ -1184,3 +1647,29 @@ def _code_revision() -> str:
     )
     revision = completed.stdout.strip()
     return revision if completed.returncode == 0 and revision else "unknown"
+
+
+def _code_identity() -> dict[str, object]:
+    """Return a JSON-safe identity for the exact checked-out code state."""
+
+    repository = Path(__file__).resolve().parents[3]
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=False, capture_output=True
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "-z"], cwd=repository, check=False, capture_output=True
+    )
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "HEAD", "--", "."], cwd=repository, check=False, capture_output=True
+    )
+    if any(result.returncode != 0 for result in (head, status, diff)):
+        raise RuntimeError("unable to determine final export code identity")
+    revision = head.stdout.decode("utf-8", errors="strict").strip()
+    if not revision:
+        raise RuntimeError("unable to determine final export Git HEAD")
+    dirty = bool(status.stdout)
+    return {
+        "head": revision,
+        "dirty": dirty,
+        "diff_sha256": hashlib.sha256(status.stdout + b"\0" + diff.stdout).hexdigest(),
+    }
