@@ -17,13 +17,15 @@ import wave
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .artifacts import atomic_write_json, sha256_file
+from .artifacts import sha256_file
 from .sources import JoinedRow, SourceIntegrityError, iter_split_rows
 
 
 TOKEN_MIN = 0
 TOKEN_MAX = 6560
+PROMPT_RESERVATION_COUNT = 20
 _TAR_NAME = re.compile(r"shard_(\d{6})\.tar")
+_PROMPT_WAV = re.compile(r"eval_prompts/voice_(\d{2})\.wav")
 _PHASE_COLUMNS = ["source_relative_path", "text", "instruct", "agreement", "speech_token", "speech_token_len"]
 _PROMPT_COLUMNS = [
     "source_relative_path",
@@ -150,6 +152,14 @@ class CacheManifest:
     prompt_count: int
 
 
+@dataclass(frozen=True)
+class _StagedArtifact:
+    """A verified same-directory temporary artifact awaiting transactional rename."""
+
+    target: Path
+    partial: Path
+
+
 def iter_tar_audio(path: Path) -> Iterator[TarAudioSample]:
     """Stream exactly adjacent JSON/MP3 pairs, retaining at most one unpaired key."""
 
@@ -167,8 +177,6 @@ def iter_tar_audio(path: Path) -> Iterator[TarAudioSample]:
         raise CacheIntegrityError(f"cannot read source tar: {path}") from exc
     with archive:
         for member in archive:
-            if member.isdir():
-                continue
             if not member.isfile():
                 raise CacheIntegrityError(f"unexpected non-file tar member: {member.name}")
             member_path = Path(member.name)
@@ -285,26 +293,17 @@ def build_cache_shard(request: CacheShardRequest, tokenizer: SpeechTokenizer) ->
     if remaining:
         raise CacheIntegrityError(f"split-plan rows missing from source tar: {sorted(remaining)[0]}")
 
-    phase1_path = request.cache_root / "phase1" / f"shard_{request.shard:06d}.parquet"
-    phase2_path = request.cache_root / "phase2" / f"shard_{request.shard:06d}.parquet"
-    _publish_phase(phase1_path, phase_rows[1])
-    _publish_phase(phase2_path, phase_rows[2])
-    prompt_records = _publish_prompts(request.cache_root, prompt_audio)
-    shard_manifest_path = request.cache_root / "shard_manifests" / f"shard_{request.shard:06d}.json"
-    shard_manifest = {
-        "shard": request.shard,
-        "source_tar": str(request.source_tar),
-        "source_sha256": source_sha256,
-        "split_plan": str(plan_path),
-        "split_plan_sha256": plan_sha256,
-        "plan_row_count": len(rows),
-        "phase": {
-            str(phase): _phase_metadata(request.cache_root, phase, request.shard, phase_rows[phase]) for phase in (1, 2)
-        },
-        "prompts": prompt_records,
-    }
-    atomic_write_json(shard_manifest_path, shard_manifest)
-    _refresh_aggregate_files(request.cache_root)
+    phase1_path, phase2_path, shard_manifest_path = _publish_shard_transaction(
+        request.cache_root,
+        request.shard,
+        request.source_tar,
+        source_sha256,
+        plan_path,
+        plan_sha256,
+        len(rows),
+        phase_rows,
+        prompt_audio,
+    )
     return CacheShardResult(
         shard=request.shard,
         phase1_path=phase1_path,
@@ -355,6 +354,7 @@ def verify_cache(root: Path) -> CacheManifest:
             if not wav.is_file() or sha256_file(wav) != _required_string(prompt, "wav_sha256"):
                 raise CacheIntegrityError(f"prompt WAV checksum changed: {wav}")
             prompts.append(prompt)
+    _verify_prompt_set(root, prompts)
     _verify_prompt_parquet(root, prompts)
     aggregate_path = root / "manifest.json"
     if aggregate_path.is_file():
@@ -405,9 +405,6 @@ def _split_rows(plan_dir: Path, shard: int) -> dict[str, JoinedRow]:
 
 
 def _prompt_indices(plan_dir: Path, rows: Mapping[str, JoinedRow]) -> dict[str, int]:
-    reserved = [row for row in rows.values() if row.reserved]
-    if not reserved:
-        return {}
     manifest = _load_mapping(plan_dir / "manifest.json")
     entries = manifest.get("reserved_prompts")
     if not isinstance(entries, list):
@@ -417,10 +414,14 @@ def _prompt_indices(plan_dir: Path, rows: Mapping[str, JoinedRow]) -> dict[str, 
         if not isinstance(entry, Mapping):
             raise CacheIntegrityError("invalid reserved prompt entry")
         identifiers.append(_required_string(entry, "source_relative_path"))
-    if len(set(identifiers)) != len(identifiers):
-        raise CacheIntegrityError("duplicate reserved prompt identity in split-plan manifest")
+    if len(identifiers) != PROMPT_RESERVATION_COUNT:
+        raise CacheIntegrityError(f"split-plan manifest must contain exactly {PROMPT_RESERVATION_COUNT} reserved prompt identities")
+    if len(set(identifiers)) != PROMPT_RESERVATION_COUNT:
+        raise CacheIntegrityError("split-plan manifest reserved prompt identities must be unique")
     indices = {identifier: index for index, identifier in enumerate(identifiers)}
-    for row in reserved:
+    for row in rows.values():
+        if not row.reserved:
+            continue
         if row.source_relative_path not in indices:
             raise CacheIntegrityError(f"reserved row missing from split-plan manifest: {row.source_relative_path}")
     return indices
@@ -446,8 +447,8 @@ def _validated_tokens(tokens: object, source_relative_path: str) -> list[int]:
     return result
 
 
-def _publish_phase(path: Path, rows: list[dict[str, object]]) -> None:
-    table = pa.table(
+def _phase_table(rows: list[dict[str, object]]) -> pa.Table:
+    return pa.table(
         {
             "source_relative_path": pa.array([row["source_relative_path"] for row in rows], type=pa.string()),
             "text": pa.array([row["text"] for row in rows], type=pa.string()),
@@ -457,15 +458,131 @@ def _publish_phase(path: Path, rows: list[dict[str, object]]) -> None:
             "speech_token_len": pa.array([row["speech_token_len"] for row in rows], type=pa.int32()),
         }
     )
-    _publish_parquet(path, table, lambda loaded: _verify_phase_table(loaded, rows))
 
 
-def _publish_prompts(root: Path, prompts: list[tuple[JoinedRow, AudioInput, int]]) -> list[dict[str, object]]:
+def _phase_metadata(root: Path, phase: int, shard: int, rows: list[dict[str, object]], staged: _StagedArtifact) -> dict[str, object]:
+    path = root / f"phase{phase}" / f"shard_{shard:06d}.parquet"
+    tokens = [token for row in rows for token in row["speech_token"]]
+    return {
+        "path": str(path.relative_to(root)),
+        "sha256": sha256_file(staged.partial),
+        "row_count": len(rows),
+        "token_min": min(tokens) if tokens else None,
+        "token_max": max(tokens) if tokens else None,
+    }
+
+
+def _publish_shard_transaction(
+    root: Path,
+    shard: int,
+    source_tar: Path,
+    source_sha256: str,
+    plan_path: Path,
+    plan_sha256: str,
+    plan_row_count: int,
+    phase_rows: Mapping[int, list[dict[str, object]]],
+    prompt_audio: list[tuple[JoinedRow, AudioInput, int]],
+) -> tuple[Path, Path, Path]:
+    """Stage every shard output before any final path is replaced, then commit as one unit."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".cache.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return _stage_and_commit_shard(
+                root, shard, source_tar, source_sha256, plan_path, plan_sha256, plan_row_count, phase_rows, prompt_audio
+            )
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _stage_and_commit_shard(
+    root: Path,
+    shard: int,
+    source_tar: Path,
+    source_sha256: str,
+    plan_path: Path,
+    plan_sha256: str,
+    plan_row_count: int,
+    phase_rows: Mapping[int, list[dict[str, object]]],
+    prompt_audio: list[tuple[JoinedRow, AudioInput, int]],
+) -> tuple[Path, Path, Path]:
+    phase_paths = {phase: root / f"phase{phase}" / f"shard_{shard:06d}.parquet" for phase in (1, 2)}
+    shard_manifest_path = root / "shard_manifests" / f"shard_{shard:06d}.json"
+    staged: list[_StagedArtifact] = []
+    try:
+        phase_artifacts = {
+            phase: _stage_parquet(phase_paths[phase], _phase_table(phase_rows[phase]), lambda loaded, rows=phase_rows[phase]: _verify_phase_table(loaded, rows))
+            for phase in (1, 2)
+        }
+        staged.extend(phase_artifacts.values())
+        prompt_records, prompt_artifacts = _stage_prompts(root, prompt_audio)
+        staged.extend(prompt_artifacts)
+        shard_manifest = {
+            "shard": shard,
+            "source_tar": str(source_tar),
+            "source_sha256": source_sha256,
+            "split_plan": str(plan_path),
+            "split_plan_sha256": plan_sha256,
+            "plan_row_count": plan_row_count,
+            "phase": {
+                str(phase): _phase_metadata(root, phase, shard, phase_rows[phase], phase_artifacts[phase]) for phase in (1, 2)
+            },
+            "prompts": prompt_records,
+        }
+        shard_manifest_artifact = _stage_json(shard_manifest_path, shard_manifest)
+        staged.append(shard_manifest_artifact)
+        old_manifests = [
+            _load_mapping(path)
+            for path in sorted((root / "shard_manifests").glob("shard_*.json"))
+            if path != shard_manifest_path
+        ]
+        manifests = [*old_manifests, shard_manifest]
+        prompts = sorted(
+            [prompt for manifest in manifests for prompt in manifest.get("prompts", [])],
+            key=lambda prompt: _required_string(prompt, "audio_path"),
+        )
+        if not all(isinstance(prompt, dict) for prompt in prompts):
+            raise CacheIntegrityError("invalid prompt metadata while staging aggregate")
+        eval_artifact = _stage_prompt_parquet(root / "eval_prompts.parquet", prompts)
+        staged.append(eval_artifact)
+        root_manifest = {
+            "schema_version": "balalaika-cache-v1",
+            "shard_manifests": {
+                **{path.name: sha256_file(path) for path in sorted((root / "shard_manifests").glob("shard_*.json")) if path != shard_manifest_path},
+                shard_manifest_path.name: sha256_file(shard_manifest_artifact.partial),
+            },
+            "phase_rows": {
+                str(phase): sum(_required_int(manifest["phase"][str(phase)], "row_count") for manifest in manifests)
+                for phase in (1, 2)
+            },
+            "prompt_count": len(prompts),
+        }
+        root_manifest_artifact = _stage_json(root / "manifest.json", root_manifest)
+        staged.append(root_manifest_artifact)
+        _transactional_publish([
+            phase_artifacts[1],
+            phase_artifacts[2],
+            *prompt_artifacts,
+            eval_artifact,
+            shard_manifest_artifact,
+            root_manifest_artifact,
+        ])
+        return phase_paths[1], phase_paths[2], shard_manifest_path
+    except Exception:
+        for artifact in staged:
+            _remove_partial(artifact.partial)
+        raise
+
+
+def _stage_prompts(root: Path, prompts: list[tuple[JoinedRow, AudioInput, int]]) -> tuple[list[dict[str, object]], list[_StagedArtifact]]:
     records: list[dict[str, object]] = []
+    artifacts: list[_StagedArtifact] = []
     for row, audio, index in prompts:
         relative = f"eval_prompts/voice_{index:02d}.wav"
-        destination = root / relative
-        _publish_bytes(destination, _pcm_wav(audio))
+        artifact = _stage_bytes(root / relative, _pcm_wav(audio))
+        artifacts.append(artifact)
         records.append(
             {
                 "source_relative_path": row.source_relative_path,
@@ -477,56 +594,15 @@ def _publish_prompts(root: Path, prompts: list[tuple[JoinedRow, AudioInput, int]
                 "sample_rate": audio.sample_rate,
                 "frames": audio.frames,
                 "duration_seconds": audio.frames / audio.sample_rate,
-                "wav_sha256": sha256_file(destination),
+                "wav_sha256": sha256_file(artifact.partial),
             }
         )
-    return records
+    return records, artifacts
 
 
-def _phase_metadata(root: Path, phase: int, shard: int, rows: list[dict[str, object]]) -> dict[str, object]:
-    path = root / f"phase{phase}" / f"shard_{shard:06d}.parquet"
-    tokens = [token for row in rows for token in row["speech_token"]]
-    return {
-        "path": str(path.relative_to(root)),
-        "sha256": sha256_file(path),
-        "row_count": len(rows),
-        "token_min": min(tokens) if tokens else None,
-        "token_max": max(tokens) if tokens else None,
-    }
-
-
-def _refresh_aggregate_files(root: Path) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path = root / ".cache.lock"
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            manifest_paths = sorted((root / "shard_manifests").glob("shard_*.json"))
-            manifests = [_load_mapping(path) for path in manifest_paths]
-            prompts = [prompt for manifest in manifests for prompt in manifest.get("prompts", [])]
-            if not all(isinstance(prompt, dict) for prompt in prompts):
-                raise CacheIntegrityError("invalid prompt metadata while publishing aggregate")
-            prompts = sorted(prompts, key=lambda prompt: _required_string(prompt, "audio_path"))
-            _publish_prompt_parquet(root / "eval_prompts.parquet", prompts)
-            atomic_write_json(
-                root / "manifest.json",
-                {
-                    "schema_version": "balalaika-cache-v1",
-                    "shard_manifests": {path.name: sha256_file(path) for path in manifest_paths},
-                    "phase_rows": {
-                        str(phase): sum(_required_int(manifest["phase"][str(phase)], "row_count") for manifest in manifests)
-                        for phase in (1, 2)
-                    },
-                    "prompt_count": len(prompts),
-                },
-            )
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def _publish_prompt_parquet(path: Path, prompts: list[dict[str, object]]) -> None:
+def _stage_prompt_parquet(path: Path, prompts: list[dict[str, object]]) -> _StagedArtifact:
     table = pa.table({column: pa.array([prompt.get(column) for prompt in prompts], type=_prompt_type(column)) for column in _PROMPT_COLUMNS})
-    _publish_parquet(path, table, _verify_prompt_table)
+    return _stage_parquet(path, table, _verify_prompt_table)
 
 
 def _prompt_type(column: str) -> pa.DataType:
@@ -537,24 +613,25 @@ def _prompt_type(column: str) -> pa.DataType:
     return pa.string()
 
 
-def _publish_parquet(path: Path, table: pa.Table, verifier) -> None:
+def _stage_parquet(path: Path, table: pa.Table, verifier) -> _StagedArtifact:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f".{path.name}.partial")
+    _recover_backup(path)
     _remove_partial(partial)
     try:
         pq.write_table(table, partial, compression="zstd")
         _fsync_file(partial)
         verifier(pq.read_table(partial))
-        os.replace(partial, path)
-        _fsync_directory(path.parent)
+        return _StagedArtifact(path, partial)
     except Exception:
         _remove_partial(partial)
         raise
 
 
-def _publish_bytes(path: Path, payload: bytes) -> None:
+def _stage_bytes(path: Path, payload: bytes) -> _StagedArtifact:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f".{path.name}.partial")
+    _recover_backup(path)
     _remove_partial(partial)
     try:
         with partial.open("wb") as handle:
@@ -563,11 +640,76 @@ def _publish_bytes(path: Path, payload: bytes) -> None:
             os.fsync(handle.fileno())
         if not partial.is_file() or not payload:
             raise CacheIntegrityError(f"failed to write prompt WAV: {path}")
-        os.replace(partial, path)
-        _fsync_directory(path.parent)
+        return _StagedArtifact(path, partial)
     except Exception:
         _remove_partial(partial)
         raise
+
+
+def _stage_json(path: Path, value: Mapping[str, object]) -> _StagedArtifact:
+    try:
+        payload = json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    except (TypeError, ValueError) as exc:
+        raise CacheIntegrityError(f"cannot serialize cache manifest: {path}") from exc
+    artifact = _stage_bytes(path, payload)
+    _load_mapping(artifact.partial)
+    return artifact
+
+
+def _transactional_publish(artifacts: list[_StagedArtifact]) -> None:
+    """Replace staged finals in order, restoring all prior finals if any replacement fails."""
+
+    published: list[tuple[_StagedArtifact, Path | None]] = []
+    try:
+        for artifact in artifacts:
+            backup = _backup_path(artifact.target)
+            _recover_backup(artifact.target)
+            if artifact.target.exists():
+                os.replace(artifact.target, backup)
+                _fsync_directory(artifact.target.parent)
+                published.append((artifact, backup))
+            else:
+                published.append((artifact, None))
+            _replace_staged(artifact.partial, artifact.target)
+            _fsync_directory(artifact.target.parent)
+        for _, backup in published:
+            if backup is not None and backup.exists():
+                backup.unlink()
+                _fsync_directory(backup.parent)
+    except Exception:
+        for artifact, backup in reversed(published):
+            if artifact.target.exists():
+                artifact.target.unlink()
+            if backup is not None and backup.exists():
+                os.replace(backup, artifact.target)
+            _fsync_directory(artifact.target.parent)
+        raise
+    finally:
+        for artifact in artifacts:
+            _remove_partial(artifact.partial)
+
+
+def _replace_staged(source: Path, destination: Path) -> None:
+    """Indirection keeps replacement failure handling focused and injectable in tests."""
+
+    os.replace(source, destination)
+
+
+def _backup_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.rollback")
+
+
+def _recover_backup(path: Path) -> None:
+    """Recover a pre-rename backup left by an interrupted prior transaction."""
+
+    backup = _backup_path(path)
+    if not backup.exists():
+        return
+    if path.exists():
+        backup.unlink()
+    else:
+        os.replace(backup, path)
+    _fsync_directory(path.parent)
 
 
 def _verify_phase_table(table: pa.Table, expected_rows: list[dict[str, object]] | None) -> None:
@@ -624,6 +766,30 @@ def _verify_prompt_parquet(root: Path, prompts: list[dict[str, object]]) -> None
     expected = sorted(prompts, key=lambda prompt: _required_string(prompt, "audio_path"))
     if actual != expected:
         raise CacheIntegrityError("eval prompt metadata changed")
+
+
+def _verify_prompt_set(root: Path, prompts: list[dict[str, object]]) -> None:
+    if len(prompts) != PROMPT_RESERVATION_COUNT:
+        raise CacheIntegrityError(f"cache must contain exactly {PROMPT_RESERVATION_COUNT} aggregate prompt records")
+    paths = [_required_string(prompt, "audio_path") for prompt in prompts]
+    indices: list[int] = []
+    for path in paths:
+        match = _PROMPT_WAV.fullmatch(path)
+        if match is None:
+            raise CacheIntegrityError(f"invalid prompt WAV path: {path}")
+        indices.append(int(match.group(1)))
+    if len(set(paths)) != PROMPT_RESERVATION_COUNT or len(set(indices)) != PROMPT_RESERVATION_COUNT:
+        raise CacheIntegrityError("cache prompt records must have unique indices and WAV paths")
+    expected_paths = {f"eval_prompts/voice_{index:02d}.wav" for index in range(PROMPT_RESERVATION_COUNT)}
+    if set(paths) != expected_paths:
+        raise CacheIntegrityError(f"cache must contain exactly {PROMPT_RESERVATION_COUNT} prompt WAVs with indices 00-19")
+    wav_paths = {
+        f"eval_prompts/{path.name}"
+        for path in (root / "eval_prompts").glob("*.wav")
+        if path.is_file()
+    }
+    if wav_paths != expected_paths:
+        raise CacheIntegrityError(f"cache must contain exactly {PROMPT_RESERVATION_COUNT} prompt WAV files")
 
 
 def _verify_input_checksum(data: Mapping[str, object], path_key: str, checksum_key: str) -> None:
