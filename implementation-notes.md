@@ -44,3 +44,11 @@
 - Decision: Cache completion is reconciled against the canonical source-archive shard set; worker results and pre-existing manifests cannot introduce or omit shards.
 - Validation: Tokenizer tests pass 12/12 and all Balalaika tests pass 62/62; scoped re-review approved provider, pilot-artifact, lease-result, and exact-shard-set controls.
 - Follow-up: No real pilot or approval exists yet; real CUDA qualification and manual listening remain mandatory before corpus tokenization.
+
+## 2026-08-02 - Task 6 LoRA model boundary
+
+- Decision: Per-sample memorization statistics count only target IDs in `[0, speech_token_size)`; EOS, fill, ignored, and padded targets are excluded.
+- Decision: Require the exact approved model-root name `Fun-CosyVoice3-0.5B-2512`, in addition to rejecting `_RL` paths.
+- Decision: Treat the LoRA audit as an enforcing gate that independently maps every trainable adapter tensor to one unique approved active target and rejects missing, frozen, forbidden, orphan, duplicate, ambiguous, or dense trainables.
+- Validation: Model tests pass 21/21, the required combined suite passes 23/23, and all Balalaika tests pass 83/83; scoped re-review approved statistics, audit, identity, and corrupted-adapter rejection.
+- Follow-up: Production HyperPyYAML loading and the actual 0.5B target inventory remain part of real hardware qualification.
