@@ -243,6 +243,81 @@ def _dunder_dict_backed_schedule(step: int) -> float:
     )
 
 
+def _runtime_import_builtins_schedule(step: int) -> float:
+    import builtins
+
+    return 1.0 if step < 2 else builtins.globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+
+
+def _runtime_from_import_schedule(step: int) -> float:
+    from builtins import globals as namespace
+
+    return 1.0 if step < 2 else namespace()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+
+
+def _nested_runtime_import_schedule(step: int) -> float:
+    def lookup() -> float:
+        import builtins
+
+        return builtins.globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+
+    return 1.0 if step < 2 else lookup()
+
+
+def _dunder_import_builtins_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else __import__("builtins").globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+    )
+
+
+def _eval_backed_schedule(step: int) -> float:
+    return 1.0 if step < 2 else eval("0.5")
+
+
+def _exec_backed_schedule(step: int) -> float:
+    if step < 2:
+        return 1.0
+    namespace: dict[str, float] = {}
+    exec("result = 0.5", {}, namespace)
+    return namespace["result"]
+
+
+def _compile_backed_schedule(step: int) -> float:
+    if step < 2:
+        return 1.0
+    return 0.5 if compile("0.5", "<scheduler>", "eval") else 1.0
+
+
+def _function_globals_backed_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else _dynamic_scheduler_holder.__globals__[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
+    )
+
+
+def _function_builtins_backed_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else _dynamic_scheduler_holder.__builtins__["globals"]()[
+            _DYNAMIC_SCHEDULER_GLOBAL_NAME
+        ]
+    )
+
+
+def _dunder_getattribute_backed_schedule(step: int) -> float:
+    return (
+        1.0
+        if step < 2
+        else _dynamic_scheduler_holder.__getattribute__("__globals__")[
+            _DYNAMIC_SCHEDULER_GLOBAL_NAME
+        ]
+    )
+
+
 def _constant_lambda_scheduler(parameter: torch.nn.Parameter):
     return torch.optim.lr_scheduler.LambdaLR(
         torch.optim.AdamW([parameter], lr=1e-4), lambda _: 1.0
@@ -250,6 +325,65 @@ def _constant_lambda_scheduler(parameter: torch.nn.Parameter):
 
 
 class AccelerateTrainingTests(unittest.TestCase):
+    def test_scheduler_identity_rejects_runtime_imports_in_nested_code(self) -> None:
+        api = _api()
+
+        for schedule in (
+            _runtime_import_builtins_schedule,
+            _runtime_from_import_schedule,
+            _nested_runtime_import_schedule,
+        ):
+            with self.subTest(schedule=schedule.__name__):
+                parameter = torch.nn.Parameter(torch.tensor(0.0))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    torch.optim.AdamW([parameter], lr=1e-4), schedule
+                )
+
+                with self.assertRaises(ValueError):
+                    api._scheduler_identity(scheduler)
+
+        import_star = types.FunctionType(
+            compile("from builtins import *", "<scheduler>", "exec"), {}
+        )
+        with self.subTest(schedule="runtime_import_star"):
+            with self.assertRaises(ValueError):
+                api._callable_fingerprint(import_star)
+
+    def test_scheduler_identity_rejects_dynamic_import_and_evaluation(self) -> None:
+        api = _api()
+
+        for schedule in (
+            _dunder_import_builtins_schedule,
+            _eval_backed_schedule,
+            _exec_backed_schedule,
+            _compile_backed_schedule,
+        ):
+            with self.subTest(schedule=schedule.__name__):
+                parameter = torch.nn.Parameter(torch.tensor(0.0))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    torch.optim.AdamW([parameter], lr=1e-4), schedule
+                )
+
+                with self.assertRaises(ValueError):
+                    api._scheduler_identity(scheduler)
+
+    def test_scheduler_identity_rejects_unresolved_namespace_attributes(self) -> None:
+        api = _api()
+
+        for schedule in (
+            _function_globals_backed_schedule,
+            _function_builtins_backed_schedule,
+            _dunder_getattribute_backed_schedule,
+        ):
+            with self.subTest(schedule=schedule.__name__):
+                parameter = torch.nn.Parameter(torch.tensor(0.0))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    torch.optim.AdamW([parameter], lr=1e-4), schedule
+                )
+
+                with self.assertRaises(ValueError):
+                    api._scheduler_identity(scheduler)
+
     def test_scheduler_identity_rejects_globals_dynamic_name_lookup(self) -> None:
         api = _api()
         parameter = torch.nn.Parameter(torch.tensor(0.0))

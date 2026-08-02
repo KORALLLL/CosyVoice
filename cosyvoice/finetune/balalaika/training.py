@@ -605,6 +605,7 @@ def _callable_fingerprint(value: Callable[..., object]) -> str:
 _DYNAMIC_NAME_BUILTINS = frozenset(
     {
         "__import__",
+        "compile",
         "delattr",
         "dir",
         "eval",
@@ -616,6 +617,11 @@ _DYNAMIC_NAME_BUILTINS = frozenset(
         "setattr",
         "vars",
     }
+)
+
+_RUNTIME_IMPORT_OPCODES = frozenset({"IMPORT_NAME", "IMPORT_FROM", "IMPORT_STAR"})
+_DYNAMIC_NAMESPACE_ATTRIBUTES = frozenset(
+    {"__builtins__", "__dict__", "__getattribute__", "__globals__"}
 )
 
 
@@ -702,6 +708,8 @@ def _function_semantics(value: types.FunctionType, active: set[int]) -> dict[str
 def _referenced_global_names(value: types.CodeType) -> set[str]:
     names: set[str] = set()
     for instruction in dis.get_instructions(value):
+        if instruction.opname in _RUNTIME_IMPORT_OPCODES:
+            raise ValueError("scheduler callable uses runtime imports")
         if instruction.opname == "LOAD_GLOBAL":
             if not isinstance(instruction.argval, str):
                 raise ValueError("scheduler callable has an invalid global reference")
@@ -710,7 +718,7 @@ def _referenced_global_names(value: types.CodeType) -> set[str]:
             raise ValueError("scheduler callable uses dynamic name resolution")
         elif (
             instruction.opname in {"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"}
-            and instruction.argval == "__dict__"
+            and instruction.argval in _DYNAMIC_NAMESPACE_ATTRIBUTES
         ):
             raise ValueError("scheduler callable uses dynamic name resolution")
     for constant in value.co_consts:
