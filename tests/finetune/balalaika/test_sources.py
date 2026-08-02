@@ -9,6 +9,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,6 +81,12 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(selected_a, selected_b)
         self.assertTrue(all(self.by_id[key].agreement >= 0.95 for key in selected_a))
 
+    def test_model_limit_exclusion_has_no_training_phase(self) -> None:
+        # A preflighted row must not regain phase 2 through the generic assignment helper.
+        limited = replace(joined("000000/limited.mp3", 0.95), model_limit_exclusion="text_token_length>200")
+        assigned = assign_phases([limited], reserved=set())
+        self.assertEqual((assigned[0].phase, assigned[0].reserved), (None, False))
+
     def test_duplicate_combined_id_is_rejected(self) -> None:
         # Silently keeping either duplicate would make the plan non-canonical.
         combined = self._combined_path()
@@ -110,6 +117,10 @@ class SourceTests(unittest.TestCase):
         (self.dataset_root / "train/shard_000518.tar").unlink()
         with self.assertRaisesRegex(SourceIntegrityError, "519 source tar archives"):
             inventory_sources(self.paths)
+        (self.dataset_root / "train/shard_000518.tar").touch()
+        (self.dataset_root / "train/shard_000519.tar").touch()
+        with self.assertRaisesRegex(SourceIntegrityError, "519 source tar archives"):
+            inventory_sources(self.paths)
 
     def test_join_rejects_sidecar_paths_outside_the_canonical_tar_range(self) -> None:
         # A six-digit but non-existent shard must not create an unreachable plan row.
@@ -119,10 +130,6 @@ class SourceTests(unittest.TestCase):
         combined.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         with self.assertRaisesRegex(SourceIntegrityError, "outside canonical tar range"):
             self._build_fixture_plan()
-        (self.dataset_root / "train/shard_000518.tar").touch()
-        (self.dataset_root / "train/shard_000519.tar").touch()
-        with self.assertRaisesRegex(SourceIntegrityError, "519 source tar archives"):
-            inventory_sources(self.paths)
 
     def test_split_manifest_reconciles_phase_null_and_reserved_counts(self) -> None:
         # A reserved prompt must be removed from phase 2 yet remain in total audit.
@@ -162,13 +169,45 @@ class SourceTests(unittest.TestCase):
                 patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 1),
                 patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
             ):
-                counts = build_split_plan(self.paths)
+                counts = build_split_plan(self.paths, _count_text_tokens=lambda text: 1)
         self.assertEqual(counts.total, 3)
 
         rows = [json.loads(line) for line in rover_jsonl.read_text(encoding="utf-8").splitlines()]
         del rows[0]["asr_agreement_mean"]
         rover_jsonl.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-        with self.assertRaisesRegex(SourceIntegrityError, "missing agreement"):
+        with self.assertRaisesRegex(SourceIntegrityError, "missing asr_agreement_mean"):
+            self._build_fixture_plan()
+
+    def test_over_limit_phase2_text_is_excluded_before_reservation(self) -> None:
+        # A character-count proxy could reserve this row despite 201 real tokens.
+        combined = self._combined_path()
+        combined_rows = [json.loads(line) for line in combined.read_text(encoding="utf-8").splitlines()]
+        combined_rows[-1]["rover_punctuated_accented"] = "Слишком длинный текст"
+        combined.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in combined_rows), encoding="utf-8")
+        rover = self._rover_path()
+        rover_rows = [json.loads(line) for line in rover.read_text(encoding="utf-8").splitlines()]
+        rover_rows[-1]["asr_agreement_mean"] = 0.96
+        rover.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rover_rows), encoding="utf-8")
+
+        counts = self._build_fixture_plan(
+            expected_nulls=0,
+            reserve_count=1,
+            count_tokens=lambda text: 201 if text == "Слишком длинный текст" else 1,
+        )
+
+        self.assertEqual((counts.phase1, counts.phase2, counts.null, counts.reserved, counts.model_limit_exclusions), (1, 0, 0, 1, 1))
+        rows = {row.source_relative_path: row for row in iter_split_rows(counts.plan_dir, 0)}
+        self.assertFalse(rows["000000/c.mp3"].reserved)
+        self.assertEqual(rows["000000/c.mp3"].model_limit_exclusion, "text_token_length>200")
+        self.assertEqual(rows["000000/c.mp3"].text_token_count, 201)
+
+    def test_canonical_rover_rejects_legacy_agreement_field(self) -> None:
+        # Legacy agreement must not be mistaken for canonical ROVER evidence.
+        rover = self._rover_path()
+        rows = [json.loads(line) for line in rover.read_text(encoding="utf-8").splitlines()]
+        rows[0]["agreement"] = rows[0].pop("asr_agreement_mean")
+        rover.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        with self.assertRaisesRegex(SourceIntegrityError, "missing asr_agreement_mean"):
             self._build_fixture_plan()
 
     def _combined_path(self) -> Path:
@@ -177,14 +216,14 @@ class SourceTests(unittest.TestCase):
     def _rover_path(self) -> Path:
         return self.dataset_root / "punctuation_artifacts/20260729T135419Z/rover.jsonl"
 
-    def _build_fixture_plan(self, *, expected_nulls: int = 1, reserve_count: int = 0):
+    def _build_fixture_plan(self, *, expected_nulls: int = 1, reserve_count: int = 0, count_tokens=None):
         with (
             patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/rover.jsonl"),
             patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
             patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", expected_nulls),
             patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", reserve_count),
         ):
-            return build_split_plan(self.paths, seed=1986)
+            return build_split_plan(self.paths, seed=1986, _count_text_tokens=count_tokens or (lambda text: 1))
 
     def _write_zstd_tar(self, destination: Path, rover_jsonl: bytes) -> None:
         tar_path = destination.with_suffix("")

@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
-from typing import Iterable, Iterator, Mapping, TextIO
+from typing import Callable, Iterable, Iterator, Mapping, TextIO
 
 from .artifacts import atomic_write_json, sha256_file
 from .config import RunPaths
@@ -25,6 +25,7 @@ EXPECTED_SOURCE_ROWS = 4_075_032
 EXPECTED_NULL_ROWS = 309
 PROMPT_RESERVATION_COUNT = 20
 MAX_ROWS_PER_SHARD = 8_000
+TEXT_TOKEN_MAX_LENGTH = 200
 
 _SOURCE_PATH = re.compile(r"(?P<shard>\d{6})/(?P<name>[^/]+\.mp3)")
 
@@ -44,6 +45,8 @@ class JoinedRow:
     phase: int | None = None
     reserved: bool = False
     reservation_score: str | None = None
+    model_limit_exclusion: str | None = None
+    text_token_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +138,9 @@ def assign_phases(rows: Iterable[JoinedRow], reserved: set[str]) -> list[JoinedR
 
     assigned: list[JoinedRow] = []
     for row in rows:
-        if row.agreement is None:
+        if _model_limit_excluded(row):
+            assigned.append(replace(row, phase=None, reserved=False, reservation_score=None))
+        elif row.agreement is None:
             assigned.append(replace(row, phase=None, reserved=False, reservation_score=None))
         elif row.source_relative_path in reserved:
             assigned.append(replace(row, phase=None, reserved=True))
@@ -146,12 +151,19 @@ def assign_phases(rows: Iterable[JoinedRow], reserved: set[str]) -> list[JoinedR
     return assigned
 
 
-def build_split_plan(paths: RunPaths, seed: int = 1986) -> SplitCounts:
+def build_split_plan(
+    paths: RunPaths, seed: int = 1986, *, _count_text_tokens: Callable[[str], int] | None = None
+) -> SplitCounts:
     """Publish a per-source-shard plan only after full canonical reconciliation."""
 
     inventory = inventory_sources(paths)
+    count_text_tokens = _count_text_tokens or _load_cosyvoice3_text_token_counter(paths)
     first_audit = _JoinAudit()
-    selected_ids = reserve_prompt_ids(_iter_joined_rows(inventory, first_audit), PROMPT_RESERVATION_COUNT, seed)
+    selected_ids = reserve_prompt_ids(
+        _preflight_text_limits(_iter_joined_rows(inventory, first_audit), count_text_tokens),
+        PROMPT_RESERVATION_COUNT,
+        seed,
+    )
     if first_audit.combined_rows != EXPECTED_SOURCE_ROWS or first_audit.rover_rows != EXPECTED_SOURCE_ROWS:
         raise SourceIntegrityError(
             "canonical sidecar row counts must both equal "
@@ -162,7 +174,9 @@ def build_split_plan(paths: RunPaths, seed: int = 1986) -> SplitCounts:
 
     plan_dir = paths.run_root / "split_plan"
     plan_dir.mkdir(parents=True, exist_ok=True)
-    counts, shard_sha256, selected_scores = _write_split_rows(inventory, plan_dir, set(selected_ids), seed)
+    counts, shard_sha256, selected_scores = _write_split_rows(
+        inventory, plan_dir, set(selected_ids), seed, count_text_tokens
+    )
     if counts.null != EXPECTED_NULL_ROWS:
         raise SourceIntegrityError(f"expected exactly {EXPECTED_NULL_ROWS} null agreement rows, got {counts.null}")
     if counts.reserved != PROMPT_RESERVATION_COUNT:
@@ -220,11 +234,17 @@ def iter_split_rows(plan_dir: Path, shard: int) -> Iterator[JoinedRow]:
                 phase=_phase(data, path, number),
                 reserved=_bool_field(data, "reserved", path, number),
                 reservation_score=_optional_string_field(data, "reservation_score", path, number),
+                model_limit_exclusion=_optional_string_field(data, "model_limit_exclusion", path, number),
+                text_token_count=_optional_non_negative_int(data, "text_token_count", path, number),
             )
 
 
 def _write_split_rows(
-    inventory: SourceInventory, plan_dir: Path, reserved_ids: set[str], seed: int
+    inventory: SourceInventory,
+    plan_dir: Path,
+    reserved_ids: set[str],
+    seed: int,
+    count_text_tokens: Callable[[str], int],
 ) -> tuple[SplitCounts, dict[str, str], dict[str, str]]:
     counts = SplitCounts(0, 0, 0, 0, 0, 0, plan_dir, "")
     shard_sha256: dict[str, str] = {}
@@ -246,7 +266,7 @@ def _write_split_rows(
         partial = None
 
     try:
-        for row in _iter_joined_rows(inventory, _JoinAudit()):
+        for row in _preflight_text_limits(_iter_joined_rows(inventory, _JoinAudit()), count_text_tokens):
             shard = _shard_number(row.source_relative_path)
             if current_shard != shard:
                 close_current()
@@ -301,7 +321,7 @@ def _iter_joined_rows(inventory: SourceInventory, audit: _JoinAudit) -> Iterator
             if combined_row is None:
                 raise SourceIntegrityError("combined and ROVER join keys differ")
             text = _string_field(combined_row, "rover_punctuated_accented", inventory.combined_sidecar, audit.combined_rows)
-            agreement = _agreement(rover, inventory.rover_archive, audit.rover_rows, required=True)
+            agreement = _agreement(rover, inventory.rover_archive, audit.rover_rows, canonical_rover=True)
             yield JoinedRow(source_relative_path=source_relative_path, text=text, agreement=agreement)
             rover = next(rover_rows, None)
         if combined:
@@ -421,15 +441,13 @@ def _optional_string_field(row: Mapping[str, object], field: str, path: Path, nu
     return value
 
 
-def _agreement(row: Mapping[str, object], path: Path, number: int, *, required: bool = False) -> float | None:
-    if "asr_agreement_mean" in row:
+def _agreement(row: Mapping[str, object], path: Path, number: int, *, canonical_rover: bool = False) -> float | None:
+    if canonical_rover:
+        if "asr_agreement_mean" not in row:
+            raise SourceIntegrityError(f"missing asr_agreement_mean in {path}:{number}")
         value = row["asr_agreement_mean"]
-    elif "agreement" in row:
-        value = row["agreement"]
-    elif required:
-        raise SourceIntegrityError(f"missing agreement in {path}:{number}")
     else:
-        value = None
+        value = row.get("agreement")
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
@@ -453,16 +471,57 @@ def _bool_field(row: Mapping[str, object], field: str, path: Path, number: int) 
     return value
 
 
+def _optional_non_negative_int(row: Mapping[str, object], field: str, path: Path, number: int) -> int | None:
+    value = row.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SourceIntegrityError(f"invalid {field} in {path}:{number}")
+    return value
+
+
 def _shard_number(source_relative_path: str) -> int:
     match = _SOURCE_PATH.fullmatch(source_relative_path)
     assert match is not None
     return int(match.group("shard"))
 
 
-def _model_limit_excluded(row: JoinedRow) -> bool:
-    """Task 2 has no tokenizer-dependent limits; reject no valid canonical row."""
+def _load_cosyvoice3_text_token_counter(paths: RunPaths) -> Callable[[str], int]:
+    """Lazily load the authoritative CosyVoice3 Qwen tokenizer at plan build time."""
 
-    return False
+    from cosyvoice.tokenizer.tokenizer import get_qwen_tokenizer
+
+    tokenizer = get_qwen_tokenizer(
+        token_path=str(paths.base_model_dir / "CosyVoice-BlankEN"),
+        skip_special_tokens=True,
+        version="cosyvoice3",
+    )
+
+    def count_text_tokens(text: str) -> int:
+        return len(tokenizer.encode(text, allowed_special="all"))
+
+    return count_text_tokens
+
+
+def _preflight_text_limits(rows: Iterable[JoinedRow], count_text_tokens: Callable[[str], int]) -> Iterator[JoinedRow]:
+    """Annotate canonical rows excluded by the same text-token limit as CosyVoice3."""
+
+    for row in rows:
+        token_count = count_text_tokens(row.text)
+        if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 0:
+            raise SourceIntegrityError("CosyVoice3 text token counter returned an invalid count")
+        exclusion = None
+        if token_count == 0:
+            exclusion = "text_token_length=0"
+        elif token_count > TEXT_TOKEN_MAX_LENGTH:
+            exclusion = f"text_token_length>{TEXT_TOKEN_MAX_LENGTH}"
+        yield replace(row, text_token_count=token_count, model_limit_exclusion=exclusion)
+
+
+def _model_limit_excluded(row: JoinedRow) -> bool:
+    """Return whether tokenizer preflight intentionally removed this text row."""
+
+    return row.model_limit_exclusion is not None
 
 
 def _row_json(row: JoinedRow) -> dict[str, object]:
@@ -474,4 +533,6 @@ def _row_json(row: JoinedRow) -> dict[str, object]:
         "phase": row.phase,
         "reserved": row.reserved,
         "reservation_score": row.reservation_score,
+        "model_limit_exclusion": row.model_limit_exclusion,
+        "text_token_count": row.text_token_count,
     }
