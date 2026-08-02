@@ -124,6 +124,7 @@ class TrainingCallbacks:
     """External validation boundary owned by the later evaluation task."""
 
     validate: Callable[[ValidationEvent], bool | None]
+    after_resume_loaded: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,8 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
     model, optimizer, scheduler = accelerator.prepare(request.model, optimizer, scheduler)
     if request.resume_from is not None:
         accelerator.load_state(str(request.resume_from))
+        if callbacks.after_resume_loaded is not None:
+            callbacks.after_resume_loaded()
 
     optimizer.zero_grad(set_to_none=True)
     reached: list[ValidationEvent] = []

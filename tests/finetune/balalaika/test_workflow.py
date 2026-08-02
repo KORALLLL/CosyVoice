@@ -168,6 +168,7 @@ class WorkflowTests(unittest.TestCase):
             root = Path(directory)
             backend = ProductionBackend.__new__(ProductionBackend)
             backend._validation_logger = None
+            backend.coordinator = FakeCoordinator()
             options = _args(root, FakeBackend()).options
             checkpoint = root / "resume"
             checkpoint.mkdir()
@@ -216,6 +217,107 @@ class WorkflowTests(unittest.TestCase):
                             checkpoint,
                         )
                     self.assertEqual(calls, [])
+
+    def test_production_resume_evidence_is_verified_only_on_main_and_broadcast_to_peers(self) -> None:
+        class Channel:
+            value: object = None
+
+        class RankCoordinator(FakeCoordinator):
+            def __init__(self, *, main: bool, channel: Channel) -> None:
+                super().__init__()
+                self.is_main_process = main
+                self.process_index = 0 if main else 1
+                self.channel = channel
+
+            def broadcast(self, value: object) -> object:
+                self.broadcasts.append(value)
+                if self.is_main_process:
+                    self.channel.value = value
+                return self.channel.value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            options = _args(root, FakeBackend()).options
+            checkpoint = root / "resume"
+            checkpoint.mkdir()
+            (checkpoint / "checkpoint_manifest.json").write_text(json.dumps({
+                "validation_status": "succeeded",
+                "progress": {"phase": 1, "validation_index": 2},
+            }), encoding="utf-8")
+            channel = Channel()
+            main = ProductionBackend.__new__(ProductionBackend)
+            peer = ProductionBackend.__new__(ProductionBackend)
+            main.coordinator = RankCoordinator(main=True, channel=channel)
+            peer.coordinator = RankCoordinator(main=False, channel=channel)
+            main_calls: list[int] = []
+            peer_calls: list[int] = []
+
+            def committed(_options: WorkflowOptions, index: int) -> dict[str, object]:
+                main_calls.append(index)
+                return {
+                    "validation_index": index,
+                    "generations": 2_000,
+                    "summary": f"summary-{index}.json",
+                    "summary_sha256": str(index) * 64,
+                    "identity_sha256": str(index) * 64,
+                    "artifact_checksums": {"results_jsonl": str(index) * 64},
+                }
+
+            main._committed_validation_evidence = committed  # type: ignore[method-assign]
+            peer._committed_validation_evidence = lambda _options, index: peer_calls.append(index) or {}  # type: ignore[method-assign]
+            expected = main._resume_validation_evidence(
+                options, PhaseSpec.for_phase(1), tuple(range(1, 17)), checkpoint,
+            )
+            received = peer._resume_validation_evidence(
+                options, PhaseSpec.for_phase(1), tuple(range(1, 17)), checkpoint,
+            )
+
+            self.assertEqual(received, expected)
+            self.assertEqual([item["validation_index"] for item in received], [1, 2])
+            self.assertEqual(main_calls, [1, 2])
+            self.assertEqual(peer_calls, [])
+            self.assertEqual(main.coordinator.barriers, 1)
+            self.assertEqual(peer.coordinator.barriers, 1)
+
+    def test_production_resume_evidence_broadcasts_main_verification_error_to_peers(self) -> None:
+        class Channel:
+            value: object = None
+
+        class RankCoordinator(FakeCoordinator):
+            def __init__(self, *, main: bool, channel: Channel) -> None:
+                super().__init__()
+                self.is_main_process = main
+                self.process_index = 0 if main else 1
+                self.channel = channel
+
+            def broadcast(self, value: object) -> object:
+                if self.is_main_process:
+                    self.channel.value = value
+                return self.channel.value
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            options = _args(root, FakeBackend()).options
+            checkpoint = root / "resume"
+            checkpoint.mkdir()
+            (checkpoint / "checkpoint_manifest.json").write_text(json.dumps({
+                "validation_status": "succeeded",
+                "progress": {"phase": 1, "validation_index": 1},
+            }), encoding="utf-8")
+            channel = Channel()
+            main = ProductionBackend.__new__(ProductionBackend)
+            peer = ProductionBackend.__new__(ProductionBackend)
+            main.coordinator = RankCoordinator(main=True, channel=channel)
+            peer.coordinator = RankCoordinator(main=False, channel=channel)
+            main._committed_validation_evidence = mock.Mock(side_effect=StageRequirementError("W&B marker missing"))  # type: ignore[method-assign]
+            peer._committed_validation_evidence = mock.Mock(side_effect=AssertionError("peer touched W&B"))  # type: ignore[method-assign]
+
+            for backend in (main, peer):
+                with self.assertRaisesRegex(StageRequirementError, "W&B marker missing"):
+                    backend._resume_validation_evidence(
+                        options, PhaseSpec.for_phase(1), tuple(range(1, 17)), checkpoint,
+                    )
+            peer._committed_validation_evidence.assert_not_called()
 
     def test_accelerator_scope_clears_prepared_and_new_checkpoint_state_on_success_and_error(self) -> None:
         class Accelerator:

@@ -136,3 +136,10 @@
 - Changed: Memorization, capacity qualification, and phase training each receive an isolated lifecycle scope around the workflow-owned Accelerator. Prepared models, optimizers, schedulers, dataloaders, and custom checkpoint objects are cleared on entry and on both successful and exceptional exit.
 - Changed: CUDA tokenizer qualification restores the rank's original device in a `finally` block, and final export consumes the already committed validation-40 request instead of retaining or rebuilding the training-time evaluation model.
 - Validation: Focused workflow/tokenizer tests pass 30/30 and training/memorization tests pass 35/35, including resume-cursor, lifecycle-exception, and CUDA-device regressions.
+
+### Fix round 2
+
+- Changed: `TrainingCallbacks` now has a resume-only post-load hook. The trainer invokes it on every rank after immutable identity and state-file authentication plus `Accelerator.load_state`, but before pending-boundary revalidation, boundary release, dataloader iteration, optimizer work, or checkpoint publication.
+- Decision: Resume evidence verification is a rank-zero operation wrapped in the workflow's synchronized main-rank call. Rank zero alone accesses the live W&B tracker; the complete prior-validation evidence list or structured failure is broadcast and unwrapped identically on every rank.
+- Decision: The hook itself performs that synchronized broadcast while phase training is already inside the workflow's collective operation. Its barrier completes before a shared exception is raised, after which every rank enters the outer collective error gather without leaving peers behind.
+- Validation: New regressions cover main/non-main evidence and error broadcast, post-state-load/pre-forward/pre-save ordering, pending-current revalidation order, fresh-run exclusion, and final succeeded resume behavior.

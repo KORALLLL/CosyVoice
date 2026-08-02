@@ -174,6 +174,138 @@ def _save_adapter(model, path):
 
 
 class AccelerateTrainingTests(unittest.TestCase):
+    def test_resume_loaded_hook_runs_after_state_load_before_forward_or_checkpoint_save(self) -> None:
+        api = _api()
+        events: list[str] = []
+
+        class OrderedModel(ToyAdapterModel):
+            def forward(self, batch, device):
+                events.append("forward")
+                return super().forward(batch, device)
+
+        class OrderedAccelerator(FakeAccelerator):
+            def load_state(self, input_dir) -> None:
+                super().load_state(input_dir)
+                events.append("state-loaded")
+
+            def save_state(self, output_dir) -> None:
+                events.append("checkpoint-save")
+                super().save_state(output_dir)
+
+        model = OrderedModel([])
+        batch = {"utts": ["only"], "target": torch.tensor([1.0])}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            first_accelerator = OrderedAccelerator()
+            request = api.TrainRequest(
+                model=model,
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2_000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: [batch],
+                accelerator_factory=lambda **_kwargs: first_accelerator,
+            )
+            fresh_hook_calls: list[str] = []
+            first = api.train_phase(
+                request,
+                api.TrainingCallbacks(
+                    validate=lambda _event: False,
+                    after_resume_loaded=lambda: fresh_hook_calls.append("fresh"),
+                ),
+            )
+            self.assertEqual(fresh_hook_calls, [])
+            events.clear()
+
+            def stop_in_hook() -> None:
+                events.append("resume-hook")
+                raise RuntimeError("stop after resume authentication")
+
+            with self.assertRaisesRegex(RuntimeError, "stop after resume authentication"):
+                api.train_phase(
+                    replace(
+                        request,
+                        resume_from=first.checkpoint,
+                        accelerator_factory=lambda **_kwargs: OrderedAccelerator(),
+                    ),
+                    api.TrainingCallbacks(
+                        validate=lambda _event: events.append("validate"),
+                        after_resume_loaded=stop_in_hook,
+                    ),
+                )
+
+        self.assertEqual(events, ["state-loaded", "resume-hook"])
+
+    def test_pending_resume_hook_precedes_revalidation_of_current_boundary(self) -> None:
+        api = _api()
+        events: list[str] = []
+        model = ToyAdapterModel([])
+        batch = {"utts": ["only"], "target": torch.tensor([1.0])}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            request = api.TrainRequest(
+                model=model,
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2_000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: [batch],
+                accelerator_factory=FakeAccelerator,
+            )
+            with self.assertRaisesRegex(RuntimeError, "validation interrupted"):
+                api.train_phase(
+                    request,
+                    api.TrainingCallbacks(
+                        validate=lambda _event: (_ for _ in ()).throw(RuntimeError("validation interrupted")),
+                    ),
+                )
+            pending = Path(tmp) / "phase-1-validation-01"
+            result = api.train_phase(
+                replace(request, resume_from=pending),
+                api.TrainingCallbacks(
+                    validate=lambda event: events.append(f"validate-{event.validation_index}") or False,
+                    after_resume_loaded=lambda: events.append("resume-hook"),
+                ),
+            )
+
+        self.assertEqual(events, ["resume-hook", "validate-1"])
+        self.assertFalse(result.completed)
+
+    def test_final_succeeded_resume_invokes_hook_without_revalidation_or_training(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+        batch = {"utts": ["only"], "target": torch.tensor([1.0])}
+        events: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            request = api.TrainRequest(
+                model=model,
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2_000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: [batch],
+                accelerator_factory=FakeAccelerator,
+            )
+            first = api.train_phase(request, api.TrainingCallbacks(validate=lambda _event: True))
+            forward_calls = model.forward_calls
+            resumed = api.train_phase(
+                replace(request, resume_from=first.checkpoint),
+                api.TrainingCallbacks(
+                    validate=lambda _event: events.append("validate"),
+                    after_resume_loaded=lambda: events.append("resume-hook"),
+                ),
+            )
+
+        self.assertEqual(events, ["resume-hook"])
+        self.assertEqual(model.forward_calls, forward_calls)
+        self.assertTrue(resumed.completed)
+
     def test_constant_scheduler_spec_is_json_serializable_and_keeps_exact_lr(self) -> None:
         api = _api()
         spec = api.SchedulerSpec(kind="constant-v1")

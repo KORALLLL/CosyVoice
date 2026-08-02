@@ -506,24 +506,16 @@ class ProductionBackend:
         if not cache_manifest.is_file():
             raise StageRequirementError("verified cache aggregate manifest is missing")
         validation_evidence: list[dict[str, object]] = []
-        resume_evidence_loaded = options.resume_checkpoint is None
 
         def load_resume_evidence() -> None:
-            nonlocal resume_evidence_loaded
-            if resume_evidence_loaded:
-                return
             validation_evidence.extend(self._resume_validation_evidence(
                 options,
                 phase,
                 validation_indices,
                 options.resume_checkpoint,
             ))
-            resume_evidence_loaded = True
 
         def validate(event: Any) -> bool:
-            # train_phase authenticates the immutable checkpoint identity and
-            # every state-file checksum before it can invoke this callback.
-            load_resume_evidence()
             expected = validation_indices[len(validation_evidence)]
             if event.validation_index != expected:
                 raise StageRequirementError(f"trainer emitted validation {event.validation_index}, expected {expected}")
@@ -549,10 +541,10 @@ class ProductionBackend:
             validation_index_base=0 if phase.number == 1 else 16,
             initial_adapter_sha256=initial_adapter_sha256,
         )
-        result = train_phase(request, TrainingCallbacks(validate=validate))
-        # A final succeeded checkpoint may need no further validation callback;
-        # train_phase has still authenticated and loaded it before returning.
-        load_resume_evidence()
+        result = train_phase(request, TrainingCallbacks(
+            validate=validate,
+            after_resume_loaded=load_resume_evidence,
+        ))
         if (
             not result.completed
             or [item.get("validation_index") for item in validation_evidence] != list(validation_indices)
@@ -588,6 +580,27 @@ class ProductionBackend:
     ) -> list[dict[str, object]]:
         if resume_checkpoint is None:
             return []
+        received = _main_call(
+            self.coordinator,
+            "resume validation evidence",
+            lambda: self._resume_validation_evidence_main(
+                options,
+                phase,
+                validation_indices,
+                resume_checkpoint,
+            ),
+        )
+        if not isinstance(received, list) or any(not isinstance(item, Mapping) for item in received):
+            raise StageRequirementError("resume validation evidence broadcast is invalid")
+        return [dict(item) for item in received]
+
+    def _resume_validation_evidence_main(
+        self,
+        options: WorkflowOptions,
+        phase: PhaseSpec,
+        validation_indices: tuple[int, ...],
+        resume_checkpoint: Path,
+    ) -> list[dict[str, object]]:
         manifest = _read_mapping(Path(resume_checkpoint) / "checkpoint_manifest.json")
         status = manifest.get("validation_status")
         if status not in {"pending", "succeeded"}:
