@@ -106,3 +106,13 @@
 - Decision: W&B is a mandatory main-rank gate. Scalar and media components use remote commit markers written with their payloads and queried before retry; structured preflight/log outcomes are broadcast so all ranks proceed or fail together.
 - Validation: Evaluation tests pass 27/27, exact evaluation/metrics tests pass 35/35, and all Balalaika tests pass 157/157; scoped re-review approved identity, journal, artifact-resume, remote WAV, rank, and collective W&B controls.
 - Follow-up: Real eight-GPU synthesis, private benchmark access, GigaAM CUDA inference, and online W&B synchronization remain hardware qualification work.
+
+## 2026-08-02 - Task 11 final model transaction
+
+- Decision: A production-ready export is one atomic directory transaction that includes the adapter merge, original-key check, strict normal-path load, fixed-logit equivalence, four authenticated voice-cloning generations, GigaAM ASR, exact manifest, and success seal before the final rename.
+- Decision: Finalization revalidates the exact Task 10 validation-40 publication and live W&B scalar/media markers, derives checkpoint and model-state identities from the actual phase-2 checkpoint, and requires the trainer's complete 14-field phase-2 identity.
+- Decision: Retain exactly the adapter manifest and safetensors weights, reject symlinks/extras, bind the complete base-asset and 20-prompt inventories, and require the exact normal CosyVoice3 pipeline plus a freshly CUDA-qualified GigaAM v3 RNN-T recognizer for production evidence.
+- Decision: Store fixed-probe IDs and both logit tensors in checksum-bound safetensors. Committed validation requires the authenticated base directory, recomputes adapter-active and merged logits from the actual models, and derives every tolerance metric from those tensors.
+- Decision: Validate the complete staged final directory before publication and again afterward. Matching retries are idempotent; corrupt, incomplete, differently sourced, or consistently resealed-but-semantically-invalid artifacts are refused.
+- Validation: Merge tests pass 36/36, evaluation plus merge tests pass 70/70, model tests pass 24/24, and all Balalaika tests pass 200/200. Independent scoped review found no remaining issues.
+- Follow-up: Real CosyVoice3/GigaAM CUDA inference remains part of hardware qualification; no production export or training has run.
