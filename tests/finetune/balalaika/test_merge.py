@@ -15,6 +15,8 @@ from unittest import mock
 import wave
 
 import torch
+from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import save_file as save_safetensors
 
 from cosyvoice.finetune.balalaika.artifacts import sha256_file
 from cosyvoice.finetune.balalaika import evaluation as evaluation_api
@@ -365,10 +367,15 @@ class FinalMergeTests(unittest.TestCase):
         self.assertEqual(
             set(evidence),
             {
-                "format_version", "probe", "probe_sha256", "atol", "rtol",
+                "format_version", "evidence", "evidence_sha256", "probe", "probe_sha256", "atol", "rtol",
                 "max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass",
             },
         )
+        self.assertEqual(evidence["format_version"], 2)
+        self.assertEqual(evidence["evidence"], "logit-verification.safetensors")
+        tensor_path = manifest.path.parent / evidence["evidence"]
+        self.assertTrue(tensor_path.is_file())
+        self.assertEqual(evidence["evidence_sha256"], sha256_file(tensor_path))
         self.assertEqual(evidence["probe"], expected_probe)
         self.assertEqual(evidence["probe_sha256"], expected_hash)
         self.assertEqual((evidence["atol"], evidence["rtol"]), (0.02, 0.02))
@@ -380,6 +387,24 @@ class FinalMergeTests(unittest.TestCase):
         seal = json.loads((manifest.path.parent / "final-success.json").read_text(encoding="utf-8"))
         self.assertEqual(seal["logit_verification_sha256"], api._canonical_mapping_sha256(evidence))
 
+        tensors = load_safetensors(str(tensor_path), device="cpu")
+        self.assertEqual(set(tensors), {"token_ids", "adapter_active_logits", "merged_logits"})
+        self.assertEqual(tensors["token_ids"].dtype, torch.int64)
+        self.assertEqual(tensors["adapter_active_logits"].dtype, torch.float32)
+        self.assertEqual(tensors["merged_logits"].dtype, torch.float32)
+        self.assertEqual(tensors["token_ids"].tolist(), [[0, 0, 0]])
+        self.assertEqual(tuple(tensors["token_ids"].shape), (1, 3))
+        self.assertEqual(tensors["adapter_active_logits"].shape, tensors["merged_logits"].shape)
+        self.assertEqual(tuple(tensors["adapter_active_logits"].shape[:2]), (1, 3))
+        expected = tensors["adapter_active_logits"]
+        actual = tensors["merged_logits"]
+        difference = (expected - actual).abs()
+        denominator = expected.abs().clamp_min(torch.finfo(torch.float32).eps)
+        tolerance = 0.02 + 0.02 * expected.abs()
+        self.assertEqual(evidence["max_abs_error"], float(difference.max().item()))
+        self.assertEqual(evidence["max_relative_error"], float((difference / denominator).max().item()))
+        self.assertEqual(evidence["max_tolerance_ratio"], float((difference / tolerance).max().item()))
+
     def test_resealed_impossible_logit_metrics_are_rejected(self):
         manifest = self._export()
         root = manifest.path.parent
@@ -390,6 +415,66 @@ class FinalMergeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "tolerance"):
             api.require_committed_final(root, expected_mode="test")
+
+    def test_resealed_independent_logit_claim_mutations_are_rejected(self):
+        manifest = self._export()
+        root = manifest.path.parent
+        original = manifest.path.read_bytes()
+
+        def different(number):
+            return 0.5 if number != 0.5 else 0.25
+
+        mutations = {
+            "max-abs": lambda item: item.update({"max_abs_error": 1e30}),
+            "max-relative": lambda item: item.update({"max_relative_error": 1e30}),
+            "ratio": lambda item: item.update({"max_tolerance_ratio": different(item["max_tolerance_ratio"])}),
+            "pass": lambda item: item.update({"pass": False}),
+            "finite": lambda item: item.update({"finite": False}),
+            "atol": lambda item: item.update({"atol": 0.03}),
+            "rtol": lambda item: item.update({"rtol": 0.03}),
+            "probe-ids": lambda item: item.update({
+                "probe": {"token_ids": [[1, 0, 0]], "input_shape": [1, 3]},
+                "probe_sha256": hashlib.sha256(
+                    b'{"input_shape":[1,3],"token_ids":[[1,0,0]]}'
+                ).hexdigest(),
+            }),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                manifest.path.write_bytes(original)
+                payload = json.loads(original.decode("utf-8"))
+                mutate(payload["logit_verification"])
+                evaluation_api.atomic_write_json(manifest.path, payload)
+                self._reseal_final(root)
+                with self.assertRaisesRegex(ValueError, "logit verification"):
+                    api.require_committed_final(root, expected_mode="test")
+
+    def test_resealed_logit_tensor_corruption_and_substitution_are_rejected(self):
+        manifest = self._export()
+        root = manifest.path.parent
+        manifest_bytes = manifest.path.read_bytes()
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+        self.assertIn("evidence", payload["logit_verification"])
+        tensor_path = root / payload["logit_verification"]["evidence"]
+        self.assertTrue(tensor_path.is_file())
+        tensor_bytes = tensor_path.read_bytes()
+
+        for name in ("corrupt", "substitute"):
+            with self.subTest(name=name):
+                manifest.path.write_bytes(manifest_bytes)
+                tensor_path.write_bytes(tensor_bytes)
+                if name == "corrupt":
+                    tensor_path.write_bytes(b"not safetensors")
+                else:
+                    tensors = load_safetensors(str(tensor_path), device="cpu")
+                    tensors["merged_logits"] = tensors["merged_logits"] + 0.5
+                    save_safetensors(tensors, str(tensor_path))
+                changed = json.loads(manifest_bytes.decode("utf-8"))
+                changed["logit_verification"]["evidence_sha256"] = sha256_file(tensor_path)
+                evaluation_api.atomic_write_json(manifest.path, changed)
+                self._reseal_final(root)
+                with self.assertRaisesRegex(ValueError, "logit verification"):
+                    api.require_committed_final(root, expected_mode="test")
 
     def test_logit_drift_aborts_without_publishing_output(self):
         original = api._fixed_probe_logits

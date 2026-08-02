@@ -588,7 +588,12 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
         merged_path = temporary / "llm.pt"
         merge = merge_adapter(request.base_model_dir, copied_adapter, merged_path)
         _require_original_key_layout(request.base_model_dir / "llm.pt", merged_path)
-        logit_evidence = _verify_adapter_active_logits(request.base_model_dir, copied_adapter, merged_path)
+        logit_evidence = _verify_adapter_active_logits(
+            request.base_model_dir,
+            copied_adapter,
+            merged_path,
+            temporary / "logit-verification.safetensors",
+        )
         manifest_path = temporary / "final_model_manifest.json"
         staged_manifest = FinalModelManifest(
             path=manifest_path, llm_path=merged_path, adapter_dir=copied_adapter,
@@ -898,16 +903,19 @@ def _validate_code_identity(value: object) -> None:
     _require_digest(value.get("diff_sha256"), "code diff checksum")
 
 
-def _validate_logit_evidence(value: object) -> None:
+def _validate_logit_evidence(root: Path, value: object) -> None:
     fields = {
-        "format_version", "probe", "probe_sha256", "atol", "rtol",
+        "format_version", "evidence", "evidence_sha256", "probe", "probe_sha256", "atol", "rtol",
         "max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass",
     }
-    if not isinstance(value, Mapping) or set(value) != fields or value.get("format_version") != 1:
+    if not isinstance(value, Mapping) or set(value) != fields or value.get("format_version") != 2:
         raise ValueError("logit verification schema is invalid")
     probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
     if value.get("probe") != probe or value.get("probe_sha256") != _canonical_mapping_sha256(probe):
         raise ValueError("logit verification probe identity changed")
+    if value.get("evidence") != "logit-verification.safetensors":
+        raise ValueError("logit verification tensor evidence path changed")
+    _require_digest(value.get("evidence_sha256"), "logit verification tensor evidence checksum")
     if value.get("atol") != 0.02 or value.get("rtol") != 0.02 or value.get("finite") is not True or value.get("pass") is not True:
         raise ValueError("logit verification tolerance or result is invalid")
     for name in ("max_abs_error", "max_relative_error", "max_tolerance_ratio"):
@@ -916,6 +924,43 @@ def _validate_logit_evidence(value: object) -> None:
             raise ValueError("logit verification error metrics are invalid")
     if value["max_tolerance_ratio"] > 1.0:
         raise ValueError("logit verification exceeds its elementwise tolerance")
+    evidence_path = _safe_final_path(root, value["evidence"], "logit verification tensor evidence")
+    if evidence_path.is_symlink() or not evidence_path.is_file() or sha256_file(evidence_path) != value["evidence_sha256"]:
+        raise ValueError("logit verification tensor evidence checksum changed")
+    from safetensors import SafetensorError
+    from safetensors.torch import load_file
+
+    try:
+        tensors = load_file(str(evidence_path), device="cpu")
+    except (OSError, RuntimeError, SafetensorError) as exc:
+        raise ValueError("logit verification tensor evidence is invalid") from exc
+    if set(tensors) != {"token_ids", "adapter_active_logits", "merged_logits"}:
+        raise ValueError("logit verification tensor evidence schema is invalid")
+    token_ids = tensors["token_ids"]
+    expected = tensors["adapter_active_logits"]
+    actual = tensors["merged_logits"]
+    if (
+        token_ids.dtype != torch.int64
+        or token_ids.device.type != "cpu"
+        or not token_ids.is_contiguous()
+        or tuple(token_ids.shape) != (1, 3)
+        or token_ids.tolist() != [[0, 0, 0]]
+        or expected.dtype != torch.float32
+        or actual.dtype != torch.float32
+        or expected.device.type != "cpu"
+        or actual.device.type != "cpu"
+        or not expected.is_contiguous()
+        or not actual.is_contiguous()
+        or expected.ndim != 3
+        or expected.shape != actual.shape
+        or tuple(expected.shape[:2]) != (1, 3)
+        or expected.shape[2] < 1
+    ):
+        raise ValueError("logit verification tensor evidence dtype or shape is invalid")
+    recomputed = _logit_metrics(expected, actual, value["atol"], value["rtol"])
+    for name in ("max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass"):
+        if value[name] != recomputed[name]:
+            raise ValueError(f"logit verification {name} differs from tensor evidence")
 
 
 def _validate_task10_evidence(value: object, prompt_inventory_sha256: str) -> None:
@@ -1010,6 +1055,7 @@ def require_committed_final(
         "llm.pt",
         "adapter/adapter_manifest.json",
         "adapter/adapter_model.safetensors",
+        "logit-verification.safetensors",
         "final_model_manifest.json",
         "strict-verification/strict-verification.json",
         *(f"strict-verification/audio/smoke-{index:02d}.wav" for index in range(1, 5)),
@@ -1077,7 +1123,7 @@ def require_committed_final(
     if _canonical_mapping_sha256(manifest["base_assets"]) != manifest["base_assets_sha256"]:
         raise ValueError("final base asset inventory checksum changed")
     _validate_code_identity(manifest["code_identity"])
-    _validate_logit_evidence(manifest["logit_verification"])
+    _validate_logit_evidence(output_dir, manifest["logit_verification"])
     if seal.get("logit_verification_sha256") != _canonical_mapping_sha256(manifest["logit_verification"]):
         raise ValueError("final success seal logit evidence checksum changed")
     strict = manifest.get("strict_verification")
@@ -1379,11 +1425,16 @@ def _require_original_key_layout(base_path: Path, merged_path: Path) -> None:
         raise RuntimeError("merged checkpoint does not preserve the original state-dict key layout")
 
 
-def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path: Path) -> dict[str, object]:
+def _verify_adapter_active_logits(
+    base_dir: Path,
+    adapter_dir: Path,
+    merged_path: Path,
+    evidence_path: Path,
+) -> dict[str, object]:
     """Prove the fresh adapter-active and standalone paths agree on fixed IDs."""
 
     from peft.utils import set_peft_model_state_dict
-    from safetensors.torch import load_file
+    from safetensors.torch import load_file, save_file
 
     adapter, _ = _require_exact_adapter_directory(adapter_dir)
     adapted = inject_lora(load_base_llm(base_dir), LoraSettings(**adapter["settings"])).eval()
@@ -1397,29 +1448,49 @@ def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path
         raise RuntimeError(f"adapter logits verification cannot load adapter: missing={missing}, unexpected={result.unexpected_keys}")
     merged = load_base_llm(base_dir).eval()
     merged.load_state_dict(torch.load(merged_path, map_location="cpu", weights_only=True), strict=True)
-    expected = _fixed_probe_logits(adapted)
-    actual = _fixed_probe_logits(merged)
+    expected = _fixed_probe_logits(adapted).to(device="cpu", dtype=torch.float32).contiguous()
+    actual = _fixed_probe_logits(merged).to(device="cpu", dtype=torch.float32).contiguous()
     atol = 2e-2
     rtol = 2e-2
-    finite = bool(torch.isfinite(expected).all() and torch.isfinite(actual).all())
-    if not finite:
+    metrics = _logit_metrics(expected, actual, atol, rtol)
+    if not metrics["finite"]:
         raise RuntimeError("adapter-active and merged logits contain non-finite values")
+    if not metrics["pass"]:
+        raise RuntimeError("adapter-active and merged logits exceed BF16 tolerance")
+    probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
+    token_ids = torch.zeros((1, 3), dtype=torch.int64, device="cpu").contiguous()
+    _atomic_safetensors(evidence_path, {
+        "token_ids": token_ids,
+        "adapter_active_logits": expected,
+        "merged_logits": actual,
+    }, save_file)
+    return {
+        "format_version": 2,
+        "evidence": "logit-verification.safetensors",
+        "evidence_sha256": sha256_file(evidence_path),
+        "probe": probe,
+        "probe_sha256": _canonical_mapping_sha256(probe),
+        "atol": atol,
+        "rtol": rtol,
+        **metrics,
+    }
+
+
+def _logit_metrics(
+    expected: torch.Tensor,
+    actual: torch.Tensor,
+    atol: float,
+    rtol: float,
+) -> dict[str, object]:
+    finite = bool(torch.isfinite(expected).all() and torch.isfinite(actual).all())
     difference = (expected - actual).abs()
     denominator = expected.abs().clamp_min(torch.finfo(expected.dtype).eps)
     tolerance = atol + rtol * expected.abs()
     max_abs_error = float(difference.max().item())
     max_relative_error = float((difference / denominator).max().item())
     max_tolerance_ratio = float((difference / tolerance).max().item())
-    passed = max_tolerance_ratio <= 1.0
-    if not passed:
-        raise RuntimeError("adapter-active and merged logits exceed BF16 tolerance")
-    probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
+    passed = finite and bool(torch.allclose(expected, actual, rtol=rtol, atol=atol))
     return {
-        "format_version": 1,
-        "probe": probe,
-        "probe_sha256": _canonical_mapping_sha256(probe),
-        "atol": atol,
-        "rtol": rtol,
         "max_abs_error": max_abs_error,
         "max_relative_error": max_relative_error,
         "max_tolerance_ratio": max_tolerance_ratio,
