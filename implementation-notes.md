@@ -83,3 +83,10 @@
 - Decision: Lambda-based scheduler identity hashes stable executable semantics—bytecode, constants, names, argument shape, defaults, closure values, and referenced globals—rather than trusting `state_dict()`, source paths, line numbers, or a caller label.
 - Decision: Reject scheduler callables containing recursive or unsupported configuration instead of publishing an identity that may collapse distinct future learning-rate behavior.
 - Validation: The regression proves two LambdaLR instances have equal initial `state_dict()` values but distinct semantic identities, and changed future multipliers are refused on resume. Focused tests pass 20/20, all Balalaika tests pass 113/113, and the two-process smoke plus compilation/whitespace checks pass.
+
+### Architectural resolution after review breaker
+
+- Changed: With user approval, removed arbitrary scheduler callables and their fingerprint machinery after repeated reflection bypasses demonstrated that arbitrary Python behavior cannot be completely checksum-bound.
+- Decision: `TrainRequest` accepts only the frozen, declarative `SchedulerSpec(kind="constant-v1")`; the trainer constructs the constant schedule internally from the exact phase learning rate and stores the spec verbatim in resume identity.
+- Validation: Task 8 tests pass 23/23, all Balalaika tests pass 116/116, and the real two-process CPU `train_phase` smoke passes with equal rank weights and boundary ordinals 1–8. Regression tests reject both the retired `scheduler_factory` keyword and callable `scheduler_spec` values.
+- Follow-up: Real eight-GPU BF16 qualification remains mandatory before production training.
