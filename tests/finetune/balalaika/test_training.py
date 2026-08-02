@@ -9,6 +9,7 @@ from itertools import islice
 import json
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -181,7 +182,65 @@ def _quarter_after_two_steps(step: int) -> float:
     return 1.0 if step < 2 else 0.25
 
 
+_MUTABLE_SCHEDULER_CONFIG = types.ModuleType("mutable_scheduler_config")
+setattr(_MUTABLE_SCHEDULER_CONFIG, "multiplier", 0.5)
+
+
+def _module_backed_schedule(step: int) -> float:
+    return 1.0 if step < 2 else _MUTABLE_SCHEDULER_CONFIG.multiplier
+
+
+_NESTED_GLOBAL_MULTIPLIER = 0.5
+
+
+def _nested_global_schedule(step: int) -> float:
+    return 1.0 if step < 2 else (lambda: _NESTED_GLOBAL_MULTIPLIER)()
+
+
+def _constant_lambda_scheduler(parameter: torch.nn.Parameter):
+    return torch.optim.lr_scheduler.LambdaLR(
+        torch.optim.AdamW([parameter], lr=1e-4), lambda _: 1.0
+    )
+
+
 class AccelerateTrainingTests(unittest.TestCase):
+    def test_scheduler_identity_fingerprints_globals_in_nested_code(self) -> None:
+        api = _api()
+        first_parameter = torch.nn.Parameter(torch.tensor(0.0))
+        first = torch.optim.lr_scheduler.LambdaLR(
+            torch.optim.AdamW([first_parameter], lr=1e-4), _nested_global_schedule
+        )
+        first_identity = api._scheduler_identity(first)
+
+        with mock.patch(f"{__name__}._NESTED_GLOBAL_MULTIPLIER", 0.25):
+            second_parameter = torch.nn.Parameter(torch.tensor(0.0))
+            second = torch.optim.lr_scheduler.LambdaLR(
+                torch.optim.AdamW([second_parameter], lr=1e-4), _nested_global_schedule
+            )
+            second_identity = api._scheduler_identity(second)
+
+        self.assertEqual(first.state_dict(), second.state_dict())
+        self.assertNotEqual(first_identity, second_identity)
+
+    def test_scheduler_identity_rejects_module_backed_mutable_attribute(self) -> None:
+        api = _api()
+        parameter = torch.nn.Parameter(torch.tensor(0.0))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            torch.optim.AdamW([parameter], lr=1e-4), _module_backed_schedule
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "scheduler callable configuration cannot be stably serialized: module"
+        ):
+            api._scheduler_identity(scheduler)
+
+    def test_default_lambda_scheduler_identity_is_stable_across_instances(self) -> None:
+        api = _api()
+        first = _constant_lambda_scheduler(torch.nn.Parameter(torch.tensor(0.0)))
+        second = _constant_lambda_scheduler(torch.nn.Parameter(torch.tensor(0.0)))
+
+        self.assertEqual(api._scheduler_identity(first), api._scheduler_identity(second))
+
     def test_lambda_scheduler_identity_includes_future_callable_semantics(self) -> None:
         api = _api()
         first_parameter = torch.nn.Parameter(torch.tensor(0.0))

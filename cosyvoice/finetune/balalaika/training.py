@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import dis
 import functools
 import hashlib
 import json
@@ -649,11 +650,22 @@ def _function_semantics(value: types.FunctionType, active: set[int]) -> dict[str
         except ValueError as exc:
             raise ValueError("scheduler callable has an empty closure cell") from exc
         closure.append(_stable_semantic_value(cell_value, active))
-    referenced_globals = {
-        name: _stable_semantic_value(value.__globals__[name], active)
-        for name in value.__code__.co_names
-        if name in value.__globals__
-    }
+    builtins = value.__builtins__
+    if isinstance(builtins, types.ModuleType):
+        builtin_namespace: Mapping[str, object] = vars(builtins)
+    elif isinstance(builtins, Mapping):
+        builtin_namespace = builtins
+    else:
+        raise ValueError("scheduler callable has an unsupported builtins namespace")
+    referenced_globals: dict[str, object] = {}
+    for name in sorted(_referenced_global_names(value.__code__)):
+        if name in value.__globals__:
+            referenced = value.__globals__[name]
+        elif name in builtin_namespace:
+            referenced = builtin_namespace[name]
+        else:
+            raise ValueError(f"scheduler callable global {name!r} cannot be resolved")
+        referenced_globals[name] = _stable_semantic_value(referenced, active)
     return {
         "kind": "python_function",
         "module": value.__module__,
@@ -663,6 +675,21 @@ def _function_semantics(value: types.FunctionType, active: set[int]) -> dict[str
         "closure": closure,
         "globals": referenced_globals,
     }
+
+
+def _referenced_global_names(value: types.CodeType) -> set[str]:
+    names: set[str] = set()
+    for instruction in dis.get_instructions(value):
+        if instruction.opname == "LOAD_GLOBAL":
+            if not isinstance(instruction.argval, str):
+                raise ValueError("scheduler callable has an invalid global reference")
+            names.add(instruction.argval)
+        elif instruction.opname in {"LOAD_NAME", "LOAD_FROM_DICT_OR_GLOBALS"}:
+            raise ValueError("scheduler callable uses dynamic name resolution")
+    for constant in value.co_consts:
+        if isinstance(constant, types.CodeType):
+            names.update(_referenced_global_names(constant))
+    return names
 
 
 def _code_semantics(value: types.CodeType, active: set[int]) -> dict[str, object]:
@@ -706,7 +733,9 @@ def _stable_semantic_value(value: object, active: set[int]) -> object:
             }
         }
     if isinstance(value, types.ModuleType):
-        return {"module": value.__name__}
+        raise ValueError(
+            "scheduler callable configuration cannot be stably serialized: module"
+        )
     if callable(value):
         return {"callable": _callable_semantics(value, active)}
     raise ValueError(
