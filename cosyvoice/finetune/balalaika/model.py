@@ -571,7 +571,7 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "production_ready": False,
             "base_assets": base_assets,
             "base_assets_sha256": _canonical_mapping_sha256(base_assets),
-            "task10_evidence": asdict(lineage["validation_evidence"]) if lineage["validation_evidence"] is not None else None,
+            "task10_evidence": _final_validation_payload(lineage["validation_evidence"]),
             "code_revision": _code_revision(),
         }
         manifest_path = temporary / "final_model_manifest.json"
@@ -600,6 +600,9 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "report_sha256": sha256_file(report.path),
             "audio": [str(path.relative_to(temporary)) for path in report.audio_paths],
         }
+        strict_payload = json.loads(report.path.read_text(encoding="utf-8"))
+        payload["prompt_inventory_sha256"] = strict_payload["prompt_inventory_sha256"]
+        payload["selected_voices"] = strict_payload["selected_voices"]
         payload["production_ready"] = not request.test_mode
         atomic_write_json(manifest_path, payload)
         artifact_checksums = {str(path.relative_to(temporary)): sha256_file(path) for path in sorted(temporary.rglob("*")) if path.is_file()}
@@ -634,7 +637,8 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
     _require_final_manifest(request.final_manifest)
     if _canonical_mapping_sha256(build_base_asset_manifest(request.base_model_dir)) != request.final_manifest.base_assets_sha256:
         raise ValueError("strict verification base asset identity differs from exported base")
-    voices = _strict_smoke_voices(request.voices)[:4]
+    inventory = _strict_smoke_voices(request.voices)
+    voices = inventory[:4]
     if request.output_dir.exists() or request.output_dir.is_symlink():
         raise FileExistsError(f"strict verification destination already exists: {request.output_dir}")
     request.output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -666,16 +670,22 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
         checksums = {path.name: sha256_file(path) for path in audio_paths}
         libraries = _library_identities(request.recognizer)
         payload = {
-        "format_version": 1,
-        "final_model_manifest_sha256": sha256_file(request.final_manifest.path),
-        "llm_sha256": request.final_manifest.llm_sha256,
-        "strict_load": True,
-        "smoke_utterances": 4,
-        "audio": [
-            {"voice_id": voice["voice_id"], "prompt": prompt, "path": str(path), "sha256": checksums[path.name], "asr": asr}
-            for voice, prompt, path, asr in zip(voices, _SMOKE_PROMPTS, audio_paths, hypotheses, strict=True)
-        ],
-        "libraries": libraries,
+            "format_version": 1,
+            "final_model_manifest_sha256": sha256_file(request.final_manifest.path),
+            "llm_sha256": request.final_manifest.llm_sha256,
+            "strict_load": True,
+            "smoke_utterances": 4,
+            "prompt_inventory_sha256": _canonical_mapping_sha256({"voices": [
+                {"voice_id": value["voice_id"], "prompt_text": value["prompt_text"], "prompt_sha256": value["prompt_sha256"]}
+                for value in inventory
+            ]}),
+            "selected_voices": [value["voice_id"] for value in voices],
+            "prompt_source": "test_fixture" if request.test_mode else "task10_validation_request",
+            "audio": [
+                {"voice_id": voice["voice_id"], "prompt": prompt, "path": str(path), "sha256": checksums[path.name], "asr": asr}
+                for voice, prompt, path, asr in zip(voices, _SMOKE_PROMPTS, audio_paths, hypotheses, strict=True)
+            ],
+            "libraries": libraries,
         }
         report_path = stage / "strict-verification.json"
         atomic_write_json(report_path, payload)
@@ -731,6 +741,14 @@ def build_base_asset_manifest(base_dir: Path) -> dict[str, object]:
 
 def _canonical_mapping_sha256(value: Mapping[str, object]) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _final_validation_payload(evidence: object) -> object:
+    if evidence is None:
+        return None
+    from cosyvoice.finetune.balalaika.evaluation import final_validation_evidence_payload
+
+    return final_validation_evidence_payload(evidence)
 
 
 def checkpoint_identity_sha256(manifest: Mapping[str, object]) -> str:

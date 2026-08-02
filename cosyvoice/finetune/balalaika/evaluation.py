@@ -224,6 +224,29 @@ class WandbCommitEvidence:
     remote_markers: Mapping[str, object]
 
 
+def final_validation_evidence_payload(evidence: FinalValidationEvidence) -> dict[str, object]:
+    """Return the complete finalization evidence in JSON-safe canonical form."""
+
+    if not isinstance(evidence, FinalValidationEvidence):
+        raise TypeError("evidence must be FinalValidationEvidence")
+    wandb = evidence.wandb
+    return {
+        "evaluation_identity_sha256": evidence.identity_sha256,
+        "artifact_checksums": dict(evidence.artifact_checksums),
+        "checkpoint_sha256": evidence.checkpoint_sha256,
+        "model_state_sha256": evidence.model_state_sha256,
+        "wandb": {
+            "run_id": wandb.run_id,
+            "context": _thaw_json(wandb.context),
+            "marker": wandb.marker,
+            "run_manifest_sha256": wandb.run_manifest_sha256,
+            "ledger_path": str(wandb.ledger_path),
+            "ledger_sha256": wandb.ledger_sha256,
+            "remote_markers": _thaw_json(wandb.remote_markers),
+        },
+    }
+
+
 def verify_final_validation_evidence(
     request: EvaluationRequest,
     *,
