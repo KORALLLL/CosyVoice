@@ -77,3 +77,9 @@
 - Changed: Stale checkpoint staging at the exact derived `.incomplete` path is removed before a retry; neighboring completed checkpoints are never touched.
 - Validation: Focused training tests pass 18/18, all Balalaika tests pass 111/111, and the two-process DDP smoke passes uneven empty-rank work, a 2-of-3 final accumulation, validation crash/resume, exact boundaries, no replay, and equal rank weights.
 - Follow-up: The smoke is intentionally two-process CPU validation; real eight-GPU BF16 capacity and performance qualification remains outside fixture scope.
+
+### Fix round 2
+
+- Decision: Lambda-based scheduler identity hashes stable executable semantics—bytecode, constants, names, argument shape, defaults, closure values, and referenced globals—rather than trusting `state_dict()`, source paths, line numbers, or a caller label.
+- Decision: Reject scheduler callables containing recursive or unsupported configuration instead of publishing an identity that may collapse distinct future learning-rate behavior.
+- Validation: The regression proves two LambdaLR instances have equal initial `state_dict()` values but distinct semantic identities, and changed future multipliers are refused on resume. Focused tests pass 20/20, all Balalaika tests pass 113/113, and the two-process smoke plus compilation/whitespace checks pass.

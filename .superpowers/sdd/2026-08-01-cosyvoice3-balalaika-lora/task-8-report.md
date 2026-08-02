@@ -149,3 +149,45 @@ The smoke artifact records global samples `3`, optimizer steps `1`, boundary ord
 ### Remaining qualification boundary
 
 No real eight-GPU, BF16 model, production corpus, credential, installation, or upload was used. The passing smoke is real two-process CPU DDP exercised through Accelerate; it is not evidence of eight-GPU hardware qualification.
+
+## Fix Round 2
+
+### Finding addressed
+
+Scheduler identity no longer assumes `state_dict()` captures future behavior. For schedulers exposing `lr_lambdas`, each callable now receives a SHA-256 fingerprint over stable Python semantics: bytecode, code constants and names, argument metadata, defaults, keyword defaults, closure cells, and referenced global values. Partials, bound methods, builtins, and inspectable callable objects have explicit representations. Recursive, non-finite, or unsupported configuration is rejected rather than assigned an ambiguous identity. Source paths and line numbers are excluded.
+
+Standard scheduler class and initial state remain in the identity, so constructor-relevant immutable state stays bound alongside any callable semantics. Resume compares this complete identity before Accelerate state loading.
+
+### TDD evidence
+
+Two functions returned the same multiplier at initialization but different multipliers after step two. Their LambdaLR `state_dict()` values were deliberately equal. Before the fix, both the direct identity comparison and resume rejection failed:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_lambda_scheduler_identity_includes_future_callable_semantics tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_resume_rejects_changed_lambda_scheduler_semantics -v
+Ran 2 tests in 1.555s
+FAILED (failures=2)
+```
+
+After semantic fingerprinting:
+
+```text
+Ran 2 tests in 1.488s
+OK
+```
+
+### Verification
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 20 tests in 2.281s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_artifacts tests.finetune.balalaika.test_cache tests.finetune.balalaika.test_data tests.finetune.balalaika.test_metrics tests.finetune.balalaika.test_model tests.finetune.balalaika.test_sources tests.finetune.balalaika.test_tokenizer tests.finetune.balalaika.test_training tests.finetune.balalaika.test_validation_data -v
+Ran 113 tests in 6.182s
+OK
+
+rtk accelerate launch --cpu --num_processes 2 -m tests.finetune.balalaika.accelerate_smoke
+exit 0
+```
+
+`rtk python -m py_compile ...` and `rtk git diff --check` also exited successfully. No external work or eight-GPU hardware claim was made.
