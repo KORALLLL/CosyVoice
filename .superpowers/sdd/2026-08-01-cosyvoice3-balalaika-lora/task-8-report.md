@@ -369,3 +369,63 @@ exit 0
 ### Self-review and qualification boundary
 
 The import check is opcode-based rather than spelling-based, so aliases and local bindings cannot bypass it, and the existing recursive code walk applies the same rule to nested functions. Forbidden dynamic builtins are checked by resolved object identity, preserving shadowed pure Python functions with the same source-level name. No model checkpoint, production data, credential, installation, upload, or other external work was used. The smoke remains real two-process CPU DDP through Accelerate; real eight-GPU BF16 behavior remains a hardware qualification boundary.
+
+## Architectural resolution after review breaker
+
+### Decision implemented
+
+Arbitrary scheduler callables and factories are no longer part of the training API. `TrainRequest.scheduler_factory` was replaced by a frozen `SchedulerSpec`; its closed `SchedulerKind` enum contains only `constant-v1`, the fixed learning-rate schedule required by both approved Balalaika phases. The trainer constructs CosyVoice's `ConstantLR` internally.
+
+The declarative spec validates unknown kinds, rejects non-`SchedulerSpec` request values, serializes to `{"kind": "constant-v1"}`, and is included verbatim under `identity.scheduler`. Resume identity comparison remains exact, so an added, removed, or changed scheduler-spec field rejects the checkpoint before Accelerate state loading. The callable bytecode, globals, closure, import, and reflection fingerprint machinery and all bypass-focused tests were removed.
+
+### TDD evidence
+
+The behavior tests were changed first. Against the callable API, the focused suite produced the expected missing-spec errors and old-identity failure:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 21 tests in 1.551s
+FAILED (failures=1, errors=3)
+```
+
+The three errors were the absent `SchedulerSpec`, absent `TrainRequest.scheduler_spec`, and the same absent spec in unknown-kind validation. The failure showed the checkpoint still stored a `LambdaLR` class/state/callable fingerprint instead of the literal declarative identity.
+
+After the minimal closed-spec implementation:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 21 tests in 2.196s
+OK
+```
+
+The replacement tests cover JSON serialization and the real constant learning-rate trajectory, unknown scheduler kinds, non-spec request values, the exact manifest identity, and resume rejection when that identity contains an unrecognized field. No test injects a scheduler callable.
+
+### Files and commit
+
+- `cosyvoice/finetune/balalaika/training.py`: defines the closed immutable scheduler schema, constructs `ConstantLR` internally, records the literal spec identity, and removes callable fingerprint/reflection code.
+- `tests/finetune/balalaika/test_training.py`: replaces bypass-oriented callable tests with declarative behavior and resume-identity regressions.
+- `tests/finetune/balalaika/accelerate_smoke.py`: supplies the production declarative spec explicitly.
+- Code/tests commit: `7ec547e688a8b393e4f77e00330afc6f5a1bb246` (`fix: replace scheduler callables with closed spec`).
+
+### Verification
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_artifacts tests.finetune.balalaika.test_cache tests.finetune.balalaika.test_data tests.finetune.balalaika.test_metrics tests.finetune.balalaika.test_model tests.finetune.balalaika.test_sources tests.finetune.balalaika.test_tokenizer tests.finetune.balalaika.test_training tests.finetune.balalaika.test_validation_data -v
+Ran 114 tests in 5.474s
+OK
+
+rtk accelerate launch --cpu --num_processes 2 -m tests.finetune.balalaika.accelerate_smoke
+exit 0
+
+rtk python -m py_compile cosyvoice/finetune/balalaika/training.py tests/finetune/balalaika/test_training.py tests/finetune/balalaika/accelerate_smoke.py
+exit 0
+
+rtk git diff --check
+exit 0
+```
+
+The smoke artifact records `world_size: 2`, boundary ordinals `1..8`, `global_samples: 3`, `optimizer_steps: 1`, and identical adapter weights on both ranks. This reconfirms pending resume, empty-rank collective behavior, and final accumulation commit on the declarative scheduler path.
+
+### Concerns and qualification boundary
+
+The supported scheduler set is intentionally limited to the versioned constant schedule required by this recipe. Adding a new schedule requires a new explicit enum/schema member, construction branch, trajectory test, and identity behavior; arbitrary Python injection is not available. No model checkpoint, production data, credential, installation, upload, or other external work was used. The passing smoke remains real two-process CPU DDP through Accelerate, not evidence of real eight-GPU BF16 hardware qualification.
