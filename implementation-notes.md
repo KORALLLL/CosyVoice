@@ -58,3 +58,12 @@
 - Decision: Random Parquet access uses bounded one-row batches within retained row-group offsets rather than materializing whole row groups.
 - Decision: Dynamic batch cost follows actual independent padding: `batch_size * (max_text_len + max_speech_len)`.
 - Validation: Data tests pass 10/10 and all Balalaika tests pass 93/93; scoped re-review approved bounded row access and complementary-length budget handling.
+
+## 2026-08-02 - Task 8 resumable Accelerate training
+
+- Decision: Represent every one-eighth point as an exact rational fraction and use the smallest completed-sample threshold at or above it; small datasets may share a sample threshold, but retain eight distinct monotone boundary indices.
+- Decision: Atomically publish a checksum-complete checkpoint as validation-pending before invoking validation, then atomically mark its manifest succeeded; restart retries pending validation before consuming another batch and skips succeeded validation.
+- Assumption: Production callers supply the Task 7 epoch dataloader through a factory; the trainer owns Accelerate preparation, adapter-only optimizer construction, progress, and checkpoint state.
+- Decision: Keep all eight fractional event identities even when a small epoch maps several exact fractions to the same completed-sample threshold; release every due event once at the next accumulation boundary.
+- Validation: Training tests pass 13/13, all Balalaika tests pass 106/106, the two-process Accelerate CPU smoke writes eight ordered boundary records, and compilation/whitespace checks pass.
+- Follow-up: Real eight-GPU BF16 execution, production model loading, and DDP behavior of explicit empty synchronization batches remain hardware qualification work.
