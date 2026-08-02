@@ -89,6 +89,7 @@ class ExportRequest:
     validation_request: object | None = None
     wandb_run_manifest: Path | None = None
     test_mode: bool = False
+    expected_training_identity: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for name in ("base_model_dir", "phase2_checkpoint", "validation_summary", "output_dir"):
@@ -96,6 +97,8 @@ class ExportRequest:
                 raise TypeError(f"{name} must be a pathlib.Path")
         if self.test_mode is not True and (self.validation_request is None or not isinstance(self.wandb_run_manifest, Path)):
             raise ValueError("production export requires Task 10 evidence request and W&B run manifest")
+        if self.test_mode is not True and not isinstance(self.expected_training_identity, Mapping):
+            raise ValueError("production export requires the complete immutable training identity")
 
 
 @dataclass(frozen=True)
@@ -553,6 +556,7 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "target_modules": list(merge.target_modules),
             "phase2_checkpoint": str(request.phase2_checkpoint),
             "phase2_checkpoint_manifest_sha256": lineage["checkpoint_sha256"],
+            "phase2_model_state_sha256": lineage["model_state_sha256"],
             "validation_summary": str(request.validation_summary),
             "validation_summary_sha256": lineage["validation_sha256"],
             "production_ready": not request.test_mode,
@@ -691,6 +695,26 @@ def _canonical_mapping_sha256(value: Mapping[str, object]) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def checkpoint_identity_sha256(manifest: Mapping[str, object]) -> str:
+    """Stable phase-checkpoint identity, excluding its post-validation status bit."""
+
+    if not isinstance(manifest, Mapping):
+        raise TypeError("checkpoint manifest must be a mapping")
+    value = dict(manifest)
+    value.pop("validation_status", None)
+    return _canonical_mapping_sha256(value)
+
+
+def model_state_identity_sha256(state_files: Mapping[str, object]) -> str:
+    """Stable identity of the authenticated immutable checkpoint state files."""
+
+    if not isinstance(state_files, Mapping) or not state_files:
+        raise ValueError("checkpoint state-file inventory is invalid")
+    if any(not isinstance(name, str) or not isinstance(digest, str) or len(digest) != 64 for name, digest in state_files.items()):
+        raise ValueError("checkpoint state-file inventory is invalid")
+    return _canonical_mapping_sha256(dict(state_files))
+
+
 def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
     checkpoint = request.phase2_checkpoint / "checkpoint_manifest.json"
     try:
@@ -710,6 +734,8 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
         raise ValueError("final export requires phase-2 checkpoint lineage")
     if progress.get("validation_index") != 40:
         raise ValueError("final export requires validation index 40")
+    if not request.test_mode and identity != request.expected_training_identity:
+        raise ValueError("phase-2 checkpoint training identity differs from the workflow identity")
     adapter_dir = request.phase2_checkpoint / "adapter"
     adapter = _read_adapter_manifest(adapter_dir / ADAPTER_MANIFEST_NAME)
     settings = LoraSettings(**adapter["settings"])
@@ -727,6 +753,8 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
     }
     if dict(state_files) != actual:
         raise ValueError("phase-2 checkpoint state checksum inventory changed")
+    checkpoint_sha256 = checkpoint_identity_sha256(checkpoint_payload)
+    model_state_sha256 = model_state_identity_sha256(actual)
     if not isinstance(validation, Mapping) or validation.get("format_version") != 2 or validation.get("validation_index") != 40:
         raise ValueError("final export requires a successful validation-40 summary")
     evaluation_identity = validation.get("evaluation_identity")
@@ -760,14 +788,10 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
     if not request.test_mode:
         from cosyvoice.finetune.balalaika.evaluation import verify_final_validation_evidence
 
-        checkpoint_identity = evaluation_identity.get("checkpoint_sha256")
-        model_state_identity = evaluation_identity.get("model_state_sha256")
-        if not isinstance(checkpoint_identity, str) or not isinstance(model_state_identity, str):
-            raise ValueError("validation-40 evaluation identity lacks checkpoint/model-state checksums")
         verify_final_validation_evidence(
             request.validation_request,
-            expected_checkpoint_sha256=checkpoint_identity,
-            expected_model_state_sha256=model_state_identity,
+            expected_checkpoint_sha256=checkpoint_sha256,
+            expected_model_state_sha256=model_state_sha256,
             expected_base_checkpoint_sha256=str(adapter["base_checkpoint_sha256"]),
             expected_adapter_sha256=str(adapter["weights_sha256"]),
             wandb_run_manifest=request.wandb_run_manifest,
@@ -777,7 +801,8 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
         raise ValueError("requested base checkpoint differs from the final adapter")
     return {
         "adapter_dir": adapter_dir,
-        "checkpoint_sha256": sha256_file(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "model_state_sha256": model_state_sha256,
         "validation_sha256": sha256_file(request.validation_summary),
     }
 
@@ -847,6 +872,7 @@ def _require_final_manifest(manifest: FinalModelManifest) -> None:
         "format_version", "llm", "llm_sha256", "adapter", "adapter_weights_sha256",
         "base_checkpoint_sha256", "target_modules", "phase2_checkpoint",
         "phase2_checkpoint_manifest_sha256", "validation_summary",
+        "phase2_model_state_sha256",
         "validation_summary_sha256", "code_revision",
         "production_ready",
         "base_assets", "base_assets_sha256",
