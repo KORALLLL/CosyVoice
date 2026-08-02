@@ -1,0 +1,455 @@
+"""CPU-only tests for exact progress and resumable Accelerate training."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import replace
+from importlib import import_module
+from itertools import islice
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+import torch
+
+from cosyvoice.finetune.balalaika.config import PhaseSpec
+from cosyvoice.finetune.balalaika.model import LoraSettings, TrainableAudit
+
+
+def _api():
+    try:
+        return import_module("cosyvoice.finetune.balalaika.training")
+    except ModuleNotFoundError as exc:
+        raise AssertionError("Balalaika Accelerate training module is missing") from exc
+
+
+class ToyAdapterModel(torch.nn.Module):
+    def __init__(self, seen_sample_ids: list[str]) -> None:
+        super().__init__()
+        self.lora_weight = torch.nn.Parameter(torch.tensor(0.0))
+        self._seen_sample_ids = seen_sample_ids
+        self._balalaika_base_checkpoint_sha256 = "b" * 64
+        self._balalaika_lora_settings = LoraSettings()
+
+    def forward(self, batch, _device):
+        self._seen_sample_ids.extend(batch["utts"])
+        target = batch["target"].float()
+        return {"loss": ((self.lora_weight - target) ** 2).mean()}
+
+
+class FakeAccelerator:
+    """Stateful CPU fixture for the subset of Accelerate owned by the trainer."""
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.num_processes = 8
+        self.process_index = 0
+        self.is_main_process = True
+        self.device = torch.device("cpu")
+        self.sync_gradients = True
+        self._checkpointables = []
+        self._prepared = ()
+
+    def prepare(self, *values):
+        self._prepared = values
+        return values
+
+    def register_for_checkpointing(self, value) -> None:
+        self._checkpointables.append(value)
+
+    @contextmanager
+    def accumulate(self, _model):
+        yield
+
+    def backward(self, loss) -> None:
+        loss.backward()
+
+    def clip_grad_norm_(self, parameters, max_norm):
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+    def reduce(self, value, reduction="sum"):
+        if reduction != "sum":
+            raise AssertionError(reduction)
+        return value
+
+    def wait_for_everyone(self) -> None:
+        return None
+
+    def unwrap_model(self, model):
+        return model
+
+    def save_state(self, output_dir) -> None:
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        model, optimizer, scheduler = self._prepared
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "checkpointables": [value.state_dict() for value in self._checkpointables],
+                "rng": torch.get_rng_state(),
+            },
+            output / "fake_accelerate_state.pt",
+        )
+        torch.save(torch.get_rng_state(), output / "random_states_0.pkl")
+
+    def load_state(self, input_dir) -> None:
+        state = torch.load(Path(input_dir) / "fake_accelerate_state.pt", weights_only=False)
+        model, optimizer, scheduler = self._prepared
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        for value, saved in zip(self._checkpointables, state["checkpointables"], strict=True):
+            value.load_state_dict(saved)
+        torch.set_rng_state(state["rng"])
+
+    def skip_first_batches(self, dataloader, count):
+        return islice(dataloader, count, None)
+
+    def gather(self, value):
+        return value.repeat(self.num_processes)
+
+
+def _audit(_model) -> TrainableAudit:
+    return TrainableAudit(("toy",), ("lora_weight",), (), 1, 1)
+
+
+def _save_adapter(model, path):
+    output = Path(path)
+    output.mkdir(parents=True, exist_ok=True)
+    weights = output / "adapter_model.safetensors"
+    weights.write_bytes(model.lora_weight.detach().cpu().numpy().tobytes())
+    (output / "adapter_manifest.json").write_text(
+        json.dumps({"base_checkpoint_sha256": model._balalaika_base_checkpoint_sha256}),
+        encoding="utf-8",
+    )
+
+
+class AccelerateTrainingTests(unittest.TestCase):
+    def test_fraction_boundaries_are_exact(self) -> None:
+        boundaries = _api().FractionBoundary.for_epoch(eligible_samples=80)
+
+        self.assertEqual([item.sample_target for item in boundaries], [10, 20, 30, 40, 50, 60, 70, 80])
+        self.assertEqual([(item.numerator, item.denominator) for item in boundaries], [(i, 8) for i in range(1, 9)])
+
+    def test_small_epoch_retains_all_eight_ordered_boundary_events(self) -> None:
+        boundaries = _api().FractionBoundary.for_epoch(eligible_samples=3)
+
+        self.assertEqual([item.sample_target for item in boundaries], [1, 1, 2, 2, 2, 3, 3, 3])
+        self.assertEqual([item.ordinal for item in boundaries], list(range(1, 9)))
+
+    def test_fraction_targets_remain_exact_beyond_float_integer_range(self) -> None:
+        eligible = 2**60 + 1
+        boundaries = _api().FractionBoundary.for_epoch(eligible)
+
+        self.assertEqual(
+            [item.sample_target for item in boundaries],
+            [(eligible * ordinal + 7) // 8 for ordinal in range(1, 9)],
+        )
+
+    def test_resume_does_not_repeat_samples_or_validation_boundaries(self) -> None:
+        api = _api()
+        seen: list[str] = []
+        model = ToyAdapterModel(seen)
+        batches = [
+            {"utts": [f"sample-{index}"], "target": torch.tensor([float(index + 1)])}
+            for index in range(8)
+        ]
+        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            root = Path(tmp)
+            first_indices: list[int] = []
+            first = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=8,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=root,
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: batches,
+                    accelerator_factory=FakeAccelerator,
+                ),
+                api.TrainingCallbacks(
+                    validate=lambda event: first_indices.append(event.validation_index) or event.validation_index < 3
+                ),
+            )
+            resumed_indices: list[int] = []
+            resumed = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=8,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=root,
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: batches,
+                    accelerator_factory=FakeAccelerator,
+                    resume_from=first.checkpoint,
+                ),
+                api.TrainingCallbacks(validate=lambda event: resumed_indices.append(event.validation_index)),
+            )
+
+        self.assertEqual(seen, [f"sample-{index}" for index in range(8)])
+        self.assertEqual(first_indices + resumed_indices, list(range(1, 9)))
+        self.assertEqual(resumed.progress.optimizer_steps, 8)
+        self.assertTrue(resumed.completed)
+
+    def test_one_optimizer_boundary_can_release_all_due_small_epoch_events(self) -> None:
+        api = _api()
+        seen: list[str] = []
+        model = ToyAdapterModel(seen)
+        events = []
+        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+        batch = {"utts": ["a", "b", "c"], "target": torch.tensor([1.0, 2.0, 3.0])}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            result = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=3,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path(tmp),
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: [batch],
+                    accelerator_factory=FakeAccelerator,
+                ),
+                api.TrainingCallbacks(validate=lambda event: events.append(event)),
+            )
+
+        self.assertTrue(result.completed)
+        self.assertEqual([event.boundary.ordinal for event in events], list(range(1, 9)))
+        self.assertEqual({event.global_samples for event in events}, {3})
+
+    def test_phase_two_continues_global_validation_indices_at_seventeen(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+        phase = replace(PhaseSpec.for_phase(2), epochs=1)
+        indices: list[int] = []
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            result = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=1,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path(tmp),
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: [
+                        {"utts": ["only"], "target": torch.tensor([1.0])}
+                    ],
+                    accelerator_factory=FakeAccelerator,
+                ),
+                api.TrainingCallbacks(validate=lambda event: indices.append(event.validation_index)),
+            )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(indices, list(range(17, 25)))
+
+    def test_checkpoint_records_complete_identity_rng_and_state_checksums(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            result = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=1,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path(tmp),
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: [
+                        {"utts": ["only"], "target": torch.tensor([1.0])}
+                    ],
+                    accelerator_factory=FakeAccelerator,
+                ),
+                api.TrainingCallbacks(validate=lambda event: False),
+            )
+            manifest = json.loads((result.checkpoint / api.CHECKPOINT_MANIFEST).read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["validation_status"], "succeeded")
+        self.assertEqual(
+            set(manifest["identity"]),
+            {"cache_checksum", "phase", "phase_spec", "base_checkpoint_sha256", "lora", "token_limit", "accumulation_steps", "world_size"},
+        )
+        self.assertIn("fake_accelerate_state.pt", manifest["state_files"])
+        self.assertIn("adapter/adapter_model.safetensors", manifest["state_files"])
+        self.assertEqual(manifest["rng_files"], ["random_states_0.pkl"])
+
+    def test_resume_refuses_changed_identity_and_tampered_state(self) -> None:
+        api = _api()
+        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            model = ToyAdapterModel([])
+            request = api.TrainRequest(
+                model=model,
+                phase=phase,
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: [
+                    {"utts": ["only"], "target": torch.tensor([1.0])}
+                ],
+                accelerator_factory=FakeAccelerator,
+            )
+            first = api.train_phase(request, api.TrainingCallbacks(validate=lambda event: False))
+            for changed in (
+                replace(request, resume_from=first.checkpoint, cache_checksum="d" * 64),
+                replace(request, resume_from=first.checkpoint, phase=replace(PhaseSpec.for_phase(2), epochs=1)),
+                replace(request, resume_from=first.checkpoint, phase=replace(phase, learning_rate=2e-4)),
+                replace(request, resume_from=first.checkpoint, token_limit=3000),
+                replace(request, resume_from=first.checkpoint, accumulation_steps=2),
+            ):
+                with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "identity changed"):
+                    api.train_phase(changed, api.TrainingCallbacks(validate=lambda event: None))
+
+            state_path = first.checkpoint / "fake_accelerate_state.pt"
+            state_path.write_bytes(state_path.read_bytes() + b"tampered")
+            with self.assertRaisesRegex(ValueError, "checksum changed"):
+                api.train_phase(
+                    replace(request, resume_from=first.checkpoint),
+                    api.TrainingCallbacks(validate=lambda event: None),
+                )
+
+    def test_validation_failure_resumes_pending_checkpoint_without_sample_replay(self) -> None:
+        api = _api()
+        seen: list[str] = []
+        model = ToyAdapterModel(seen)
+        batches = [
+            {"utts": [f"sample-{index}"], "target": torch.tensor([float(index + 1)])}
+            for index in range(8)
+        ]
+        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+
+        def fail_validation(_event):
+            raise RuntimeError("validation unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            request = api.TrainRequest(
+                model=model,
+                phase=phase,
+                eligible_samples=8,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: batches,
+                accelerator_factory=FakeAccelerator,
+            )
+            with self.assertRaisesRegex(RuntimeError, "validation unavailable"):
+                api.train_phase(request, api.TrainingCallbacks(validate=fail_validation))
+
+            pending = Path(tmp) / "phase-1-validation-01"
+            manifest = json.loads((pending / api.CHECKPOINT_MANIFEST).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["validation_status"], "pending")
+            recovered_indices: list[int] = []
+            recovered = api.train_phase(
+                replace(request, resume_from=pending),
+                api.TrainingCallbacks(
+                    validate=lambda event: recovered_indices.append(event.validation_index) or False
+                ),
+            )
+            recovered_status = json.loads(
+                (recovered.checkpoint / api.CHECKPOINT_MANIFEST).read_text(encoding="utf-8")
+            )["validation_status"]
+
+        self.assertEqual(seen, ["sample-0"])
+        self.assertEqual(recovered_indices, [1])
+        self.assertFalse(recovered.completed)
+        self.assertEqual(recovered_status, "succeeded")
+
+    def test_production_oom_raises_without_changing_the_token_limit(self) -> None:
+        api = _api()
+
+        class OOMModel(ToyAdapterModel):
+            def forward(self, batch, device):
+                raise torch.cuda.OutOfMemoryError("fixture OOM")
+
+        request = api.TrainRequest(
+            model=OOMModel([]),
+            phase=replace(PhaseSpec.for_phase(1), epochs=1),
+            eligible_samples=1,
+            cache_checksum="c" * 64,
+            checkpoint_root=Path("unused"),
+            token_limit=5000,
+            accumulation_steps=1,
+            dataloader_factory=lambda _epoch, _accelerator: [
+                {"utts": ["only"], "target": torch.tensor([1.0])}
+            ],
+            accelerator_factory=FakeAccelerator,
+        )
+        with mock.patch.object(api, "audit_trainable_parameters", _audit):
+            with self.assertRaisesRegex(api.TrainingCapacityError, "5000"):
+                api.train_phase(request, api.TrainingCallbacks(validate=lambda event: None))
+
+        self.assertEqual(request.token_limit, 5000)
+
+    def test_qualification_selects_largest_candidate_with_two_gib_on_every_rank(self) -> None:
+        api = _api()
+        gib = 1024**3
+        peaks = {2000: 1 * gib, 3000: 2 * gib, 4000: 3 * gib, 5000: 5 * gib, 6000: 7 * gib}
+        tried: list[int] = []
+
+        result = api.qualify_token_limit(
+            api.QualificationRequest(
+                accelerator=FakeAccelerator(),
+                run_candidate=lambda limit: (tried.append(limit) or peaks[limit], 8 * gib),
+            )
+        )
+
+        self.assertEqual(tried, [2000, 3000, 4000, 5000, 6000])
+        self.assertEqual(result.token_limit, 5000)
+        self.assertEqual([item.token_limit for item in result.candidates], tried)
+        self.assertTrue(all(len(item.peak_bytes_by_rank) == 8 for item in result.candidates))
+
+    def test_qualification_refuses_when_no_candidate_has_headroom(self) -> None:
+        api = _api()
+        gib = 1024**3
+
+        with self.assertRaisesRegex(api.TrainingCapacityError, "two GiB"):
+            api.qualify_token_limit(
+                api.QualificationRequest(
+                    accelerator=FakeAccelerator(),
+                    run_candidate=lambda _limit: (7 * gib, 8 * gib),
+                )
+            )
+
+    def test_qualification_stops_collectively_when_any_rank_ooms(self) -> None:
+        api = _api()
+        tried: list[int] = []
+
+        class RemoteOOMAccelerator(FakeAccelerator):
+            def gather(self, value):
+                if value.numel() == 1:
+                    return torch.tensor([0, 0, 0, 0, 0, 0, 0, 1], dtype=value.dtype)
+                return super().gather(value)
+
+        with self.assertRaises(api.TrainingCapacityError):
+            api.qualify_token_limit(
+                api.QualificationRequest(
+                    accelerator=RemoteOOMAccelerator(),
+                    run_candidate=lambda limit: (tried.append(limit) or 1, 3 * 1024**3),
+                )
+            )
+
+        self.assertEqual(tried, [2000])
+
+
+if __name__ == "__main__":
+    unittest.main()
