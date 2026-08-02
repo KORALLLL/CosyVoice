@@ -576,7 +576,12 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
     }
     output_dir = request.output_dir
     if output_dir.exists() or output_dir.is_symlink():
-        return require_committed_final(output_dir, expected_mode=mode, expected_lineage=expected_lineage)
+        return require_committed_final(
+            output_dir,
+            request.base_model_dir,
+            expected_mode=mode,
+            expected_lineage=expected_lineage,
+        )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
     try:
@@ -662,12 +667,23 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "logit_verification_sha256": _canonical_mapping_sha256(logit_evidence),
             "artifacts": artifact_checksums,
         })
+        require_committed_final(
+            temporary,
+            request.base_model_dir,
+            expected_mode=mode,
+            expected_lineage=expected_lineage,
+        )
         _publish_directory(temporary, output_dir)
     except Exception:
         if temporary.exists() and not temporary.is_symlink():
             shutil.rmtree(temporary)
         raise
-    return require_committed_final(output_dir, expected_mode=mode, expected_lineage=expected_lineage)
+    return require_committed_final(
+        output_dir,
+        request.base_model_dir,
+        expected_mode=mode,
+        expected_lineage=expected_lineage,
+    )
 
 
 def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
@@ -903,7 +919,13 @@ def _validate_code_identity(value: object) -> None:
     _require_digest(value.get("diff_sha256"), "code diff checksum")
 
 
-def _validate_logit_evidence(root: Path, value: object) -> None:
+def _validate_logit_evidence(
+    root: Path,
+    value: object,
+    base_model_dir: Path,
+    adapter_dir: Path,
+    merged_path: Path,
+) -> None:
     fields = {
         "format_version", "evidence", "evidence_sha256", "probe", "probe_sha256", "atol", "rtol",
         "max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass",
@@ -961,6 +983,21 @@ def _validate_logit_evidence(root: Path, value: object) -> None:
     for name in ("max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass"):
         if value[name] != recomputed[name]:
             raise ValueError(f"logit verification {name} differs from tensor evidence")
+    computed_ids, computed_expected, computed_actual = _compute_fixed_probe_tensors(
+        base_model_dir,
+        adapter_dir,
+        merged_path,
+    )
+    if (
+        not torch.equal(token_ids, computed_ids)
+        or expected.dtype != computed_expected.dtype
+        or expected.shape != computed_expected.shape
+        or not torch.equal(expected, computed_expected)
+        or actual.dtype != computed_actual.dtype
+        or actual.shape != computed_actual.shape
+        or not torch.equal(actual, computed_actual)
+    ):
+        raise ValueError("logit verification tensor evidence differs from authenticated model computation")
 
 
 def _validate_task10_evidence(value: object, prompt_inventory_sha256: str) -> None:
@@ -1043,12 +1080,15 @@ def _validate_task10_evidence(value: object, prompt_inventory_sha256: str) -> No
 
 def require_committed_final(
     output_dir: Path,
+    base_model_dir: Path,
     *,
     expected_mode: Literal["test", "production"] | None = None,
     expected_lineage: Mapping[str, object] | None = None,
 ) -> FinalModelManifest:
     """Fail closed unless ``output_dir`` is one complete immutable final export."""
 
+    if not isinstance(base_model_dir, Path):
+        raise TypeError("base_model_dir must be Path")
     output_dir = Path(output_dir)
     inventory = _regular_file_inventory(output_dir, excluded={"final-success.json"})
     expected_files = {
@@ -1122,8 +1162,20 @@ def require_committed_final(
     _validate_base_asset_payload(manifest["base_assets"])
     if _canonical_mapping_sha256(manifest["base_assets"]) != manifest["base_assets_sha256"]:
         raise ValueError("final base asset inventory checksum changed")
+    current_base_assets = build_base_asset_manifest(base_model_dir)
+    if (
+        current_base_assets != manifest["base_assets"]
+        or _canonical_mapping_sha256(current_base_assets) != manifest["base_assets_sha256"]
+    ):
+        raise ValueError("current base asset manifest differs from final embedded base assets")
     _validate_code_identity(manifest["code_identity"])
-    _validate_logit_evidence(output_dir, manifest["logit_verification"])
+    _validate_logit_evidence(
+        output_dir,
+        manifest["logit_verification"],
+        base_model_dir,
+        adapter_dir,
+        llm_path,
+    )
     if seal.get("logit_verification_sha256") != _canonical_mapping_sha256(manifest["logit_verification"]):
         raise ValueError("final success seal logit evidence checksum changed")
     strict = manifest.get("strict_verification")
@@ -1433,23 +1485,9 @@ def _verify_adapter_active_logits(
 ) -> dict[str, object]:
     """Prove the fresh adapter-active and standalone paths agree on fixed IDs."""
 
-    from peft.utils import set_peft_model_state_dict
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import save_file
 
-    adapter, _ = _require_exact_adapter_directory(adapter_dir)
-    adapted = inject_lora(load_base_llm(base_dir), LoraSettings(**adapter["settings"])).eval()
-    result = set_peft_model_state_dict(
-        adapted,
-        load_file(str(adapter_dir / adapter["weights"]), device="cpu"),
-        adapter_name=ADAPTER_NAME,
-    )
-    missing = tuple(name for name in result.missing_keys if "lora_" in name)
-    if missing or result.unexpected_keys:
-        raise RuntimeError(f"adapter logits verification cannot load adapter: missing={missing}, unexpected={result.unexpected_keys}")
-    merged = load_base_llm(base_dir).eval()
-    merged.load_state_dict(torch.load(merged_path, map_location="cpu", weights_only=True), strict=True)
-    expected = _fixed_probe_logits(adapted).to(device="cpu", dtype=torch.float32).contiguous()
-    actual = _fixed_probe_logits(merged).to(device="cpu", dtype=torch.float32).contiguous()
+    token_ids, expected, actual = _compute_fixed_probe_tensors(base_dir, adapter_dir, merged_path)
     atol = 2e-2
     rtol = 2e-2
     metrics = _logit_metrics(expected, actual, atol, rtol)
@@ -1458,7 +1496,6 @@ def _verify_adapter_active_logits(
     if not metrics["pass"]:
         raise RuntimeError("adapter-active and merged logits exceed BF16 tolerance")
     probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
-    token_ids = torch.zeros((1, 3), dtype=torch.int64, device="cpu").contiguous()
     _atomic_safetensors(evidence_path, {
         "token_ids": token_ids,
         "adapter_active_logits": expected,
@@ -1476,6 +1513,36 @@ def _verify_adapter_active_logits(
     }
 
 
+def _compute_fixed_probe_tensors(
+    base_dir: Path,
+    adapter_dir: Path,
+    merged_path: Path,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fresh-load both model paths and return their exact fixed-probe evidence."""
+
+    from peft.utils import set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    adapter, _ = _require_exact_adapter_directory(adapter_dir)
+    adapted = inject_lora(load_base_llm(base_dir), LoraSettings(**adapter["settings"])).eval()
+    result = set_peft_model_state_dict(
+        adapted,
+        load_file(str(adapter_dir / adapter["weights"]), device="cpu"),
+        adapter_name=ADAPTER_NAME,
+    )
+    missing = tuple(name for name in result.missing_keys if "lora_" in name)
+    if missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"adapter logits verification cannot load adapter: missing={missing}, unexpected={result.unexpected_keys}"
+        )
+    merged = load_base_llm(base_dir).eval()
+    merged.load_state_dict(torch.load(merged_path, map_location="cpu", weights_only=True), strict=True)
+    token_ids = torch.zeros((1, 3), dtype=torch.int64, device="cpu").contiguous()
+    expected = _fixed_probe_logits(adapted).to(device="cpu", dtype=torch.float32).contiguous()
+    actual = _fixed_probe_logits(merged).to(device="cpu", dtype=torch.float32).contiguous()
+    return token_ids, expected, actual
+
+
 def _logit_metrics(
     expected: torch.Tensor,
     actual: torch.Tensor,
@@ -1485,11 +1552,11 @@ def _logit_metrics(
     finite = bool(torch.isfinite(expected).all() and torch.isfinite(actual).all())
     difference = (expected - actual).abs()
     denominator = expected.abs().clamp_min(torch.finfo(expected.dtype).eps)
-    tolerance = atol + rtol * expected.abs()
+    tolerance = atol + rtol * actual.abs()
     max_abs_error = float(difference.max().item())
     max_relative_error = float((difference / denominator).max().item())
     max_tolerance_ratio = float((difference / tolerance).max().item())
-    passed = finite and bool(torch.allclose(expected, actual, rtol=rtol, atol=atol))
+    passed = finite and max_tolerance_ratio <= 1.0
     return {
         "max_abs_error": max_abs_error,
         "max_relative_error": max_relative_error,
@@ -1522,8 +1589,12 @@ def _publish_directory(temporary: Path, destination: Path) -> None:
         os.close(parent_fd)
 
 
-def _require_final_manifest(manifest: FinalModelManifest) -> None:
-    committed = require_committed_final(manifest.path.parent, expected_mode=manifest.mode)
+def _require_final_manifest(manifest: FinalModelManifest, base_model_dir: Path) -> None:
+    committed = require_committed_final(
+        manifest.path.parent,
+        base_model_dir,
+        expected_mode=manifest.mode,
+    )
     if committed != manifest:
         raise ValueError("final model manifest object differs from committed evidence")
 

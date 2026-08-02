@@ -317,6 +317,11 @@ class FinalMergeTests(unittest.TestCase):
         seal["artifacts"] = api._regular_file_inventory(root, excluded={"final-success.json"})
         evaluation_api.atomic_write_json(seal_path, seal)
 
+    def _require_committed(self, root, *, base_model_dir=None, **kwargs):
+        authenticated_base = self.base_dir if base_model_dir is None else base_model_dir
+        with mock.patch.object(api, "load_base_llm", side_effect=lambda _: copy.deepcopy(self.fresh_base)):
+            return api.require_committed_final(root, authenticated_base, **kwargs)
+
     def test_merged_checkpoint_has_original_keys_only(self):
         manifest = self._export()
 
@@ -400,7 +405,7 @@ class FinalMergeTests(unittest.TestCase):
         actual = tensors["merged_logits"]
         difference = (expected - actual).abs()
         denominator = expected.abs().clamp_min(torch.finfo(torch.float32).eps)
-        tolerance = 0.02 + 0.02 * expected.abs()
+        tolerance = 0.02 + 0.02 * actual.abs()
         self.assertEqual(evidence["max_abs_error"], float(difference.max().item()))
         self.assertEqual(evidence["max_relative_error"], float((difference / denominator).max().item()))
         self.assertEqual(evidence["max_tolerance_ratio"], float((difference / tolerance).max().item()))
@@ -414,7 +419,7 @@ class FinalMergeTests(unittest.TestCase):
         self._reseal_final(root)
 
         with self.assertRaisesRegex(ValueError, "tolerance"):
-            api.require_committed_final(root, expected_mode="test")
+            self._require_committed(root, expected_mode="test")
 
     def test_resealed_independent_logit_claim_mutations_are_rejected(self):
         manifest = self._export()
@@ -447,7 +452,39 @@ class FinalMergeTests(unittest.TestCase):
                 evaluation_api.atomic_write_json(manifest.path, payload)
                 self._reseal_final(root)
                 with self.assertRaisesRegex(ValueError, "logit verification"):
-                    api.require_committed_final(root, expected_mode="test")
+                    self._require_committed(root, expected_mode="test")
+
+    def test_resealed_self_consistent_logit_tensor_replacements_are_rejected(self):
+        manifest = self._export()
+        root = manifest.path.parent
+        manifest_bytes = manifest.path.read_bytes()
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+        tensor_path = root / payload["logit_verification"]["evidence"]
+
+        for name, shape in (("identical-zeros", (1, 3, 8)), ("wrong-width", (1, 3, 1))):
+            with self.subTest(name=name):
+                manifest.path.write_bytes(manifest_bytes)
+                expected = torch.zeros(shape, dtype=torch.float32)
+                actual = torch.zeros(shape, dtype=torch.float32)
+                save_safetensors({
+                    "token_ids": torch.zeros((1, 3), dtype=torch.int64),
+                    "adapter_active_logits": expected,
+                    "merged_logits": actual,
+                }, str(tensor_path))
+                changed = json.loads(manifest_bytes.decode("utf-8"))
+                evidence = changed["logit_verification"]
+                evidence.update({
+                    "evidence_sha256": sha256_file(tensor_path),
+                    "max_abs_error": 0.0,
+                    "max_relative_error": 0.0,
+                    "max_tolerance_ratio": 0.0,
+                    "finite": True,
+                    "pass": True,
+                })
+                evaluation_api.atomic_write_json(manifest.path, changed)
+                self._reseal_final(root)
+                with self.assertRaisesRegex(ValueError, "model computation"):
+                    self._require_committed(root, expected_mode="test")
 
     def test_resealed_logit_tensor_corruption_and_substitution_are_rejected(self):
         manifest = self._export()
@@ -474,7 +511,7 @@ class FinalMergeTests(unittest.TestCase):
                 evaluation_api.atomic_write_json(manifest.path, changed)
                 self._reseal_final(root)
                 with self.assertRaisesRegex(ValueError, "logit verification"):
-                    api.require_committed_final(root, expected_mode="test")
+                    self._require_committed(root, expected_mode="test")
 
     def test_logit_drift_aborts_without_publishing_output(self):
         original = api._fixed_probe_logits
@@ -491,6 +528,63 @@ class FinalMergeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "logits"):
                 self._export_changed(request)
         self.assertFalse(request.output_dir.exists())
+
+    def test_logit_tolerance_ratio_uses_actual_denominator_at_boundary(self):
+        def logits_for(delta):
+            calls = 0
+
+            def fixed(_model):
+                nonlocal calls
+                calls += 1
+                value = 0.0 if calls % 2 else delta
+                return torch.full((1, 3, 8), value, dtype=torch.float32)
+
+            return fixed
+
+        passing = replace(self.export_request, output_dir=self.root / "boundary-pass")
+        with mock.patch.object(api, "_fixed_probe_logits", side_effect=logits_for(0.0202)):
+            result = self._export_changed(passing)
+        evidence = json.loads(result.path.read_text(encoding="utf-8"))["logit_verification"]
+        self.assertTrue(evidence["pass"])
+        self.assertLess(evidence["max_tolerance_ratio"], 1.0)
+
+        failing = replace(self.export_request, output_dir=self.root / "boundary-fail")
+        with mock.patch.object(api, "_fixed_probe_logits", side_effect=logits_for(0.0205)):
+            with self.assertRaisesRegex(RuntimeError, "logits"):
+                self._export_changed(failing)
+        self.assertFalse(failing.output_dir.exists())
+
+    def test_prepublication_model_recomputation_failure_leaves_no_final(self):
+        original = api._compute_fixed_probe_tensors
+        calls = 0
+
+        def changed(*args):
+            nonlocal calls
+            calls += 1
+            token_ids, expected, actual = original(*args)
+            if calls == 2:
+                actual = actual + 0.5
+            return token_ids, expected, actual
+
+        request = replace(self.export_request, output_dir=self.root / "prevalidation-fail")
+        with mock.patch.object(api, "_compute_fixed_probe_tensors", side_effect=changed):
+            with self.assertRaisesRegex(ValueError, "model computation"):
+                self._export_changed(request)
+        self.assertFalse(request.output_dir.exists())
+
+    def test_committed_final_requires_authenticated_base_directory(self):
+        manifest = self._export()
+
+        with self.assertRaises(TypeError):
+            api.require_committed_final(manifest.path.parent, expected_mode="test")
+
+        wrong_base = self.root / "wrong-base"
+        wrong_base.mkdir()
+        for source in self.base_dir.iterdir():
+            (wrong_base / source.name).write_bytes(source.read_bytes())
+        (wrong_base / "flow.pt").write_bytes(b"different-flow")
+        with self.assertRaisesRegex(ValueError, "base asset"):
+            self._require_committed(manifest.path.parent, base_model_dir=wrong_base, expected_mode="test")
 
     def test_adapter_directory_must_be_exact_regular_inventory(self):
         cases = ("extra", "symlink")
@@ -533,9 +627,9 @@ class FinalMergeTests(unittest.TestCase):
         after = {path.relative_to(second.path.parent): path.read_bytes() for path in second.path.parent.rglob("*") if path.is_file()}
         self.assertEqual(first, second)
         self.assertEqual(before, after)
-        self.assertEqual(api.require_committed_final(first.path.parent, expected_mode="test"), first)
+        self.assertEqual(self._require_committed(first.path.parent, expected_mode="test"), first)
         with self.assertRaisesRegex(ValueError, "mode"):
-            api.require_committed_final(first.path.parent, expected_mode="production")
+            self._require_committed(first.path.parent, expected_mode="production")
 
     def test_committed_final_rejects_manifest_seal_wav_adapter_and_extra_corruption(self):
         def corrupt_seal(root):
@@ -559,7 +653,7 @@ class FinalMergeTests(unittest.TestCase):
                 manifest = self._export_changed(request)
                 mutate(manifest.path.parent)
                 with self.assertRaises(ValueError):
-                    api.require_committed_final(manifest.path.parent, expected_mode="test")
+                    self._require_committed(manifest.path.parent, expected_mode="test")
                 with self.assertRaises((ValueError, FileExistsError)):
                     self._export_changed(request)
 
@@ -580,7 +674,7 @@ class FinalMergeTests(unittest.TestCase):
         evaluation_api.atomic_write_json(seal_path, seal)
 
         with self.assertRaisesRegex(ValueError, "ASR"):
-            api.require_committed_final(root, expected_mode="test")
+            self._require_committed(root, expected_mode="test")
 
     def test_strict_report_uses_safe_relative_audio_paths(self):
         manifest = self._export()
@@ -606,7 +700,7 @@ class FinalMergeTests(unittest.TestCase):
                 self.assertFalse(output.exists())
                 self.assertEqual(list(output.parent.glob(f".{output.name}.*")), [])
                 recovered = self._export_changed(replace(self.export_request, output_dir=output))
-                self.assertEqual(api.require_committed_final(output, expected_mode="test"), recovered)
+                self.assertEqual(self._require_committed(output, expected_mode="test"), recovered)
 
     def test_post_rename_failure_recovers_idempotently(self):
         request = replace(self.export_request, output_dir=self.root / "post-rename")
@@ -622,7 +716,7 @@ class FinalMergeTests(unittest.TestCase):
                 self._export_changed(request)
         self.assertTrue(request.output_dir.is_dir())
         recovered = self._export_changed(request)
-        self.assertEqual(recovered, api.require_committed_final(request.output_dir, expected_mode="test"))
+        self.assertEqual(recovered, self._require_committed(request.output_dir, expected_mode="test"))
 
     def test_existing_final_with_different_prompt_lineage_is_refused(self):
         manifest = self._export()
@@ -632,7 +726,7 @@ class FinalMergeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "lineage"):
             self._export_changed(changed)
-        self.assertEqual(api.require_committed_final(manifest.path.parent, expected_mode="test"), manifest)
+        self.assertEqual(self._require_committed(manifest.path.parent, expected_mode="test"), manifest)
 
     def test_code_identity_is_structured_and_bound(self):
         identity = {"head": "abc123", "dirty": True, "diff_sha256": "d" * 64}
@@ -670,7 +764,8 @@ class FinalMergeTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self._export()
-        self.assertEqual(api.require_committed_final(manifest.path.parent, expected_mode="test"), manifest)
+        with self.assertRaisesRegex(ValueError, "current base asset"):
+            self._require_committed(manifest.path.parent, expected_mode="test")
 
     def test_base_asset_inventory_rejects_the_10001st_file(self):
         original = Path.rglob
@@ -722,9 +817,9 @@ class FinalMergeTests(unittest.TestCase):
             ):
                 manifest = api.export_final_llm(request)
 
-        self.assertEqual(api.require_committed_final(manifest.path.parent, expected_mode="production"), manifest)
+        self.assertEqual(self._require_committed(manifest.path.parent, expected_mode="production"), manifest)
         with self.assertRaisesRegex(ValueError, "mode"):
-            api.require_committed_final(manifest.path.parent, expected_mode="test")
+            self._require_committed(manifest.path.parent, expected_mode="test")
         voices, _ = evaluation_api.authenticated_prompt_inventory(request.validation_request.prompts)
         verify = api.VerifyRequest(
             base_model_dir=self.base_dir,
@@ -782,7 +877,7 @@ class FinalMergeTests(unittest.TestCase):
             "checkpoint": (mutate_phase, "checkpoint"),
             "model-state": (mutate_state, "model state"),
             "summary": (mutate_summary, "summary"),
-            "base": (mutate_base, "base checkpoint"),
+            "base": (mutate_base, "base asset"),
             "evaluation-wandb": (mutate_evaluation, "evaluation identity"),
             "artifacts-wandb": (mutate_artifacts, "artifact checksums"),
         }
@@ -800,7 +895,7 @@ class FinalMergeTests(unittest.TestCase):
                 evaluation_api.atomic_write_json(manifest.path, payload)
                 self._reseal_final(root)
                 with self.assertRaisesRegex(ValueError, message):
-                    api.require_committed_final(root, expected_mode="production")
+                    self._require_committed(root, expected_mode="production")
 
     def test_resealed_unexpected_final_file_is_rejected(self):
         manifest = self._export()
@@ -809,7 +904,7 @@ class FinalMergeTests(unittest.TestCase):
         self._reseal_final(root)
 
         with self.assertRaisesRegex(ValueError, "unexpected files"):
-            api.require_committed_final(root, expected_mode="test")
+            self._require_committed(root, expected_mode="test")
 
     def test_committed_production_rejects_resealed_wandb_context_schema_and_digests(self):
         _, manifest = self._export_production("wandb-context")
@@ -834,7 +929,7 @@ class FinalMergeTests(unittest.TestCase):
                 evaluation_api.atomic_write_json(manifest.path, payload)
                 self._reseal_final(root)
                 with self.assertRaisesRegex(ValueError, "context"):
-                    api.require_committed_final(root, expected_mode="production")
+                    self._require_committed(root, expected_mode="production")
 
     def test_production_report_rejects_resealed_fake_pipeline_identity(self):
         _, manifest = self._export_production("pipeline-identity")
@@ -849,7 +944,7 @@ class FinalMergeTests(unittest.TestCase):
         self._reseal_final(root)
 
         with self.assertRaisesRegex(ValueError, "exact CosyVoice3"):
-            api.require_committed_final(root, expected_mode="production")
+            self._require_committed(root, expected_mode="production")
 
     def test_production_recognizer_requalifies_current_cuda_sessions(self):
         request, manifest = self._export_production("recognizer-runtime")
