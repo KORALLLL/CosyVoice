@@ -52,6 +52,14 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "base/non-RL"):
             RunPaths.from_env({"BALALAIKA_BASE_MODEL_DIR": "/models/Fun-CosyVoice3-0.5B-2512_RL"})
 
+    def test_run_paths_rejects_checkpoint_nested_under_rl_model(self):
+        with self.assertRaisesRegex(ValueError, "base/non-RL"):
+            RunPaths.from_env({"BALALAIKA_BASE_MODEL_DIR": "/models/Fun-CosyVoice3_RL/checkpoint"})
+
+    def test_run_paths_allows_checkpoint_nested_under_non_rl_model(self):
+        paths = RunPaths.from_env({"BALALAIKA_BASE_MODEL_DIR": "/models/Fun-CosyVoice3/checkpoint"})
+        self.assertEqual(paths.base_model_dir, Path("/models/Fun-CosyVoice3/checkpoint"))
+
     def test_atomic_write_replaces_complete_json_document(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "manifest.json"

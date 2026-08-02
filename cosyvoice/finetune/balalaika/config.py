@@ -35,7 +35,7 @@ class RunPaths:
     def from_env(cls, env: Mapping[str, str] | None = None) -> "RunPaths":
         values = os.environ if env is None else env
         base_model_dir = Path(values.get("BALALAIKA_BASE_MODEL_DIR", str(DEFAULT_BASE_MODEL_DIR)))
-        if "_RL" in base_model_dir.name.upper():
+        if any("_RL" in component.upper() for component in base_model_dir.parts):
             raise ValueError("BALALAIKA_BASE_MODEL_DIR must select the base/non-RL checkpoint")
         return cls(
             dataset_root=Path(values.get("BALALAIKA_DATASET_ROOT", str(DEFAULT_DATASET_ROOT))),
