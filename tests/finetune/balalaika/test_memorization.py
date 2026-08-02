@@ -278,6 +278,16 @@ class MemorizationSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "seal"):
             require_memorization_gate(report.path)
 
+        def add_forbidden_head_descendant(value):
+            forbidden = "base_model.model.llm.model.lm_head.child"
+            for adapter in (value["adapter"], value["provenance"]["adapter"]):
+                audit = adapter["trainable_inventory"]
+                audit["target_modules"].append(forbidden)
+                audit["trainable_parameters"].extend((
+                    f"{forbidden}.lora_A.default.weight",
+                    f"{forbidden}.lora_B.default.weight",
+                ))
+
         mutations = {
             "check-index": lambda value: value["checks"][1].update(check_index=9),
             "optimizer-step": lambda value: value["checks"][1].update(optimizer_step=99),
@@ -292,6 +302,7 @@ class MemorizationSelectionTests(unittest.TestCase):
             "audit-schema": lambda value: value["provenance"]["adapter"].update(trainable_inventory={}),
             "audit-target": lambda value: value["provenance"]["adapter"]["trainable_inventory"]["target_modules"].append("llm.model.lm_head"),
             "audit-trainable": lambda value: value["provenance"]["adapter"]["trainable_inventory"].update(trainable_parameters=["speech_embedding.dense.weight"]),
+            "audit-lm-head-descendant-pair": add_forbidden_head_descendant,
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):

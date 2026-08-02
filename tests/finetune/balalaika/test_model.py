@@ -174,6 +174,39 @@ class ModelIntegrationTests(unittest.TestCase):
             )
         self.assertFalse(model.llm.model.lm_head.weight.requires_grad)
 
+    def test_active_module_discovery_excludes_internal_qwen_lm_head_descendants(self):
+        api = _model_api()
+        model = tiny_cosyvoice3_llm()
+        model.llm.model.lm_head.child = torch.nn.Linear(8, 8, bias=False)
+
+        audit = api.audit_trainable_parameters(api.inject_lora(model, api.LoraSettings()))
+
+        self.assertIn("llm_decoder", audit.target_modules)
+        self.assertFalse(
+            any(name.startswith("llm.model.lm_head.") for name in audit.target_modules),
+            audit.target_modules,
+        )
+
+    def test_trainable_audit_rejects_prefixed_internal_qwen_lm_head_descendant_pair(self):
+        api = _model_api()
+        audit = api.audit_trainable_parameters(api.inject_lora(tiny_cosyvoice3_llm(), api.LoraSettings()))
+        payload = {
+            "target_modules": list(audit.target_modules),
+            "trainable_parameters": list(audit.trainable_parameters),
+            "unexpected_dense_parameters": [],
+            "trainable_parameter_count": audit.trainable_parameter_count,
+            "total_parameter_count": audit.total_parameter_count,
+        }
+        forbidden = "base_model.model.llm.model.lm_head.child"
+        payload["target_modules"].append(forbidden)
+        payload["trainable_parameters"].extend((
+            f"{forbidden}.lora_A.default.weight",
+            f"{forbidden}.lora_B.default.weight",
+        ))
+
+        with self.assertRaisesRegex(ValueError, "lm_head"):
+            api.validate_trainable_audit_payload(payload)
+
     def test_lora_initialization_is_an_exact_no_op(self):
         api = _model_api()
         model = tiny_cosyvoice3_llm().eval()
@@ -363,6 +396,19 @@ class ModelIntegrationTests(unittest.TestCase):
 
             with mock.patch.object(api, "load_base_llm", return_value=fresh_base):
                 with self.assertRaisesRegex(ValueError, "target inventory"):
+                    api.merge_adapter(base_dir, adapter_dir, root / "merged.pt")
+
+    def test_merge_rejects_internal_qwen_lm_head_descendant_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            api, base_dir, adapter_dir, fresh_base = _saved_adapter_fixture(root)
+            manifest_path = adapter_dir / "adapter_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["target_modules"].append("base_model.model.llm.model.lm_head.child")
+            manifest_path.write_text(json.dumps(manifest))
+
+            with mock.patch.object(api, "load_base_llm", return_value=fresh_base):
+                with self.assertRaisesRegex(ValueError, "lm_head"):
                     api.merge_adapter(base_dir, adapter_dir, root / "merged.pt")
 
     def test_load_base_llm_loads_only_cosyvoice3_llm(self):

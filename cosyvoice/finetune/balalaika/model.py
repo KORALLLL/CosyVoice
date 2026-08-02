@@ -21,6 +21,7 @@ ADAPTER_NAME = "default"
 ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 ADAPTER_MANIFEST_NAME = "adapter_manifest.json"
 APPROVED_BASE_MODEL_NAME = "Fun-CosyVoice3-0.5B-2512"
+_INTERNAL_QWEN_LM_HEAD_PARTS = ("llm", "model", "lm_head")
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,17 @@ class MergeReport:
 AdapterModel: TypeAlias = CosyVoice3LM
 
 
+def _is_internal_qwen_lm_head_path(name: str) -> bool:
+    """Return whether a module/tensor path is inside Qwen's internal LM head."""
+
+    parts = tuple(name.split("."))
+    width = len(_INTERNAL_QWEN_LM_HEAD_PARTS)
+    return any(
+        parts[index:index + width] == _INTERNAL_QWEN_LM_HEAD_PARTS
+        for index in range(len(parts) - width + 1)
+    )
+
+
 def load_base_llm(model_dir: Path) -> CosyVoice3LM:
     """Load only the frozen base/non-RL CosyVoice3 language model."""
 
@@ -123,7 +135,7 @@ def _discover_active_modules(model: CosyVoice3LM) -> tuple[str, ...]:
         if not name or any(name.startswith(f"{wrapper}.") for wrapper in wrapper_names):
             continue
         base_module = module.get_base_layer() if isinstance(module, BaseTunerLayer) else module
-        if isinstance(base_module, (nn.Linear, nn.Embedding)) and not name.endswith("llm.model.lm_head"):
+        if isinstance(base_module, (nn.Linear, nn.Embedding)) and not _is_internal_qwen_lm_head_path(name):
             targets.append(name)
     targets = tuple(targets)
     modules = dict(model.named_modules())
@@ -135,7 +147,7 @@ def _discover_active_modules(model: CosyVoice3LM) -> tuple[str, ...]:
         missing.append("Qwen input embeddings")
     if missing:
         raise ValueError(f"missing required active LoRA targets: {', '.join(missing)}")
-    if any(name.endswith("llm.model.lm_head") for name in targets):
+    if any(_is_internal_qwen_lm_head_path(name) for name in targets):
         raise RuntimeError("internal Qwen lm_head must not be an adapter target")
     return targets
 
@@ -181,7 +193,7 @@ def audit_trainable_parameters(model: nn.Module) -> TrainableAudit:
     )
     if ambiguous:
         raise RuntimeError(f"LoRA target inventory contains ambiguous nested mappings: {ambiguous}")
-    if any(name.endswith("llm.model.lm_head") for name in inventory):
+    if any(_is_internal_qwen_lm_head_path(name) for name in inventory):
         raise RuntimeError("internal Qwen lm_head is forbidden in the LoRA target inventory")
 
     discovered = _discover_active_modules(model)
@@ -193,7 +205,7 @@ def audit_trainable_parameters(model: nn.Module) -> TrainableAudit:
         for name, module in model.named_modules()
         if name and isinstance(module, BaseTunerLayer)
     }
-    forbidden_heads = tuple(name for name in wrappers if name.endswith("llm.model.lm_head"))
+    forbidden_heads = tuple(name for name in wrappers if _is_internal_qwen_lm_head_path(name))
     if forbidden_heads:
         raise RuntimeError(f"internal Qwen lm_head has a forbidden LoRA wrapper: {forbidden_heads}")
     missing_wrappers = tuple(name for name in inventory if name not in wrappers)
@@ -218,6 +230,8 @@ def audit_trainable_parameters(model: nn.Module) -> TrainableAudit:
 
     trainable = tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
     for name in trainable:
+        if _is_internal_qwen_lm_head_path(name):
+            raise RuntimeError(f"internal Qwen lm_head has a forbidden trainable parameter: {name}")
         matches = tuple(target for target in inventory if name.startswith(f"{target}."))
         if "lora_" not in name:
             raise RuntimeError(f"dense trainable parameter is forbidden: {name}")
@@ -267,9 +281,13 @@ def validate_trainable_audit_payload(payload: Mapping[str, object]) -> None:
     ):
         raise ValueError("trainable audit counts or dense inventory are invalid")
     required_targets = {"speech_embedding", "llm_decoder", "llm.model.model.embed_tokens"}
-    if not required_targets.issubset(targets) or any(name.endswith("llm.model.lm_head") for name in targets):
+    if any(_is_internal_qwen_lm_head_path(name) for name in targets):
+        raise ValueError("trainable audit target inventory contains the internal Qwen lm_head subtree")
+    if not required_targets.issubset(targets):
         raise ValueError("trainable audit target coverage is invalid")
     for name in trainable:
+        if _is_internal_qwen_lm_head_path(name):
+            raise ValueError("trainable audit contains an internal Qwen lm_head tensor")
         matches = tuple(target for target in targets if name.startswith(f"{target}."))
         if len(matches) != 1:
             raise ValueError("trainable LoRA tensor does not map to exactly one approved target")
@@ -452,6 +470,8 @@ def _read_adapter_manifest(path: Path) -> dict[str, object]:
         raise ValueError("adapter manifest weights path must be a file name")
     if not isinstance(value["target_modules"], list) or not all(isinstance(item, str) for item in value["target_modules"]):
         raise ValueError("adapter target inventory is invalid")
+    if any(_is_internal_qwen_lm_head_path(item) for item in value["target_modules"]):
+        raise ValueError("adapter target inventory contains the internal Qwen lm_head subtree")
     if not isinstance(value["settings"], dict):
         raise ValueError("adapter settings are invalid")
     return value
