@@ -24,7 +24,9 @@ SPLIT_PLAN_SCHEMA_VERSION = "rover-punctuation-stress-v1"
 INSTRUCT = "You are a helpful assistant.<|endofprompt|>"
 EXPECTED_SOURCE_TARS = 519
 EXPECTED_SOURCE_ROWS = 4_075_032
-EXPECTED_NULL_ROWS = 309
+EXPECTED_NULL_ROWS = 141
+EXPECTED_EMPTY_TEXT_ROWS = 168
+EXPECTED_OVER_LIMIT_ROWS = 26_729
 PROMPT_RESERVATION_COUNT = 20
 MAX_ROWS_PER_SHARD = 8_000
 TEXT_TOKEN_MAX_LENGTH = 200
@@ -180,13 +182,24 @@ def build_split_plan(
 
     plan_dir = paths.run_root / "split_plan"
     plan_dir.mkdir(parents=True, exist_ok=True)
-    counts, shard_sha256, selected_scores = _write_split_rows(
+    counts, shard_sha256, selected_scores, text_exclusions = _write_split_rows(
         inventory, plan_dir, set(selected_ids), seed, count_text_tokens
     )
     if counts.null != EXPECTED_NULL_ROWS:
         raise SourceIntegrityError(f"expected exactly {EXPECTED_NULL_ROWS} null agreement rows, got {counts.null}")
     if counts.reserved != PROMPT_RESERVATION_COUNT:
         raise SourceIntegrityError(f"expected exactly {PROMPT_RESERVATION_COUNT} reserved rows, got {counts.reserved}")
+    empty_text_rows = text_exclusions["text_token_length=0"]
+    if empty_text_rows != EXPECTED_EMPTY_TEXT_ROWS:
+        raise SourceIntegrityError(f"expected exactly {EXPECTED_EMPTY_TEXT_ROWS} empty-text rows, got {empty_text_rows}")
+    over_limit_key = f"text_token_length>{TEXT_TOKEN_MAX_LENGTH}"
+    over_limit_rows = text_exclusions[over_limit_key]
+    if over_limit_rows != EXPECTED_OVER_LIMIT_ROWS:
+        raise SourceIntegrityError(
+            f"expected exactly {EXPECTED_OVER_LIMIT_ROWS} over-limit text rows, got {over_limit_rows}"
+        )
+    if counts.model_limit_exclusions != sum(text_exclusions.values()):
+        raise SourceIntegrityError("model-limit exclusion count does not reconcile to the audited text-exclusion reasons")
     if counts.total != EXPECTED_SOURCE_ROWS:
         raise SourceIntegrityError(f"split total must equal {EXPECTED_SOURCE_ROWS}, got {counts.total}")
     if counts.phase1 + counts.phase2 + counts.null + counts.reserved + counts.model_limit_exclusions != EXPECTED_SOURCE_ROWS:
@@ -207,6 +220,7 @@ def build_split_plan(
             "null": counts.null,
             "reserved": counts.reserved,
             "model_limit_exclusions": counts.model_limit_exclusions,
+            "text_exclusions": text_exclusions,
             "total": counts.total,
             "source_inventory": {
                 "source_archives": dict(inventory.source_archive_sha256),
@@ -255,10 +269,14 @@ def _write_split_rows(
     reserved_ids: set[str],
     seed: int,
     count_text_tokens: Callable[[str], int],
-) -> tuple[SplitCounts, dict[str, str], dict[str, str]]:
+) -> tuple[SplitCounts, dict[str, str], dict[str, str], dict[str, int]]:
     counts = SplitCounts(0, 0, 0, 0, 0, 0, plan_dir, "")
     shard_sha256: dict[str, str] = {}
     scores: dict[str, str] = {}
+    text_exclusions = {
+        "text_token_length=0": 0,
+        f"text_token_length>{TEXT_TOKEN_MAX_LENGTH}": 0,
+    }
     current_shard: int | None = None
     handle: TextIO | None = None
     partial: Path | None = None
@@ -290,6 +308,10 @@ def _write_split_rows(
             assigned = assign_phases([row], reserved_ids)[0]
             assigned = replace(assigned, reservation_score=score)
             if is_model_excluded:
+                reason = assigned.model_limit_exclusion
+                if reason not in text_exclusions:
+                    raise SourceIntegrityError(f"unexpected model-limit exclusion reason: {reason}")
+                text_exclusions[reason] += 1
                 assigned = replace(assigned, phase=None, reserved=False, reservation_score=None)
                 counts = replace(counts, model_limit_exclusions=counts.model_limit_exclusions + 1)
             elif assigned.reserved:
@@ -311,7 +333,7 @@ def _write_split_rows(
         if partial is not None and partial.exists():
             partial.unlink()
         raise
-    return counts, shard_sha256, scores
+    return counts, shard_sha256, scores, text_exclusions
 
 
 def _iter_joined_rows(inventory: SourceInventory, audit: _JoinAudit) -> Iterator[JoinedRow]:

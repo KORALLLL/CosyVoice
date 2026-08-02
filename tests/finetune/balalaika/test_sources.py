@@ -128,6 +128,8 @@ class SourceTests(unittest.TestCase):
                 ),
                 patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
                 patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 1),
+                patch("cosyvoice.finetune.balalaika.sources.EXPECTED_EMPTY_TEXT_ROWS", 0),
+                patch("cosyvoice.finetune.balalaika.sources.EXPECTED_OVER_LIMIT_ROWS", 0),
                 patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
             ):
                 counts = build_split_plan(
@@ -210,6 +212,8 @@ class SourceTests(unittest.TestCase):
             with (
                 patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
                 patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 1),
+                patch("cosyvoice.finetune.balalaika.sources.EXPECTED_EMPTY_TEXT_ROWS", 0),
+                patch("cosyvoice.finetune.balalaika.sources.EXPECTED_OVER_LIMIT_ROWS", 0),
                 patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
             ):
                 counts = build_split_plan(self.paths, _count_text_tokens=lambda text: 1)
@@ -243,6 +247,8 @@ class SourceTests(unittest.TestCase):
             patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/reverse-rover.tar.zst"),
             patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 2),
             patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_EMPTY_TEXT_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_OVER_LIMIT_ROWS", 0),
             patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
         ):
             counts = build_split_plan(self.paths, _count_text_tokens=lambda text: 1)
@@ -263,6 +269,7 @@ class SourceTests(unittest.TestCase):
         counts = self._build_fixture_plan(
             expected_nulls=0,
             reserve_count=1,
+            expected_over_limit=1,
             count_tokens=lambda text: 201 if text == "Слишком длинный текст" else 1,
         )
 
@@ -271,6 +278,8 @@ class SourceTests(unittest.TestCase):
         self.assertFalse(rows["000000/c.mp3"].reserved)
         self.assertEqual(rows["000000/c.mp3"].model_limit_exclusion, "text_token_length>200")
         self.assertEqual(rows["000000/c.mp3"].text_token_count, 201)
+        manifest = json.loads((counts.plan_dir / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["text_exclusions"], {"text_token_length=0": 0, "text_token_length>200": 1})
 
     def test_empty_canonical_text_is_audited_and_excluded_from_training(self) -> None:
         combined = self._combined_path()
@@ -281,7 +290,7 @@ class SourceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        counts = self._build_fixture_plan(expected_nulls=1, count_tokens=lambda text: len(text))
+        counts = self._build_fixture_plan(expected_nulls=1, expected_empty=1, count_tokens=lambda text: len(text))
 
         self.assertEqual(
             (counts.phase1, counts.phase2, counts.null, counts.model_limit_exclusions),
@@ -307,11 +316,21 @@ class SourceTests(unittest.TestCase):
     def _rover_path(self) -> Path:
         return self.dataset_root / "punctuation_artifacts/20260729T135419Z/rover.jsonl"
 
-    def _build_fixture_plan(self, *, expected_nulls: int = 1, reserve_count: int = 0, count_tokens=None):
+    def _build_fixture_plan(
+        self,
+        *,
+        expected_nulls: int = 1,
+        expected_empty: int = 0,
+        expected_over_limit: int = 0,
+        reserve_count: int = 0,
+        count_tokens=None,
+    ):
         with (
             patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/rover.jsonl"),
             patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
             patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", expected_nulls),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_EMPTY_TEXT_ROWS", expected_empty),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_OVER_LIMIT_ROWS", expected_over_limit),
             patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", reserve_count),
         ):
             return build_split_plan(self.paths, seed=1986, _count_text_tokens=count_tokens or (lambda text: 1))

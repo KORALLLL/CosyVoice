@@ -86,7 +86,9 @@ versions unless the operator starts a new qualified run root.
 - Agreement source:
   `punctuation_artifacts/20260729T135419Z/balalaika-rover-results-20260729T135419Z.tar.zst`.
 - Agreement field: `asr_agreement_mean`.
-- The 309 rows with null agreement are excluded and counted explicitly.
+- The 141 true null-agreement rows are excluded and counted explicitly.
+- The 168 empty transcripts and 26,729 transcripts above the 200-token model
+  limit are separately excluded and counted explicitly.
 
 ### Validation corpus
 

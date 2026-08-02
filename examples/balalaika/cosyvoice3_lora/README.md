@@ -31,11 +31,12 @@ training can begin.
 | ASR | `onnx-asr` GigaAM v3 RNN-T (`onnx_asr.load_model("gigaam-v3-rnnt")`) |
 | Metrics | micro `utt-cer`, `utt-wer`, `num-cer`, `num-wer` in W&B |
 
-Rows with null agreement are excluded. Agreement `0.95` belongs to phase 2.
-The verified combined release contains 168 explicitly classified missing-text
-rows; these remain in the split audit with `text_token_length=0` and are
-excluded from training and prompt reservation. Texts above the model's 200-token
-limit are excluded through the same audited mechanism.
+The canonical reconciliation accounts for every one of the 4,075,032 source
+rows: 2,469,768 phase-1 rows, 1,578,206 phase-2 rows, 20 reserved prompt clips,
+141 true null-agreement rows, 168 empty transcripts, and 26,729 transcripts
+above the model's 200-token limit. Empty and over-limit transcripts remain in
+the split audit but are excluded from training and prompt reservation. Agreement
+`0.95` belongs to phase 2.
 Stress marks and the already normalized sidecar text are preserved; this recipe
 does not substitute raw transcripts.
 

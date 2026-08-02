@@ -1,5 +1,21 @@
 # Implementation Notes
 
+## 2026-08-02 - Separate null agreement from text exclusions
+
+- The completed 4,075,032-row production join showed that the earlier expected
+  count of 309 conflated 141 true null-agreement rows with 168 verified empty
+  transcripts. The two conditions are now independent hard invariants.
+- The authoritative CosyVoice3 tokenizer scan also identified exactly 26,729
+  non-empty transcripts above the 200-token model limit. The split manifest now
+  publishes both text-exclusion reason counts and reconciles their sum against
+  `model_limit_exclusions`.
+- Observed post-exclusion/reservation counts are 2,469,768 phase-1 rows,
+  1,578,206 phase-2 rows, 20 reserved prompts, 141 null agreements, 168 empty
+  transcripts, and 26,729 over-limit transcripts. They sum exactly to the
+  canonical source total.
+- The failed qualification stopped before manifest publication; no pilot,
+  approval, memorization, cache, validation, or training artifact was created.
+
 ## 2026-08-02 - Audit verified missing-text rows as zero-token exclusions
 
 - The combined-sidecar producer metadata marks the release complete and
