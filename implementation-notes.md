@@ -28,3 +28,11 @@
 - Decision: Validate the temporary private-dataset Parquet and all 2,000 number spans before publishing either final artifact.
 - Validation: All Balalaika unit tests pass 39/39; scoped re-review approved atomic cleanup, typed schema provenance, boundary spans, and environment-only authentication.
 - Follow-up: The real authenticated 2,000-row fetch remains deferred to qualification and must use a rotated environment token.
+
+## 2026-08-02 - Task 4 compact cache publication
+
+- Decision: Enforce exactly 20 unique reserved prompt identities globally while allowing each source shard to contain only its own subset.
+- Decision: Treat the shard manifest publication/fsync as the transaction commit point; pre-commit failures restore prior finals, while post-commit backup cleanup is best-effort and cannot roll back valid outputs.
+- Decision: Reject directory and other non-file tar members as unexpected input rather than silently skipping them.
+- Validation: Cache tests pass 11/11 and all Balalaika tests pass 50/50; scoped re-review approved prompt reconciliation and transactional recovery.
+- Follow-up: Real source decoding and cache generation remain gated behind tokenizer pilot approval and hardware qualification.
