@@ -98,3 +98,11 @@
 - Decision: Reject the entire internal Qwen `llm.model.lm_head` subtree across discovery, live/persisted audits, adapter manifests, merge, and memorization evidence while retaining the outer `llm_decoder` target.
 - Validation: Task 9/model tests pass 35/35 and all Balalaika tests pass 130/130; scoped re-review approved the sealed evidence and forbidden-subtree controls.
 - Follow-up: The real four-sample gate has not run; it remains mandatory after pilot approval and before any phase training.
+
+## 2026-08-02 - Task 10 hard-number evaluation
+
+- Decision: Bind every validation artifact and W&B commit to one immutable identity spanning checkpoint/model/adapter/base, benchmark semantics and number spans, all prompt text/audio checksums, ASR/provider/batch configuration, synthesis settings, code/config versions, and validation index.
+- Decision: Reuse a generated row only from a sealed exact-identity journal with a matching 24 kHz mono WAV checksum; orphan, duplicate, stale, or changed-identity audio regenerates.
+- Decision: W&B is a mandatory main-rank gate. Scalar and media components use remote commit markers written with their payloads and queried before retry; structured preflight/log outcomes are broadcast so all ranks proceed or fail together.
+- Validation: Evaluation tests pass 27/27, exact evaluation/metrics tests pass 35/35, and all Balalaika tests pass 157/157; scoped re-review approved identity, journal, artifact-resume, remote WAV, rank, and collective W&B controls.
+- Follow-up: Real eight-GPU synthesis, private benchmark access, GigaAM CUDA inference, and online W&B synchronization remain hardware qualification work.
