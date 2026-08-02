@@ -21,10 +21,13 @@ from .cache import (
     TOKEN_MAX,
     TOKEN_MIN,
     AudioInput,
+    CacheIntegrityError,
     CacheManifest,
     CacheShardRequest,
     CacheShardResult,
     TarAudioSample,
+    _load_mapping,
+    _verify_phase_metadata,
     build_cache_shard,
     iter_tar_audio,
     verify_cache,
@@ -230,9 +233,10 @@ def build_pilot(paths: RunPaths) -> PilotManifest:
         "qualification_manifest_sha256": qualification.manifest_sha256,
         "base_model": str(paths.base_model_dir),
         "base_model_tokenizer_sha256": sha256_file(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
-        "index": str(index),
+        "index": index.name,
         "index_sha256": sha256_file(index),
         "clips": records,
+        "artifacts": _pilot_artifacts(index, records),
     }
     record = StageStore(paths.stages_dir).publish("pilot", payload)
     manifest = PilotManifest(pilot_root, index, record.path, record.manifest_sha256, tuple(records))
@@ -250,6 +254,7 @@ def approve_pilot(paths: RunPaths, checksum: str) -> Path:
         raise PilotApprovalError("current pilot manifest is unavailable") from exc
     if checksum != pilot.manifest_sha256:
         raise PilotApprovalError("provided approval checksum does not match the current pilot manifest")
+    _verify_pilot_artifacts(paths, pilot.payload)
     approval = StageStore(paths.stages_dir).publish(
         "pilot_approval", {"pilot_manifest_sha256": pilot.manifest_sha256}
     )
@@ -259,7 +264,7 @@ def approve_pilot(paths: RunPaths, checksum: str) -> Path:
 def run_cache_workers(paths: RunPaths) -> CacheManifest:
     """Run approved cache work through exactly eight persistent spawned CUDA workers."""
 
-    _require_current_pilot_approval(paths)
+    require_pilot_approval(paths)
     _require_eight_devices(paths)
     inventory = inventory_sources(paths)
     cache_root = paths.run_root / "cache"
@@ -314,6 +319,8 @@ def run_cache_workers(paths: RunPaths) -> CacheManifest:
             result = CacheShardResult.from_dict(_mapping(message.get("result"), "cache worker result"))
             if result.shard not in remaining_shards:
                 raise TokenizerError(f"cache worker returned a duplicate or unleased shard: {result.shard}")
+            request = next(request for request in requests if request.shard == result.shard)
+            _validate_worker_result(request, result)
             remaining_shards.remove(result.shard)
         for worker in workers:
             worker.join()
@@ -326,7 +333,7 @@ def run_cache_workers(paths: RunPaths) -> CacheManifest:
         for worker in workers:
             worker.join()
         raise
-    return verify_cache(cache_root)
+    return _verify_requested_cache_set(cache_root, existing | {request.shard for request in requests})
 
 
 def _create_cuda_session(model_path: Path, local_rank: int) -> Any:
@@ -351,18 +358,21 @@ def _create_cuda_session(model_path: Path, local_rank: int) -> Any:
 
 def _require_cuda_provider(session: Any) -> None:
     providers = _session_providers(session)
-    if providers and providers != ["CUDAExecutionProvider"]:
+    if providers != ["CUDAExecutionProvider"]:
         raise TokenizerError(f"speech-tokenizer session did not bind CUDAExecutionProvider exclusively: {providers}")
 
 
 def _session_providers(session: Any) -> list[str]:
     getter = getattr(session, "get_providers", None)
     if not callable(getter):
-        return []
+        raise TokenizerError("cannot verify CUDA ONNX session provider identity")
     try:
-        return [str(provider) for provider in getter()]
+        providers = [str(provider) for provider in getter()]
     except Exception as exc:
         raise TokenizerError("cannot verify CUDA ONNX session providers") from exc
+    if not providers:
+        raise TokenizerError("CUDA ONNX session reports no execution providers")
+    return providers
 
 
 def _validate_audio(audio: AudioInput) -> None:
@@ -505,6 +515,24 @@ def _pilot_index(records: Sequence[Mapping[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _pilot_artifacts(index: Path, records: Sequence[Mapping[str, object]]) -> dict[str, str]:
+    """Return the complete, relative file-to-checksum inventory a reviewer heard."""
+
+    artifacts = {index.name: sha256_file(index)}
+    for record in records:
+        for name_key, checksum_key in (
+            ("original", "original_sha256"),
+            ("tokens", "tokens_sha256"),
+            ("reconstructed", "reconstructed_sha256"),
+        ):
+            name = record.get(name_key)
+            checksum = record.get(checksum_key)
+            if not isinstance(name, str) or not isinstance(checksum, str):
+                raise TokenizerError(f"pilot record is missing {name_key} checksum")
+            artifacts[name] = checksum
+    return artifacts
+
+
 def _atomic_write_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name: str | None = None
@@ -520,7 +548,9 @@ def _atomic_write_text(path: Path, value: str) -> None:
             os.unlink(temporary_name)
 
 
-def _require_current_pilot_approval(paths: RunPaths) -> None:
+def require_pilot_approval(paths: RunPaths) -> None:
+    """Require approval and rehash every listening artifact before cache work."""
+
     store = StageStore(paths.stages_dir)
     try:
         pilot = store.require("pilot")
@@ -529,6 +559,132 @@ def _require_current_pilot_approval(paths: RunPaths) -> None:
         raise PilotApprovalError("cache tokenization requires a current checksum-bound pilot approval") from exc
     if approval.payload.get("pilot_manifest_sha256") != pilot.manifest_sha256:
         raise PilotApprovalError("pilot approval does not match the current pilot manifest")
+    _verify_pilot_artifacts(paths, pilot.payload)
+
+
+def _require_current_pilot_approval(paths: RunPaths) -> None:
+    """Backward-compatible internal spelling for the checksum-bound approval gate."""
+
+    require_pilot_approval(paths)
+
+
+def _verify_pilot_artifacts(paths: RunPaths, payload: Mapping[str, object]) -> None:
+    """Fail closed unless every recorded listening artifact remains under pilot/ intact."""
+
+    root = (paths.run_root / "pilot").resolve()
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, Mapping) or not artifacts:
+        raise PilotApprovalError("pilot artifact inventory is missing or invalid")
+    checked: dict[str, str] = {}
+    for relative, expected in artifacts.items():
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise PilotApprovalError("pilot artifact inventory is invalid")
+        path = _pilot_artifact_path(root, relative)
+        if not path.is_file() or sha256_file(path) != expected:
+            raise PilotApprovalError(f"pilot artifact is missing or checksum-mismatched: {relative}")
+        checked[relative] = expected
+    index = payload.get("index")
+    index_sha256 = payload.get("index_sha256")
+    if not isinstance(index, str) or not isinstance(index_sha256, str) or checked.get(index) != index_sha256:
+        raise PilotApprovalError("pilot listening index is absent from the artifact inventory")
+    clips = payload.get("clips")
+    if not isinstance(clips, list) or not clips:
+        raise PilotApprovalError("pilot clips are missing from the artifact inventory")
+    for clip in clips:
+        if not isinstance(clip, Mapping):
+            raise PilotApprovalError("pilot clip record is invalid")
+        for name_key, checksum_key in (
+            ("original", "original_sha256"),
+            ("tokens", "tokens_sha256"),
+            ("reconstructed", "reconstructed_sha256"),
+        ):
+            name = clip.get(name_key)
+            expected = clip.get(checksum_key)
+            if not isinstance(name, str) or not isinstance(expected, str) or checked.get(name) != expected:
+                raise PilotApprovalError(f"pilot {name_key} is absent from the artifact inventory")
+
+
+def _pilot_artifact_path(root: Path, relative: str) -> Path:
+    path = Path(relative)
+    if path.is_absolute() or not relative or ".." in path.parts:
+        raise PilotApprovalError(f"pilot artifact path is unsafe: {relative!r}")
+    resolved = (root / path).resolve()
+    if root not in resolved.parents:
+        raise PilotApprovalError(f"pilot artifact path escapes pilot directory: {relative!r}")
+    return resolved
+
+
+def _validate_worker_result(request: CacheShardRequest, result: CacheShardResult) -> None:
+    """Check a worker's claim against its lease before considering that lease complete."""
+
+    if result.shard != request.shard:
+        raise TokenizerError(f"cache worker returned wrong shard: {result.shard} != {request.shard}")
+    expected_paths = {
+        "phase1": request.cache_root / "phase1" / f"shard_{request.shard:06d}.parquet",
+        "phase2": request.cache_root / "phase2" / f"shard_{request.shard:06d}.parquet",
+        "prompts": request.cache_root / "eval_prompts.parquet",
+        "manifest": request.cache_root / "shard_manifests" / f"shard_{request.shard:06d}.json",
+    }
+    for label, actual, expected in (
+        ("phase1", result.phase1_path, expected_paths["phase1"]),
+        ("phase2", result.phase2_path, expected_paths["phase2"]),
+        ("prompt", result.eval_prompts_path, expected_paths["prompts"]),
+        ("shard manifest", result.shard_manifest_path, expected_paths["manifest"]),
+    ):
+        if actual != expected:
+            raise TokenizerError(f"cache worker returned unexpected {label} path")
+    source_sha256 = request.expected_source_sha256 or sha256_file(request.source_tar)
+    plan_path = request.plan_dir / f"shard_{request.shard:06d}.jsonl"
+    plan_sha256 = request.expected_plan_sha256 or sha256_file(plan_path)
+    if result.source_sha256 != source_sha256 or result.plan_sha256 != plan_sha256:
+        raise TokenizerError("cache worker result checksum identity does not match its lease")
+    _verify_published_shard(request, result, source_sha256, plan_path, plan_sha256)
+
+
+def _verify_published_shard(
+    request: CacheShardRequest,
+    result: CacheShardResult,
+    source_sha256: str,
+    plan_path: Path,
+    plan_sha256: str,
+) -> None:
+    if not result.shard_manifest_path.is_file():
+        raise TokenizerError("cache worker did not publish its shard manifest")
+    try:
+        manifest = _load_mapping(result.shard_manifest_path)
+        if manifest.get("shard") != request.shard:
+            raise TokenizerError("published shard manifest identity does not match its lease")
+        if manifest.get("source_tar") != str(request.source_tar) or manifest.get("source_sha256") != source_sha256:
+            raise TokenizerError("published shard manifest source identity does not match its lease")
+        if manifest.get("split_plan") != str(plan_path) or manifest.get("split_plan_sha256") != plan_sha256:
+            raise TokenizerError("published shard manifest plan identity does not match its lease")
+        phase = manifest.get("phase")
+        if not isinstance(phase, Mapping):
+            raise TokenizerError("published shard manifest phase metadata is invalid")
+        verified_rows: dict[int, int] = {}
+        for number, output_path in ((1, result.phase1_path), (2, result.phase2_path)):
+            metadata = phase.get(str(number))
+            if not isinstance(metadata, Mapping) or metadata.get("path") != str(output_path.relative_to(request.cache_root)):
+                raise TokenizerError("published shard manifest phase path does not match its lease")
+            verified_rows[number] = _verify_phase_metadata(request.cache_root, metadata, number)
+        if dict(result.phase_rows) != verified_rows:
+            raise TokenizerError("published shard manifest phase rows do not match worker result")
+        if not result.eval_prompts_path.is_file():
+            raise TokenizerError("cache worker did not publish eval prompt metadata")
+    except TokenizerError:
+        raise
+    except (CacheIntegrityError, OSError, ValueError, TypeError, KeyError) as exc:
+        raise TokenizerError("published cache shard verification failed") from exc
+
+
+def _verify_requested_cache_set(cache_root: Path, expected_shards: set[int]) -> CacheManifest:
+    manifest = verify_cache(cache_root)
+    if set(manifest.shards) != expected_shards:
+        raise TokenizerError(
+            f"verified cache shard set does not match requested shard set: "
+            f"{sorted(manifest.shards)} != {sorted(expected_shards)}"
+        )
+    return manifest
 
 
 def _cache_worker(device: int, model_path: str, work: Any, results: Any) -> None:
