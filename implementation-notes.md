@@ -90,3 +90,11 @@
 - Decision: `TrainRequest` accepts only the frozen, declarative `SchedulerSpec(kind="constant-v1")`; the trainer constructs the constant schedule internally from the exact phase learning rate and stores the spec verbatim in resume identity.
 - Validation: Task 8 tests pass 23/23, all Balalaika tests pass 116/116, and the real two-process CPU `train_phase` smoke passes with equal rank weights and boundary ordinals 1–8. Regression tests reject both the retired `scheduler_factory` keyword and callable `scheduler_spec` values.
 - Follow-up: Real eight-GPU BF16 qualification remains mandatory before production training.
+
+## 2026-08-02 - Task 9 memorization gate
+
+- Decision: Gate success requires exactly four deterministic phase-balanced rows to achieve per-sample real speech-token accuracy of 100% for three consecutive checks; waveform diagnostics never affect the decision.
+- Decision: Seal the success manifest with an external SHA-256 record and checksum every evidence file; the verifier independently validates step cadence, all row token hashes, complete run configuration, base/cache/tokenizer provenance, and the strict production LoRA audit.
+- Decision: Reject the entire internal Qwen `llm.model.lm_head` subtree across discovery, live/persisted audits, adapter manifests, merge, and memorization evidence while retaining the outer `llm_decoder` target.
+- Validation: Task 9/model tests pass 35/35 and all Balalaika tests pass 130/130; scoped re-review approved the sealed evidence and forbidden-subtree controls.
+- Follow-up: The real four-sample gate has not run; it remains mandatory after pilot approval and before any phase training.
