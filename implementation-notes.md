@@ -1,5 +1,18 @@
 # Implementation Notes
 
+## 2026-08-02 - Join descending ROVER members without materializing the corpus
+
+- The canonical ROVER tar stores JSONL members from shard 518 down to shard 0,
+  while the combined transcription JSONL is ordered from 0 up to 518. Their
+  metadata binds the same archive checksum and both report 4,075,032 rows; the
+  earlier streaming join incorrectly assumed both traversals were ascending.
+- The join now detects the ROVER traversal direction and uses `tac` to stream
+  the seekable combined sidecar in the matching direction. It still bounds the
+  in-memory join to one at-most-8,000-row shard and rejects duplicates,
+  non-monotonic traversal, missing keys, and extra keys.
+- A two-shard regression archive stores members in reverse order and proves the
+  ascending combined sidecar still reconciles exactly.
+
 ## 2026-08-02 - Reuse the prequalified source inventory
 
 - Production evidence showed preflight checksumming the immutable 373 GB source

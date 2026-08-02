@@ -221,6 +221,34 @@ class SourceTests(unittest.TestCase):
         with self.assertRaisesRegex(SourceIntegrityError, "missing asr_agreement_mean"):
             self._build_fixture_plan()
 
+    def test_rover_archive_reverse_member_order_joins_ascending_combined_sidecar(self) -> None:
+        combined_rows = [
+            {"schema_version": 1, "source_relative_path": "000000/a.mp3", "rover_punctuated_accented": "Первый"},
+            {"schema_version": 1, "source_relative_path": "000001/b.mp3", "rover_punctuated_accented": "Второй"},
+        ]
+        self._combined_path().write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in combined_rows),
+            encoding="utf-8",
+        )
+        rover = self._rover_path().with_name("reverse-rover.tar.zst")
+        self._write_zstd_tar_members(
+            rover,
+            [
+                ("results/train/shard_000001.jsonl", {"schema_version": 1, "source_relative_path": "000001/b.mp3", "asr_agreement_mean": 0.96}),
+                ("results/train/shard_000000.jsonl", {"schema_version": 1, "source_relative_path": "000000/a.mp3", "asr_agreement_mean": 0.90}),
+            ],
+        )
+
+        with (
+            patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/reverse-rover.tar.zst"),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 2),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
+        ):
+            counts = build_split_plan(self.paths, _count_text_tokens=lambda text: 1)
+
+        self.assertEqual((counts.phase1, counts.phase2, counts.total), (1, 1, 2))
+
     def test_over_limit_phase2_text_is_excluded_before_reservation(self) -> None:
         # A character-count proxy could reserve this row despite 201 real tokens.
         combined = self._combined_path()
@@ -274,6 +302,16 @@ class SourceTests(unittest.TestCase):
             info = tarfile.TarInfo("rover.jsonl")
             info.size = len(rover_jsonl)
             archive.addfile(info, io.BytesIO(rover_jsonl))
+        subprocess.run(["zstd", "-q", "-f", str(tar_path), "-o", str(destination)], check=True)
+
+    def _write_zstd_tar_members(self, destination: Path, rows: list[tuple[str, dict[str, object]]]) -> None:
+        tar_path = destination.with_suffix("")
+        with tarfile.open(tar_path, "w") as archive:
+            for name, row in rows:
+                payload = (json.dumps(row) + "\n").encode("utf-8")
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
         subprocess.run(["zstd", "-q", "-f", str(tar_path), "-o", str(destination)], check=True)
 
 

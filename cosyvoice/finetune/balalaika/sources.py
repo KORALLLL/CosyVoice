@@ -317,9 +317,17 @@ def _write_split_rows(
 def _iter_joined_rows(inventory: SourceInventory, audit: _JoinAudit) -> Iterator[JoinedRow]:
     rover_rows = iter(_iter_rover_rows(inventory.rover_archive))
     rover = next(rover_rows, None)
-    for shard, combined in _iter_combined_groups(inventory.combined_sidecar, audit):
-        if rover is not None and _shard_number(_source_relative_path(rover, inventory.rover_archive, 0)) < shard:
-            raise SourceIntegrityError("combined and ROVER join keys differ")
+    first_rover_shard = (
+        _shard_number(_source_relative_path(rover, inventory.rover_archive, 0))
+        if rover is not None
+        else 0
+    )
+    reverse = first_rover_shard > 0
+    for shard, combined in _iter_combined_groups(inventory.combined_sidecar, audit, reverse=reverse):
+        if rover is not None:
+            rover_shard = _shard_number(_source_relative_path(rover, inventory.rover_archive, 0))
+            if (reverse and rover_shard > shard) or (not reverse and rover_shard < shard):
+                raise SourceIntegrityError("combined and ROVER join keys differ")
         seen_rover: set[str] = set()
         while rover is not None and _shard_number(_source_relative_path(rover, inventory.rover_archive, 0)) == shard:
             audit.rover_rows += 1
@@ -340,17 +348,42 @@ def _iter_joined_rows(inventory: SourceInventory, audit: _JoinAudit) -> Iterator
         raise SourceIntegrityError("combined and ROVER join keys differ")
 
 
-def _iter_combined_groups(path: Path, audit: _JoinAudit) -> Iterator[tuple[int, dict[str, Mapping[str, object]]]]:
+def _iter_combined_groups(
+    path: Path,
+    audit: _JoinAudit,
+    *,
+    reverse: bool = False,
+) -> Iterator[tuple[int, dict[str, Mapping[str, object]]]]:
     current_shard: int | None = None
     rows: dict[str, Mapping[str, object]] = {}
-    with path.open(encoding="utf-8") as handle:
+    process: subprocess.Popen[str] | None = None
+    handle: TextIO | None = None
+    completed = False
+    try:
+        if reverse:
+            process = subprocess.Popen(
+                ["tac", "--", str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+            )
+            if process.stdout is None:
+                raise SourceIntegrityError("tac did not provide combined-sidecar stdout")
+            handle = process.stdout
+        else:
+            handle = path.open(encoding="utf-8")
         for number, line in enumerate(handle, start=1):
             row = _json_mapping(line, path, number)
             _combined_schema(row, path, number)
             source_relative_path = _source_relative_path(row, path, number)
             shard = _shard_number(source_relative_path)
-            if current_shard is not None and shard < current_shard:
-                raise SourceIntegrityError("combined sidecar shards are not in ascending order")
+            if current_shard is not None and (
+                (not reverse and shard < current_shard)
+                or (reverse and shard > current_shard)
+            ):
+                direction = "descending" if reverse else "ascending"
+                raise SourceIntegrityError(f"combined sidecar shards are not in {direction} order")
             if current_shard is not None and shard != current_shard:
                 yield current_shard, rows
                 rows = {}
@@ -361,8 +394,24 @@ def _iter_combined_groups(path: Path, audit: _JoinAudit) -> Iterator[tuple[int, 
             rows[source_relative_path] = row
             if len(rows) > MAX_ROWS_PER_SHARD:
                 raise SourceIntegrityError(f"combined shard {shard:06d} exceeds {MAX_ROWS_PER_SHARD} rows")
-    if current_shard is not None:
-        yield current_shard, rows
+        if current_shard is not None:
+            yield current_shard, rows
+        completed = True
+        if process is not None:
+            handle.close()
+            return_code = process.wait()
+            if return_code != 0:
+                raise SourceIntegrityError(f"tac failed while reading combined sidecar with exit code {return_code}")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SourceIntegrityError(f"cannot stream combined sidecar: {path}") from exc
+    finally:
+        if handle is not None and not handle.closed:
+            handle.close()
+        if process is not None and process.poll() is None:
+            process.terminate()
+            process.wait()
+        if process is not None and completed and process.returncode not in {0, None}:
+            raise SourceIntegrityError(f"tac failed while reading combined sidecar with exit code {process.returncode}")
 
 
 def _iter_rover_rows(path: Path) -> Iterator[Mapping[str, object]]:
