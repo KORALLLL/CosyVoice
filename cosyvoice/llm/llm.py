@@ -407,7 +407,7 @@ class Qwen2LM(TransformerLM):
         logits = self.llm_decoder(lm_output)
         loss = self.criterion_ce(logits, lm_target.to(device))
         acc = th_accuracy(logits.view(-1, self.llm_decoder.out_features), lm_target, ignore_label=IGNORE_ID)
-        target_mask = lm_target.ne(IGNORE_ID)
+        target_mask = lm_target.ge(0) & lm_target.lt(self.speech_token_size)
         correct_tokens_per_sample = (logits.argmax(dim=-1).eq(lm_target) & target_mask).sum(dim=1, dtype=torch.int64)
         target_tokens_per_sample = target_mask.sum(dim=1, dtype=torch.int64)
         return {

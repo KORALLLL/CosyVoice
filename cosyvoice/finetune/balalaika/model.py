@@ -20,6 +20,7 @@ from cosyvoice.llm.llm import CosyVoice3LM
 ADAPTER_NAME = "default"
 ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 ADAPTER_MANIFEST_NAME = "adapter_manifest.json"
+APPROVED_BASE_MODEL_NAME = "Fun-CosyVoice3-0.5B-2512"
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,8 @@ def load_base_llm(model_dir: Path) -> CosyVoice3LM:
     model_dir = Path(model_dir)
     if any("_RL" in component.upper() for component in model_dir.parts):
         raise ValueError("model_dir must select the base/non-RL CosyVoice3 checkpoint")
+    if model_dir.name != APPROVED_BASE_MODEL_NAME:
+        raise ValueError(f"model_dir must be the approved {APPROVED_BASE_MODEL_NAME} model root")
     config_path = model_dir / "cosyvoice3.yaml"
     checkpoint_path = model_dir / "llm.pt"
     if not config_path.is_file():
@@ -108,14 +111,21 @@ def load_base_llm(model_dir: Path) -> CosyVoice3LM:
 
 
 def _discover_active_modules(model: CosyVoice3LM) -> tuple[str, ...]:
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
     if not isinstance(model, CosyVoice3LM):
         raise TypeError("LoRA injection requires a CosyVoice3LM, not the full CosyVoice pipeline")
 
-    targets = tuple(
-        name
-        for name, module in model.named_modules()
-        if name and isinstance(module, (nn.Linear, nn.Embedding)) and not name.endswith("llm.model.lm_head")
-    )
+    named_modules = tuple(model.named_modules())
+    wrapper_names = tuple(name for name, module in named_modules if name and isinstance(module, BaseTunerLayer))
+    targets = []
+    for name, module in named_modules:
+        if not name or any(name.startswith(f"{wrapper}.") for wrapper in wrapper_names):
+            continue
+        base_module = module.get_base_layer() if isinstance(module, BaseTunerLayer) else module
+        if isinstance(base_module, (nn.Linear, nn.Embedding)) and not name.endswith("llm.model.lm_head"):
+            targets.append(name)
+    targets = tuple(targets)
     modules = dict(model.named_modules())
     embedding = model.llm.get_input_embeddings()
     embedding_names = tuple(name for name, module in modules.items() if module is embedding)
@@ -149,25 +159,107 @@ def inject_lora(model: CosyVoice3LM, settings: LoraSettings) -> AdapterModel:
     adapted = inject_adapter_in_model(config, model, adapter_name=ADAPTER_NAME)
     adapted._balalaika_target_modules = targets
     adapted._balalaika_lora_settings = settings
-    audit = audit_trainable_parameters(adapted)
-    if audit.unexpected_dense_parameters:
-        raise RuntimeError(f"unexpected dense trainables after LoRA injection: {audit.unexpected_dense_parameters}")
+    audit_trainable_parameters(adapted)
     return adapted
 
 
 def audit_trainable_parameters(model: nn.Module) -> TrainableAudit:
-    """Report adapter scope and reject any trainable dense/base parameter."""
+    """Independently enforce adapter coverage and the adapter-only trainable boundary."""
 
-    target_modules = tuple(getattr(model, "_balalaika_target_modules", ()))
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    inventory = getattr(model, "_balalaika_target_modules", None)
+    if not isinstance(inventory, tuple) or not inventory or not all(isinstance(name, str) and name for name in inventory):
+        raise RuntimeError("LoRA target inventory must be a nonempty tuple of module names")
+    if len(inventory) != len(set(inventory)):
+        raise RuntimeError("LoRA target inventory contains duplicate module names")
+    ambiguous = tuple(
+        (left, right)
+        for index, left in enumerate(inventory)
+        for right in inventory[index + 1:]
+        if left.startswith(f"{right}.") or right.startswith(f"{left}.")
+    )
+    if ambiguous:
+        raise RuntimeError(f"LoRA target inventory contains ambiguous nested mappings: {ambiguous}")
+    if any(name.endswith("llm.model.lm_head") for name in inventory):
+        raise RuntimeError("internal Qwen lm_head is forbidden in the LoRA target inventory")
+
+    discovered = _discover_active_modules(model)
+    if inventory != discovered:
+        raise RuntimeError(f"stored LoRA target inventory does not match active targets: stored={inventory}, active={discovered}")
+
+    wrappers = {
+        name: module
+        for name, module in model.named_modules()
+        if name and isinstance(module, BaseTunerLayer)
+    }
+    forbidden_heads = tuple(name for name in wrappers if name.endswith("llm.model.lm_head"))
+    if forbidden_heads:
+        raise RuntimeError(f"internal Qwen lm_head has a forbidden LoRA wrapper: {forbidden_heads}")
+    missing_wrappers = tuple(name for name in inventory if name not in wrappers)
+    extra_wrappers = tuple(name for name in wrappers if name not in inventory)
+    if missing_wrappers or extra_wrappers:
+        raise RuntimeError(
+            f"LoRA wrapper inventory mismatch: missing={missing_wrappers}, extra={extra_wrappers}"
+        )
+
+    approved_parameter_names: set[str] = set()
+    for target in inventory:
+        wrapper = wrappers[target]
+        adapter_parameters = _default_lora_parameters(wrapper)
+        if not adapter_parameters:
+            raise RuntimeError(f"required target {target} has no complete default LoRA parameter pair")
+        if ADAPTER_NAME not in wrapper.active_adapters:
+            raise RuntimeError(f"required target {target} does not have the default LoRA adapter active")
+        frozen = tuple(name for name, parameter in adapter_parameters if not parameter.requires_grad)
+        if frozen:
+            raise RuntimeError(f"required target {target} has no complete trainable LoRA parameter pair: {frozen}")
+        approved_parameter_names.update(f"{target}.{name}" for name, _ in adapter_parameters)
+
     trainable = tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
-    unexpected = tuple(name for name in trainable if "lora_" not in name)
+    for name in trainable:
+        matches = tuple(target for target in inventory if name.startswith(f"{target}."))
+        if "lora_" not in name:
+            raise RuntimeError(f"dense trainable parameter is forbidden: {name}")
+        if len(matches) != 1:
+            raise RuntimeError(f"trainable LoRA parameter does not map to exactly one approved target: {name}")
+        if name not in approved_parameter_names:
+            raise RuntimeError(f"trainable LoRA parameter is not part of the approved default adapter: {name}")
+
     return TrainableAudit(
-        target_modules=target_modules,
+        target_modules=inventory,
         trainable_parameters=trainable,
-        unexpected_dense_parameters=unexpected,
+        unexpected_dense_parameters=(),
         trainable_parameter_count=sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
         total_parameter_count=sum(parameter.numel() for parameter in model.parameters()),
     )
+
+
+def _default_lora_parameters(wrapper: nn.Module) -> tuple[tuple[str, nn.Parameter], ...]:
+    pairs = (
+        ("lora_A", "lora_B"),
+        ("lora_embedding_A", "lora_embedding_B"),
+    )
+    for left_name, right_name in pairs:
+        left = getattr(wrapper, left_name, {})
+        right = getattr(wrapper, right_name, {})
+        left_has_adapter = ADAPTER_NAME in left
+        right_has_adapter = ADAPTER_NAME in right
+        if left_has_adapter or right_has_adapter:
+            if not left_has_adapter or not right_has_adapter:
+                return ()
+            values = ((left_name, left[ADAPTER_NAME]), (right_name, right[ADAPTER_NAME]))
+            parameters: list[tuple[str, nn.Parameter]] = []
+            for collection_name, value in values:
+                if isinstance(value, nn.Parameter):
+                    parameters.append((f"{collection_name}.{ADAPTER_NAME}", value))
+                else:
+                    parameters.extend(
+                        (f"{collection_name}.{ADAPTER_NAME}.{name}", parameter)
+                        for name, parameter in value.named_parameters()
+                    )
+            return tuple(parameters)
+    return ()
 
 
 def save_adapter(model: nn.Module, path: Path) -> AdapterManifest:
@@ -177,10 +269,6 @@ def save_adapter(model: nn.Module, path: Path) -> AdapterManifest:
     from safetensors.torch import save_file
 
     audit = audit_trainable_parameters(model)
-    if not audit.target_modules:
-        raise ValueError("model has no injected Balalaika LoRA adapter")
-    if audit.unexpected_dense_parameters:
-        raise RuntimeError(f"refusing to save model with dense trainables: {audit.unexpected_dense_parameters}")
     base_checksum = getattr(model, "_balalaika_base_checkpoint_sha256", None)
     if not isinstance(base_checksum, str) or len(base_checksum) != 64:
         raise ValueError("model is not bound to a base llm.pt checksum")
@@ -294,6 +382,8 @@ def _read_adapter_manifest(path: Path) -> dict[str, object]:
     }
     if not isinstance(value, dict) or not required.issubset(value):
         raise ValueError(f"invalid adapter manifest: {path}")
+    if value.get("format_version") != 1:
+        raise ValueError(f"invalid adapter manifest format version: {path}")
     if not isinstance(value["weights"], str) or Path(value["weights"]).name != value["weights"]:
         raise ValueError("adapter manifest weights path must be a file name")
     if not isinstance(value["target_modules"], list) or not all(isinstance(item, str) for item in value["target_modules"]):
