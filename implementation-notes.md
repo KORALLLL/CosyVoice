@@ -52,3 +52,9 @@
 - Decision: Treat the LoRA audit as an enforcing gate that independently maps every trainable adapter tensor to one unique approved active target and rejects missing, frozen, forbidden, orphan, duplicate, ambiguous, or dense trainables.
 - Validation: Model tests pass 21/21, the required combined suite passes 23/23, and all Balalaika tests pass 83/83; scoped re-review approved statistics, audit, identity, and corrupted-adapter rejection.
 - Follow-up: Production HyperPyYAML loading and the actual 0.5B target inventory remain part of real hardware qualification.
+
+## 2026-08-02 - Task 7 cached batching
+
+- Decision: Random Parquet access uses bounded one-row batches within retained row-group offsets rather than materializing whole row groups.
+- Decision: Dynamic batch cost follows actual independent padding: `batch_size * (max_text_len + max_speech_len)`.
+- Validation: Data tests pass 10/10 and all Balalaika tests pass 93/93; scoped re-review approved bounded row access and complementary-length budget handling.
