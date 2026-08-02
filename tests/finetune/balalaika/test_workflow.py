@@ -18,6 +18,7 @@ from cosyvoice.finetune.balalaika.workflow import (
     ProductionBackend,
     WorkflowOptions,
     _collective_call,
+    _accelerator_scope,
     _stage_payload,
     main,
     redact_secrets,
@@ -162,6 +163,99 @@ def _args(root: Path, backend: FakeBackend, approval: str | None = None) -> argp
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_production_resume_reconstructs_only_prior_committed_validation_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = ProductionBackend.__new__(ProductionBackend)
+            backend._validation_logger = None
+            options = _args(root, FakeBackend()).options
+            checkpoint = root / "resume"
+            checkpoint.mkdir()
+            manifest = checkpoint / "checkpoint_manifest.json"
+            calls: list[int] = []
+
+            def committed(_options: WorkflowOptions, index: int) -> dict[str, object]:
+                calls.append(index)
+                return {"validation_index": index, "generations": 2_000}
+
+            backend._committed_validation_evidence = committed  # type: ignore[method-assign]
+            for status, current, expected in (
+                ("succeeded", 4, [1, 2, 3, 4]),
+                ("pending", 4, [1, 2, 3]),
+                ("succeeded", 16, list(range(1, 17))),
+            ):
+                with self.subTest(status=status, current=current):
+                    manifest.write_text(json.dumps({
+                        "validation_status": status,
+                        "progress": {"phase": 1, "validation_index": current},
+                    }), encoding="utf-8")
+                    resumed = backend._resume_validation_evidence(
+                        options,
+                        PhaseSpec.for_phase(1),
+                        tuple(range(1, 17)),
+                        checkpoint,
+                    )
+                    self.assertEqual([item["validation_index"] for item in resumed], expected)
+                    self.assertEqual(calls, expected)
+                    calls.clear()
+
+            for phase_number, current, indices in (
+                (1, 0, tuple(range(1, 17))),
+                (2, 16, tuple(range(17, 41))),
+            ):
+                with self.subTest(phase=phase_number, synthetic_base=current):
+                    manifest.write_text(json.dumps({
+                        "validation_status": "succeeded",
+                        "progress": {"phase": phase_number, "validation_index": current},
+                    }), encoding="utf-8")
+                    with self.assertRaisesRegex(StageRequirementError, "outside the phase schedule"):
+                        backend._resume_validation_evidence(
+                            options,
+                            PhaseSpec.for_phase(phase_number),
+                            indices,
+                            checkpoint,
+                        )
+                    self.assertEqual(calls, [])
+
+    def test_accelerator_scope_clears_prepared_and_new_checkpoint_state_on_success_and_error(self) -> None:
+        class Accelerator:
+            def __init__(self) -> None:
+                self._models = ["old-model"]
+                self._optimizers = ["old-optimizer"]
+                self._schedulers = ["old-scheduler"]
+                self._dataloaders = ["old-loader"]
+                self._custom_objects = [object()]
+                self.free_calls = 0
+
+            def free_memory(self) -> None:
+                self.free_calls += 1
+                self._models.clear()
+                self._optimizers.clear()
+                self._schedulers.clear()
+                self._dataloaders.clear()
+
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                accelerator = Accelerator()
+                try:
+                    with _accelerator_scope(accelerator):
+                        accelerator._models.append("new-model")
+                        accelerator._optimizers.append("new-optimizer")
+                        accelerator._schedulers.append("new-scheduler")
+                        accelerator._dataloaders.append("new-loader")
+                        accelerator._custom_objects.append(object())
+                        if fails:
+                            raise RuntimeError("training failed")
+                except RuntimeError:
+                    if not fails:
+                        raise
+                self.assertEqual(accelerator.free_calls, 2)
+                self.assertEqual(accelerator._models, [])
+                self.assertEqual(accelerator._optimizers, [])
+                self.assertEqual(accelerator._schedulers, [])
+                self.assertEqual(accelerator._dataloaders, [])
+                self.assertEqual(accelerator._custom_objects, [])
+
     def test_phase1_stops_for_manual_pilot_review_before_later_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             backend = FakeBackend()

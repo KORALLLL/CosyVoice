@@ -9,6 +9,7 @@ tested without CUDA while the production backend calls Tasks 1--11 directly.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import IntEnum
 import json
@@ -321,14 +322,15 @@ class ProductionBackend:
 
         cache_root = options.paths.run_root / "memorization_cache"
         cache = _load_memorization_cache(cache_root)
-        report = run_memorization_gate(MemorizationRequest(
-            split_plan=cache_root / "split_plan",
-            cache=cache,
-            output_root=options.paths.run_root,
-            base_model_dir=options.paths.base_model_dir,
-            seed=options.paths.seed,
-            accelerator_factory=lambda **_: self.accelerator,
-        ))
+        with _accelerator_scope(self.accelerator):
+            report = run_memorization_gate(MemorizationRequest(
+                split_plan=cache_root / "split_plan",
+                cache=cache,
+                output_root=options.paths.run_root,
+                base_model_dir=options.paths.base_model_dir,
+                seed=options.paths.seed,
+                accelerator_factory=lambda **_: self.accelerator,
+            ))
         manifest = report.path / "memorization_manifest.json"
         return {"manifest": str(manifest), "manifest_sha256": sha256_file(manifest), "steps": report.steps}
 
@@ -356,6 +358,10 @@ class ProductionBackend:
         }
 
     def capacity_smoke(self, options: WorkflowOptions) -> dict[str, object]:
+        with _accelerator_scope(self.accelerator):
+            return self._capacity_smoke_scoped(options)
+
+    def _capacity_smoke_scoped(self, options: WorkflowOptions) -> dict[str, object]:
         # The production-path smoke uses the same request builder as training,
         # but is bounded to one optimizer accumulation and never publishes a
         # phase checkpoint.  It remains collective on all eight ranks.
@@ -447,7 +453,7 @@ class ProductionBackend:
             phase2_checkpoint=checkpoint,
             validation_summary=validation,
             output_dir=options.paths.run_root / "final",
-            validation_request=self._load_evaluation_request(options, 40),
+            validation_request=self._load_committed_evaluation_request(options, 40),
             wandb_logger=self._wandb_logger(options),
             expected_training_identity=_required_mapping(phase2, "training_identity"),
         )
@@ -460,6 +466,25 @@ class ProductionBackend:
         }
 
     def _run_training(
+        self,
+        options: WorkflowOptions,
+        phase: PhaseSpec,
+        validation_indices: tuple[int, ...],
+        initial_adapter_sha256: str | None,
+    ) -> dict[str, object]:
+        with _accelerator_scope(self.accelerator):
+            try:
+                return self._run_training_scoped(
+                    options,
+                    phase,
+                    validation_indices,
+                    initial_adapter_sha256,
+                )
+            finally:
+                self._evaluation_model = None
+                self._evaluation_checkpoint = None
+
+    def _run_training_scoped(
         self,
         options: WorkflowOptions,
         phase: PhaseSpec,
@@ -481,8 +506,24 @@ class ProductionBackend:
         if not cache_manifest.is_file():
             raise StageRequirementError("verified cache aggregate manifest is missing")
         validation_evidence: list[dict[str, object]] = []
+        resume_evidence_loaded = options.resume_checkpoint is None
+
+        def load_resume_evidence() -> None:
+            nonlocal resume_evidence_loaded
+            if resume_evidence_loaded:
+                return
+            validation_evidence.extend(self._resume_validation_evidence(
+                options,
+                phase,
+                validation_indices,
+                options.resume_checkpoint,
+            ))
+            resume_evidence_loaded = True
 
         def validate(event: Any) -> bool:
+            # train_phase authenticates the immutable checkpoint identity and
+            # every state-file checksum before it can invoke this callback.
+            load_resume_evidence()
             expected = validation_indices[len(validation_evidence)]
             if event.validation_index != expected:
                 raise StageRequirementError(f"trainer emitted validation {event.validation_index}, expected {expected}")
@@ -509,6 +550,9 @@ class ProductionBackend:
             initial_adapter_sha256=initial_adapter_sha256,
         )
         result = train_phase(request, TrainingCallbacks(validate=validate))
+        # A final succeeded checkpoint may need no further validation callback;
+        # train_phase has still authenticated and loaded it before returning.
+        load_resume_evidence()
         if (
             not result.completed
             or [item.get("validation_index") for item in validation_evidence] != list(validation_indices)
@@ -534,6 +578,36 @@ class ProductionBackend:
             "training_identity": raw["identity"],
             "validations": validation_evidence,
         }
+
+    def _resume_validation_evidence(
+        self,
+        options: WorkflowOptions,
+        phase: PhaseSpec,
+        validation_indices: tuple[int, ...],
+        resume_checkpoint: Path | None,
+    ) -> list[dict[str, object]]:
+        if resume_checkpoint is None:
+            return []
+        manifest = _read_mapping(Path(resume_checkpoint) / "checkpoint_manifest.json")
+        status = manifest.get("validation_status")
+        if status not in {"pending", "succeeded"}:
+            raise StageRequirementError("resume checkpoint validation status is invalid")
+        progress = _required_mapping(manifest, "progress")
+        current = progress.get("validation_index")
+        if (
+            progress.get("phase") != phase.number
+            or isinstance(current, bool)
+            or not isinstance(current, int)
+        ):
+            raise StageRequirementError("resume checkpoint phase/validation cursor is invalid")
+        if current not in validation_indices:
+            raise StageRequirementError("resume checkpoint validation cursor is outside the phase schedule")
+        last_committed = current if status == "succeeded" else current - 1
+        prior = tuple(index for index in validation_indices if index <= last_committed)
+        expected = tuple(range(validation_indices[0], last_committed + 1))
+        if prior != expected:
+            raise StageRequirementError("resume checkpoint skips required validation indices")
+        return [self._committed_validation_evidence(options, index) for index in prior]
 
     def _load_phase1_adapter(self, model: Any, options: WorkflowOptions, expected: str | None) -> None:
         from peft.utils import set_peft_model_state_dict
@@ -697,8 +771,6 @@ class ProductionBackend:
         indices: Sequence[int],
         recorded: object,
     ) -> None:
-        from .evaluation import verify_committed_evaluation
-
         if not isinstance(recorded, Sequence) or isinstance(recorded, (str, bytes)):
             raise StageRequirementError("phase validation evidence list is missing")
         by_index: dict[int, Mapping[str, object]] = {}
@@ -711,18 +783,38 @@ class ProductionBackend:
             by_index[index] = item
         if set(by_index) != set(indices):
             raise StageRequirementError("phase validation evidence does not cover the exact required indices")
-        logger = self._wandb_logger(options)
         for index in indices:
-            request = self._load_committed_evaluation_request(options, index)
-            committed = verify_committed_evaluation(request, wandb_logger=logger)
+            committed = self._committed_validation_evidence(options, index)
             expected = by_index[index]
             if (
-                committed.report.identity_checksum != expected.get("identity_sha256")
-                or dict(committed.report.artifact_checksums) != expected.get("artifact_checksums")
-                or committed.report.row_count != VALIDATION_GENERATIONS
+                committed.get("identity_sha256") != expected.get("identity_sha256")
+                or committed.get("artifact_checksums") != expected.get("artifact_checksums")
+                or committed.get("generations") != VALIDATION_GENERATIONS
                 or expected.get("generations") != VALIDATION_GENERATIONS
             ):
                 raise StageRequirementError(f"validation-{index:02d} evidence changed")
+
+    def _committed_validation_evidence(
+        self,
+        options: WorkflowOptions,
+        index: int,
+    ) -> dict[str, object]:
+        from .evaluation import verify_committed_evaluation
+
+        request = self._load_committed_evaluation_request(options, index)
+        committed = verify_committed_evaluation(
+            request,
+            wandb_logger=self._wandb_logger(options),
+        )
+        report = committed.report
+        return {
+            "validation_index": report.validation_index,
+            "generations": report.row_count,
+            "summary": str(report.summary_json),
+            "summary_sha256": sha256_file(report.summary_json),
+            "identity_sha256": report.identity_checksum,
+            "artifact_checksums": dict(report.artifact_checksums),
+        }
 
     def _ensure_tracker(self, options: WorkflowOptions) -> None:
         if self._tracker_initialized:
@@ -774,6 +866,27 @@ class ProductionBackend:
             visible_devices=tuple(cast(list[int], config["visible_devices"])),
             seed=int(cast(int, config["seed"])),
         )
+
+
+@contextmanager
+def _accelerator_scope(accelerator: Any) -> Any:
+    """Give one workflow stage exclusive ownership of prepared Accelerate state."""
+
+    def clear() -> None:
+        free_memory = getattr(accelerator, "free_memory", None)
+        custom_objects = getattr(accelerator, "_custom_objects", None)
+        if not callable(free_memory) or not isinstance(custom_objects, list):
+            raise StageRequirementError("Accelerator does not expose the required lifecycle state")
+        free_memory()
+        # Accelerate 1.12 clears prepared models, optimizers, schedulers, and
+        # dataloaders but leaves registered checkpoint objects behind.
+        custom_objects.clear()
+
+    clear()
+    try:
+        yield accelerator
+    finally:
+        clear()
 
 
 def _build_memorization_cache(options: WorkflowOptions) -> Any:

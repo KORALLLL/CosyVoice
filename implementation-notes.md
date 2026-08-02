@@ -128,3 +128,11 @@
 - Security: Hugging Face and W&B credentials remain environment-only. CLI/status configuration is recursively redacted for keys containing `TOKEN`, `KEY`, or `SECRET`, and the workflow has no Hub publication surface.
 - Validation: Focused Task 8/workflow/public-Task-10 tests pass 40/40; targeted Task 11 identity/export tests pass 17/17; all Balalaika tests pass 217/217; both shell launchers pass `bash -n`; Python compilation and whitespace checks pass.
 - Follow-up: No real network, CUDA, cache build, training, evaluation, export, or upload ran in Task 12. Real qualification still stops for manual pilot listening approval.
+
+### Fix round 1
+
+- Changed: Resume reconstructs and reauthenticates every earlier committed Task 10 validation before accepting the next boundary. A pending cursor excludes the interrupted boundary; a succeeded cursor includes it, and only actual phase validation indices are accepted.
+- Decision: Load resume evidence lazily after `train_phase` has authenticated the exact training identity, all checkpoint-state checksums, and restored Accelerate state. This avoids trusting evaluation evidence first and avoids hashing multi-gigabyte state twice.
+- Changed: Memorization, capacity qualification, and phase training each receive an isolated lifecycle scope around the workflow-owned Accelerator. Prepared models, optimizers, schedulers, dataloaders, and custom checkpoint objects are cleared on entry and on both successful and exceptional exit.
+- Changed: CUDA tokenizer qualification restores the rank's original device in a `finally` block, and final export consumes the already committed validation-40 request instead of retaining or rebuilding the training-time evaluation model.
+- Validation: Focused workflow/tokenizer tests pass 30/30 and training/memorization tests pass 35/35, including resume-cursor, lifecycle-exception, and CUDA-device regressions.

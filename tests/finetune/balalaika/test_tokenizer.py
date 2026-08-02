@@ -22,6 +22,7 @@ from cosyvoice.finetune.balalaika.tokenizer import (
     approve_pilot,
     require_pilot_approval,
     run_cache_workers,
+    run_tokenizer_qualification,
 )
 
 
@@ -79,6 +80,61 @@ class OutOfRangeSession(OomOnceSession):
 
 
 class TokenizerTests(unittest.TestCase):
+    def test_qualification_restores_rank_cuda_device_on_success_and_failure(self) -> None:
+        class Cuda:
+            def __init__(self) -> None:
+                self.current = 3
+                self.set_history: list[int] = []
+
+            def current_device(self) -> int:
+                return self.current
+
+            def set_device(self, device: int) -> None:
+                self.current = device
+                self.set_history.append(device)
+
+            def reset_peak_memory_stats(self, _device: int) -> None:
+                return None
+
+            def max_memory_allocated(self, _device: int) -> int:
+                return 1
+
+        class QualifiedTokenizer:
+            session = OomOnceSession()
+
+            def __init__(self, fail: bool) -> None:
+                self.fail = fail
+
+            def extract(self, _audio):
+                if self.fail:
+                    raise TokenizerError("qualification failure")
+                return [list(range(25))]
+
+            def feature_lengths(self, _audio):
+                return [100]
+
+        model = self.paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"
+        model.parent.mkdir(parents=True)
+        model.write_bytes(b"onnx")
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                cuda = Cuda()
+                torch = types.SimpleNamespace(cuda=cuda)
+                tokenizer = QualifiedTokenizer(fails)
+                patches = (
+                    patch("cosyvoice.finetune.balalaika.tokenizer._require_eight_devices"),
+                    patch("cosyvoice.finetune.balalaika.tokenizer.import_module", return_value=torch),
+                    patch.object(OnnxSpeechTokenizer, "for_paths", return_value=tokenizer),
+                )
+                with patches[0], patches[1], patches[2]:
+                    if fails:
+                        with self.assertRaisesRegex(TokenizerError, "qualification failure"):
+                            run_tokenizer_qualification(self.paths)
+                    else:
+                        run_tokenizer_qualification(self.paths)
+                self.assertEqual(cuda.current, 3)
+                self.assertEqual(cuda.set_history[-1], 3)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
