@@ -191,3 +191,51 @@ exit 0
 ```
 
 `rtk python -m py_compile ...` and `rtk git diff --check` also exited successfully. No external work or eight-GPU hardware claim was made.
+
+## Fix Round 3
+
+### Finding addressed
+
+Scheduler callable identity no longer represents a referenced module only by its module name. Python bytecode is inspected for actual `LOAD_GLOBAL` operations, including those inside nested code objects. Each name is resolved against the callable's real globals or builtins namespace and passed through the existing recursive semantic serializer. Supported immutable values, functions, tuples, frozensets, and string-keyed mappings remain fingerprintable.
+
+Module namespaces, dynamic name resolution, missing globals, and other values that cannot be deterministically and completely serialized are rejected fail closed. This prevents a mutable module attribute from changing future LR behavior while retaining the same checkpoint identity. The production/default constant lambda remains stable across equivalent instances.
+
+### TDD evidence
+
+Before the fix, the module-backed schedule was accepted and a future multiplier referenced only from nested bytecode was omitted. The equivalent constant-lambda control already passed:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_fingerprints_globals_in_nested_code tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_module_backed_mutable_attribute tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_default_lambda_scheduler_identity_is_stable_across_instances -v
+Ran 3 tests in 0.051s
+FAILED (failures=2)
+```
+
+After recursive global resolution and fail-closed module handling:
+
+```text
+Ran 3 tests in 0.069s
+OK
+```
+
+### Verification
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 23 tests in 1.225s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_artifacts tests.finetune.balalaika.test_cache tests.finetune.balalaika.test_data tests.finetune.balalaika.test_metrics tests.finetune.balalaika.test_model tests.finetune.balalaika.test_sources tests.finetune.balalaika.test_tokenizer tests.finetune.balalaika.test_training tests.finetune.balalaika.test_validation_data -v
+Ran 116 tests in 6.452s
+OK
+
+rtk accelerate launch --cpu --num_processes 2 -m tests.finetune.balalaika.accelerate_smoke
+exit 0
+```
+
+`rtk python -m py_compile cosyvoice/finetune/balalaika/training.py tests/finetune/balalaika/test_training.py tests/finetune/balalaika/accelerate_smoke.py` and `rtk git diff --check` exited successfully.
+
+### Self-review and qualification boundary
+
+The new resolver keys identity from semantic global loads rather than every `co_names` entry, so attribute names are not mistaken for independent globals. Nested code is traversed, actual builtin bindings are fingerprinted when supported, and unresolved or dynamic lookup is rejected. No source path, line number, object `repr`, or module-name-only fallback is used.
+
+No real eight-GPU, BF16 model, production corpus, credential, installation, or upload was used. The passing smoke remains real two-process CPU DDP through Accelerate, not eight-GPU hardware qualification.
