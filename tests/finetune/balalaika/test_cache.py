@@ -178,6 +178,33 @@ class CacheTests(unittest.TestCase):
         self.assertFalse(list(self.cache_root.rglob("*.partial")))
         self.assertFalse(list(self.cache_root.rglob("*.rollback")))
 
+    def test_backup_cleanup_failure_keeps_committed_cache_and_stale_backups_recover(self) -> None:
+        # Once manifests are final, cleanup failure must not roll back or delete the new cache.
+        self._configure_twenty_prompt_cache()
+        with patch("cosyvoice.finetune.balalaika.cache._decode_audio", side_effect=self._decoded):
+            first = build_cache_shard(self.request, FakeTokenizer())
+        first_phase1 = first.phase1_path.read_bytes()
+        original_unlink = Path.unlink
+        backup_deletions = 0
+
+        def fail_second_backup_unlink(path, *args, **kwargs):
+            nonlocal backup_deletions
+            if path.name.endswith(".rollback"):
+                backup_deletions += 1
+                if backup_deletions == 2:
+                    raise OSError("injected backup cleanup failure")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=fail_second_backup_unlink):
+            with patch("cosyvoice.finetune.balalaika.cache._decode_audio", side_effect=self._decoded):
+                committed = build_cache_shard(self.request, ChangedTokenizer())
+        self.assertNotEqual(committed.phase1_path.read_bytes(), first_phase1)
+        self.assertEqual(verify_cache(self.cache_root).prompt_count, 20)
+        self.assertTrue(list(self.cache_root.rglob("*.rollback")))
+        with patch("cosyvoice.finetune.balalaika.cache._decode_audio", side_effect=self._decoded):
+            build_cache_shard(self.request, ChangedTokenizer())
+        self.assertFalse(list(self.cache_root.rglob("*.rollback")))
+
     def test_verify_rejects_phase_parquet_checksum_or_token_audit_changes(self) -> None:
         # Trusting a manifest without reopening the Parquet permits undetected token corruption.
         with patch("cosyvoice.finetune.balalaika.cache._decode_audio", side_effect=self._decoded):

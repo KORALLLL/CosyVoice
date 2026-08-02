@@ -672,10 +672,6 @@ def _transactional_publish(artifacts: list[_StagedArtifact]) -> None:
                 published.append((artifact, None))
             _replace_staged(artifact.partial, artifact.target)
             _fsync_directory(artifact.target.parent)
-        for _, backup in published:
-            if backup is not None and backup.exists():
-                backup.unlink()
-                _fsync_directory(backup.parent)
     except Exception:
         for artifact, backup in reversed(published):
             if artifact.target.exists():
@@ -687,6 +683,20 @@ def _transactional_publish(artifacts: list[_StagedArtifact]) -> None:
     finally:
         for artifact in artifacts:
             _remove_partial(artifact.partial)
+    _cleanup_committed_backups(published)
+
+
+def _cleanup_committed_backups(published: list[tuple[_StagedArtifact, Path | None]]) -> None:
+    """Best-effort post-commit cleanup; stale backups are safely reconciled by the next attempt."""
+
+    for _, backup in published:
+        if backup is None or not backup.exists():
+            continue
+        try:
+            backup.unlink()
+            _fsync_directory(backup.parent)
+        except OSError:
+            continue
 
 
 def _replace_staged(source: Path, destination: Path) -> None:
