@@ -52,3 +52,22 @@ No real model, GPU, corpus, training run, install, upload, or credential access 
 - `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -v` — 30 passed.
 - `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -v` — 125 passed.
 - `rtk python -m compileall -q cosyvoice/finetune/balalaika/memorization.py cosyvoice/llm/llm.py` and `rtk git diff --check` passed.
+
+## Fix Round 2: sealed manifest and self-validating trajectory
+
+### Root cause
+
+- `_publish_success` wrote the manifest but its `MemorizationReport` return had been stranded after `require_memorization_gate`, making the declared return unreachable.
+- The evidence map intentionally omitted its own manifest, but no separate immutable binding protected the manifest contents. The verifier relied too heavily on optional external provenance and did not independently validate all trajectory and row invariants.
+
+### TDD evidence
+
+1. RED: direct `_publish_success` coverage returned `None`; success output lacked `steps` and the expected seal. The existing verifier accepted a resealed top-level-row mismatch because it only read provenance rows.
+2. GREEN: publication now records completed `steps`, atomically writes `memorization_manifest.json`, then atomically writes `memorization_success.json` containing the manifest path and SHA-256. `_publish_success` returns the completed `MemorizationReport` on its reachable path.
+3. RED: seal/internal-tamper coverage initially failed with an evidence-checksum error rather than a required seal failure; the old verifier did not self-reject check-index, optimizer-step, completed-step, row length/hash, cache/base checksum, tokenizer, adapter, or duplicate top-level-row mutations when the manifest was rehashed.
+4. GREEN: `require_memorization_gate` validates the seal before parsing or trusting the manifest, then enforces v3 manifest, evidence, exact row fields/checksums, base/cache checksums, fixed adapter settings/audit shape, full run-config types/ranges, monotonic check indices, check cadence, completed-step alignment, and a terminal streak of exactly three all-sample-exact checks. Each listed tamper case now fails even without `expected_provenance`.
+
+### Verification
+
+- `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -v` — 32 passed.
+- Full Balalaika/compile/diff verification was run after the final implementation changes before commit.

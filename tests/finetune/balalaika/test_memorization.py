@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 from contextlib import nullcontext
@@ -15,7 +16,10 @@ import torch
 from cosyvoice.finetune.balalaika.cache import CacheManifest
 from cosyvoice.finetune.balalaika.memorization import (
     SampleAccuracy,
+    MemorizationCheck,
+    MemorizationReport,
     MemorizationRequest,
+    _publish_success,
     memorization_passed,
     require_memorization_gate,
     run_memorization_gate,
@@ -140,6 +144,9 @@ class MemorizationSelectionTests(unittest.TestCase):
         self.assertEqual([check.check_index for check in report.checks], [1, 2, 3])
         self.assertTrue(all(sample.exact for check in report.checks for sample in check.samples))
         manifest = json.loads((output / "memorization" / "memorization_manifest.json").read_text())
+        self.assertEqual(manifest["steps"], report.steps)
+        seal = json.loads((report.path / "memorization_success.json").read_text())
+        self.assertEqual(seal["manifest_sha256"], hashlib.sha256((report.path / "memorization_manifest.json").read_bytes()).hexdigest())
         self.assertEqual(manifest["checks"][-1]["check_index"], 3)
         config = manifest["provenance"]["run_config"]
         self.assertEqual(
@@ -212,6 +219,70 @@ class MemorizationSelectionTests(unittest.TestCase):
         (report.path / "cross_entropy.json").write_text("{}", encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "checksum"):
             require_memorization_gate(report.path, expected_provenance=manifest["provenance"])
+
+    def test_publish_success_returns_completed_report(self):
+        selected = select_memorization_rows(self.plan, self.cache)
+        root = self.root / "direct-publish"
+        root.mkdir()
+        request = MemorizationRequest(
+            split_plan=self.plan,
+            cache=self.cache,
+            output_root=self.root,
+            base_model_dir=self.root / "base",
+            max_steps=3,
+            check_every=1,
+            model_loader=lambda _: _MemorizingModel({}),
+            dataloader_factory=_fixture_loader,
+            accelerator_factory=lambda **_: _FakeAccelerator(),
+        )
+        exact = tuple(SampleAccuracy(row.source_relative_path, row.speech_token_len, row.speech_token_len) for row in selected)
+
+        report = _publish_success(
+            root, request, selected,
+            [MemorizationCheck(index, index, exact) for index in (1, 2, 3)],
+            {}, [0.0, 0.0, 0.0], {"trainable_parameters": ["lora.fixture"]},
+            "b" * 64, _MemorizingModel({}), 3,
+        )
+
+        self.assertIsInstance(report, MemorizationReport)
+        self.assertEqual(report.steps, 3)
+
+    def test_verifier_rejects_seal_and_internal_trajectory_or_provenance_tampering(self):
+        selected = select_memorization_rows(self.plan, self.cache)
+        request = MemorizationRequest(
+            split_plan=self.plan, cache=self.cache, output_root=self.root / "self-validate",
+            base_model_dir=self.root / "base", max_steps=3, check_every=1,
+            model_loader=lambda _: _MemorizingModel({row.source_relative_path: row.speech_token_len for row in selected}),
+            adapter_injector=lambda value, _: value, audit_fn=lambda _: {"trainable_parameters": ["lora.fixture"]},
+            dataloader_factory=_fixture_loader, accelerator_factory=lambda **_: _FakeAccelerator(),
+        )
+        report = run_memorization_gate(request)
+        manifest_path = report.path / "memorization_manifest.json"
+        original = json.loads(manifest_path.read_text())
+        (report.path / "memorization_success.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "seal"):
+            require_memorization_gate(report.path)
+
+        mutations = {
+            "check-index": lambda value: value["checks"][1].update(check_index=9),
+            "optimizer-step": lambda value: value["checks"][1].update(optimizer_step=99),
+            "steps": lambda value: value.update(steps=2),
+            "row-length": lambda value: value["provenance"]["rows"][0].update(speech_token_len=0),
+            "top-row": lambda value: value["rows"][0].update(speech_token_len=999),
+            "row-hash": lambda value: value["provenance"]["rows"][0].update(speech_token_sha256="BAD"),
+            "cache": lambda value: value["provenance"].update(cache_checksum="BAD"),
+            "base": lambda value: value["provenance"].update(base_checkpoint_sha256="BAD"),
+            "tokenizer": lambda value: value["provenance"]["run_config"].update(tokenizer_identity=""),
+            "adapter": lambda value: value["provenance"].update(adapter={"settings": {}, "trainable_inventory": []}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = json.loads(json.dumps(original))
+                mutate(changed)
+                manifest_path.write_text(json.dumps(changed), encoding="utf-8")
+                _write_test_seal(report.path)
+                with self.assertRaises(ValueError):
+                    require_memorization_gate(report.path)
 
     def test_gate_does_not_publish_a_failed_attempt(self):
         output = self.root / "failed-run"
@@ -346,6 +417,15 @@ class _MemorizingModel(torch.nn.Module):
 
 def _fixture_loader(rows, **_):
     return [{"utts": [row.source_relative_path]} for row in rows]
+
+
+def _write_test_seal(root: Path) -> None:
+    manifest = root / "memorization_manifest.json"
+    (root / "memorization_success.json").write_text(json.dumps({
+        "format_version": 1,
+        "manifest": "memorization_manifest.json",
+        "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    }), encoding="utf-8")
 
 
 if __name__ == "__main__":

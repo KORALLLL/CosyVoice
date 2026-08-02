@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 from itertools import cycle
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -21,6 +22,23 @@ from .config import DEFAULT_SEED
 from .data import CachedRow
 from .model import LoraSettings, audit_trainable_parameters, inject_lora, load_base_llm
 from .training import SchedulerSpec, _build_scheduler
+
+
+_MANIFEST_NAME = "memorization_manifest.json"
+_SEAL_NAME = "memorization_success.json"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_FIXED_OPTIMIZER_CONFIG = {
+    "class": "torch.optim.adamw.AdamW",
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "amsgrad": False,
+    "maximize": False,
+    "foreach": None,
+    "capturable": False,
+    "differentiable": False,
+    "fused": None,
+}
 
 
 @dataclass(frozen=True)
@@ -374,9 +392,10 @@ def _publish_success(
         for row in rows
     ]
     atomic_write_json(
-        root / "memorization_manifest.json",
+        root / _MANIFEST_NAME,
         {
-            "format_version": 2,
+            "format_version": 3,
+            "steps": steps,
             "provenance": {
                 "cache_checksum": cache_checksum,
                 "base_checkpoint_sha256": base_checksum,
@@ -401,6 +420,15 @@ def _publish_success(
             "evidence": evidence,
         },
     )
+    atomic_write_json(
+        root / _SEAL_NAME,
+        {
+            "format_version": 1,
+            "manifest": _MANIFEST_NAME,
+            "manifest_sha256": sha256_file(root / _MANIFEST_NAME),
+        },
+    )
+    return MemorizationReport(root, steps, rows, tuple(checks), cache_checksum, base_checksum)
 
 
 def _run_config(request: MemorizationRequest) -> dict[str, object]:
@@ -441,7 +469,7 @@ def _evidence_checksums(root: Path) -> dict[str, dict[str, str]]:
             "sha256": sha256_file(path),
         }
         for path in sorted(root.rglob("*"))
-        if path.is_file() and path.name != "memorization_manifest.json"
+        if path.is_file() and path.name not in {_MANIFEST_NAME, _SEAL_NAME}
     }
 
 
@@ -453,12 +481,27 @@ def require_memorization_gate(
     """Reject a missing, altered, or provenance-mismatched gate before use."""
 
     root = Path(path)
-    manifest_path = root / "memorization_manifest.json"
+    manifest_path = root / _MANIFEST_NAME
+    seal_path = root / _SEAL_NAME
+    try:
+        seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("memorization success seal is missing or invalid") from exc
+    if (
+        not isinstance(seal, dict)
+        or set(seal) != {"format_version", "manifest", "manifest_sha256"}
+        or seal.get("format_version") != 1
+        or seal.get("manifest") != _MANIFEST_NAME
+        or not _valid_checksum(seal.get("manifest_sha256"))
+        or not manifest_path.is_file()
+        or seal["manifest_sha256"] != sha256_file(manifest_path)
+    ):
+        raise ValueError("memorization success seal changed")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("memorization success manifest is missing or invalid") from exc
-    if not isinstance(manifest, dict) or manifest.get("format_version") != 2:
+    if not isinstance(manifest, dict) or manifest.get("format_version") != 3:
         raise ValueError("memorization success manifest format is invalid")
     provenance = manifest.get("provenance")
     if not isinstance(provenance, dict):
@@ -471,32 +514,124 @@ def require_memorization_gate(
     rows = provenance.get("rows")
     checks = manifest.get("checks")
     config = provenance.get("run_config")
-    if not isinstance(rows, list) or len(rows) != 4 or not isinstance(checks, list) or not isinstance(config, dict):
+    if not isinstance(rows, list) or manifest.get("rows") != rows or not isinstance(checks, list) or not isinstance(config, dict):
         raise ValueError("memorization success provenance is incomplete")
-    required_checks = config.get("required_consecutive_checks")
-    if required_checks != 3 or len(checks) < required_checks:
-        raise ValueError("memorization success checks are incomplete")
-    identities = [row.get("source_relative_path") for row in rows if isinstance(row, dict)]
-    if len(identities) != 4 or len(set(identities)) != 4 or any(not isinstance(item, str) for item in identities):
-        raise ValueError("memorization row provenance is invalid")
-    for check in checks[-required_checks:]:
-        if not isinstance(check, dict) or not isinstance(check.get("samples"), list):
-            raise ValueError("memorization check evidence is invalid")
-        samples = check["samples"]
-        if len(samples) != 4 or {sample.get("source_relative_path") for sample in samples if isinstance(sample, dict)} != set(identities):
-            raise ValueError("memorization check sample identities changed")
-        for sample in samples:
-            if not isinstance(sample, dict) or sample.get("correct_tokens") != sample.get("target_tokens") or not isinstance(sample.get("target_tokens"), int) or sample["target_tokens"] < 1:
-                raise ValueError("memorization check is not exact per sample")
+    _validate_provenance(provenance, rows, manifest.get("adapter"))
+    _validate_trajectory(manifest.get("steps"), checks, rows, config)
     return VerifiedMemorizationEvidence(root, manifest)
-    return MemorizationReport(
-        root,
-        steps,
-        rows,
-        tuple(checks),
-        cache_checksum,
-        base_checksum,
-    )
+
+
+def _valid_checksum(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _validate_provenance(
+    provenance: Mapping[str, object],
+    rows: list[object],
+    adapter: object,
+) -> None:
+    if set(provenance) != {"cache_checksum", "base_checkpoint_sha256", "rows", "run_config", "adapter"}:
+        raise ValueError("memorization provenance fields are invalid")
+    if not _valid_checksum(provenance.get("cache_checksum")) or not _valid_checksum(provenance.get("base_checkpoint_sha256")):
+        raise ValueError("memorization cache/base provenance checksum is invalid")
+    if not isinstance(provenance.get("adapter"), dict) or adapter != provenance["adapter"]:
+        raise ValueError("memorization adapter provenance changed")
+    _validate_rows(rows)
+    _validate_adapter(provenance["adapter"])
+    _validate_run_config(provenance.get("run_config"))
+
+
+def _validate_rows(rows: Sequence[object]) -> None:
+    required = {"source_relative_path", "speech_token_len", "speech_token_sha256"}
+    if len(rows) != 4:
+        raise ValueError("memorization row provenance must contain exactly four rows")
+    identities: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != required:
+            raise ValueError("memorization row provenance fields are invalid")
+        source = row["source_relative_path"]
+        length = row["speech_token_len"]
+        if not isinstance(source, str) or not source or isinstance(length, bool) or not isinstance(length, int) or length < 1 or not _valid_checksum(row["speech_token_sha256"]):
+            raise ValueError("memorization row provenance is invalid")
+        identities.add(source)
+    if len(identities) != 4:
+        raise ValueError("memorization row provenance contains duplicate identities")
+
+
+def _validate_adapter(adapter: Mapping[str, object]) -> None:
+    if set(adapter) != {"settings", "trainable_inventory"} or adapter.get("settings") != asdict(LoraSettings()):
+        raise ValueError("memorization adapter settings are invalid")
+    audit = adapter.get("trainable_inventory")
+    trainable = audit.get("trainable_parameters") if isinstance(audit, dict) else None
+    if not isinstance(trainable, list) or not trainable or any(not isinstance(name, str) or not name for name in trainable):
+        raise ValueError("memorization adapter audit is invalid")
+
+
+def _validate_run_config(config: object) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("memorization run config is invalid")
+    required = {
+        "max_steps", "learning_rate", "max_grad_norm", "optimizer", "scheduler", "mixed_precision",
+        "gradient_accumulation_steps", "world_size", "local_batch_size", "effective_batch_size", "check_every",
+        "required_consecutive_checks", "seed", "dataloader_identity", "tokenizer_identity",
+    }
+    if set(config) != required:
+        raise ValueError("memorization run config fields are invalid")
+    if (
+        isinstance(config["max_steps"], bool) or not isinstance(config["max_steps"], int) or not 1 <= config["max_steps"] <= 2_000
+        or isinstance(config["check_every"], bool) or not isinstance(config["check_every"], int) or not 1 <= config["check_every"] <= config["max_steps"]
+        or config["required_consecutive_checks"] != 3
+        or config["world_size"] != 8 or config["mixed_precision"] != "bf16" or config["gradient_accumulation_steps"] != 1
+        or isinstance(config["local_batch_size"], bool) or not isinstance(config["local_batch_size"], int) or config["local_batch_size"] < 1
+        or config["effective_batch_size"] != config["local_batch_size"] * 8
+        or not isinstance(config["seed"], int) or isinstance(config["seed"], bool)
+        or not isinstance(config["dataloader_identity"], str) or not config["dataloader_identity"]
+        or not isinstance(config["tokenizer_identity"], str) or not config["tokenizer_identity"]
+    ):
+        raise ValueError("memorization run config values are invalid")
+    for name in ("learning_rate", "max_grad_norm"):
+        value = config[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not torch.isfinite(torch.tensor(value)) or value <= 0:
+            raise ValueError("memorization run config numeric value is invalid")
+    if config["scheduler"] != {"kind": "constant-v1"}:
+        raise ValueError("memorization scheduler config is invalid")
+    if config["optimizer"] != _FIXED_OPTIMIZER_CONFIG:
+        raise ValueError("memorization optimizer config is invalid")
+
+
+def _validate_trajectory(steps: object, checks: Sequence[object], rows: Sequence[object], config: Mapping[str, object]) -> None:
+    if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= config["max_steps"] or steps % config["check_every"]:
+        raise ValueError("memorization completed steps are invalid")
+    identities = {row["source_relative_path"] for row in rows if isinstance(row, dict)}
+    exact_history: list[bool] = []
+    for expected_index, check in enumerate(checks, start=1):
+        if not isinstance(check, dict) or check.get("check_index") != expected_index or check.get("optimizer_step") != expected_index * config["check_every"]:
+            raise ValueError("memorization check trajectory is invalid")
+        samples = check.get("samples")
+        if not isinstance(samples, list) or len(samples) != 4:
+            raise ValueError("memorization check samples are invalid")
+        sample_identities = set()
+        exact = True
+        for sample in samples:
+            if not isinstance(sample, dict) or set(sample) != {"source_relative_path", "correct_tokens", "target_tokens"}:
+                raise ValueError("memorization check sample fields are invalid")
+            source, correct, total = sample["source_relative_path"], sample["correct_tokens"], sample["target_tokens"]
+            if not isinstance(source, str) or isinstance(correct, bool) or isinstance(total, bool) or not isinstance(correct, int) or not isinstance(total, int) or total < 1 or correct < 0 or correct > total:
+                raise ValueError("memorization check sample counts are invalid")
+            sample_identities.add(source)
+            exact = exact and correct == total
+        if sample_identities != identities:
+            raise ValueError("memorization check sample identities changed")
+        exact_history.append(exact)
+    if not exact_history or checks[-1].get("optimizer_step") != steps:
+        raise ValueError("memorization final check is not aligned to completed steps")
+    trailing = 0
+    for exact in reversed(exact_history):
+        if not exact:
+            break
+        trailing += 1
+    if trailing != 3:
+        raise ValueError("memorization success must end in exactly three exact checks")
 
 
 def _cache_checksum(cache: CacheManifest) -> str:
