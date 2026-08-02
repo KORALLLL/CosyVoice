@@ -215,6 +215,40 @@ class AccelerateTrainingTests(unittest.TestCase):
                 scheduler_spec={"kind": "constant-v1"},
             )
 
+    def test_train_request_has_no_retired_scheduler_factory_keyword(self) -> None:
+        api = _api()
+
+        with self.assertRaisesRegex(TypeError, "scheduler_factory"):
+            api.TrainRequest(
+                model=ToyAdapterModel([]),
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path("unused"),
+                token_limit=2000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: (),
+                accelerator_factory=FakeAccelerator,
+                scheduler_factory=lambda _optimizer: None,
+            )
+
+    def test_train_request_rejects_callable_scheduler_spec(self) -> None:
+        api = _api()
+
+        with self.assertRaisesRegex(ValueError, "SchedulerSpec"):
+            api.TrainRequest(
+                model=ToyAdapterModel([]),
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path("unused"),
+                token_limit=2000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: (),
+                accelerator_factory=FakeAccelerator,
+                scheduler_spec=lambda _optimizer: None,
+            )
+
     def test_train_request_rejects_modified_phase_schedules(self) -> None:
         api = _api()
         model = ToyAdapterModel([])
