@@ -408,13 +408,16 @@ class Qwen2LM(TransformerLM):
         loss = self.criterion_ce(logits, lm_target.to(device))
         acc = th_accuracy(logits.view(-1, self.llm_decoder.out_features), lm_target, ignore_label=IGNORE_ID)
         target_mask = lm_target.ge(0) & lm_target.lt(self.speech_token_size)
-        correct_tokens_per_sample = (logits.argmax(dim=-1).eq(lm_target) & target_mask).sum(dim=1, dtype=torch.int64)
+        teacher_forced_predictions = logits.argmax(dim=-1)
+        correct_tokens_per_sample = (teacher_forced_predictions.eq(lm_target) & target_mask).sum(dim=1, dtype=torch.int64)
         target_tokens_per_sample = target_mask.sum(dim=1, dtype=torch.int64)
         return {
             'loss': loss,
             'acc': acc,
             'correct_tokens_per_sample': correct_tokens_per_sample,
             'target_tokens_per_sample': target_tokens_per_sample,
+            'teacher_forced_predictions': teacher_forced_predictions,
+            'teacher_forced_targets': lm_target,
         }
 
     def forward_dpo(

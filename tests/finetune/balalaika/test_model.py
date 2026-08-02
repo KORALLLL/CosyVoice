@@ -112,6 +112,9 @@ class ModelIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result["correct_tokens_per_sample"].dtype, torch.int64)
         self.assertEqual(result["target_tokens_per_sample"].dtype, torch.int64)
+        self.assertEqual(result["teacher_forced_predictions"].dtype, torch.int64)
+        self.assertEqual(result["teacher_forced_targets"].dtype, torch.int64)
+        self.assertEqual(result["teacher_forced_predictions"].shape, result["teacher_forced_targets"].shape)
         self.assertEqual(result["correct_tokens_per_sample"].tolist(), [1, 1])
         self.assertEqual(result["target_tokens_per_sample"].tolist(), [2, 1])
 
