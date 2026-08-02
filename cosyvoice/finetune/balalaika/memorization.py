@@ -68,6 +68,14 @@ class MemorizationReport:
 
 
 @dataclass(frozen=True)
+class VerifiedMemorizationEvidence:
+    """Tamper-checked success evidence suitable for a downstream stage gate."""
+
+    path: Path
+    manifest: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class MemorizationRequest:
     """Explicit dependencies for one fresh, isolated memorization attempt."""
 
@@ -80,6 +88,21 @@ class MemorizationRequest:
     check_every: int = 10
     learning_rate: float = 1e-4
     max_grad_norm: float = 1.0
+    batch_size: int = 1
+    world_size: int = 8
+    mixed_precision: str = "bf16"
+    gradient_accumulation_steps: int = 1
+    required_consecutive_checks: int = 3
+    optimizer_betas: tuple[float, float] = (0.9, 0.999)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 0.01
+    optimizer_foreach: bool | None = None
+    optimizer_capturable: bool = False
+    optimizer_differentiable: bool = False
+    optimizer_fused: bool | None = None
+    scheduler_spec: SchedulerSpec = SchedulerSpec()
+    dataloader_identity: str = "cosyvoice.balalaika.memorization-loader:v1"
+    tokenizer_identity: str = "cosyvoice.qwen-tokenizer:v3"
     tokenizer: Any | None = None
     model_loader: Callable[[Path], nn.Module] = load_base_llm
     adapter_injector: Callable[[nn.Module, LoraSettings], nn.Module] = inject_lora
@@ -95,8 +118,27 @@ class MemorizationRequest:
             raise ValueError("max_steps must be in [1, 2000]")
         if self.check_every < 1 or self.check_every > self.max_steps:
             raise ValueError("check_every must be in [1, max_steps]")
-        if self.learning_rate <= 0 or self.max_grad_norm <= 0:
-            raise ValueError("learning_rate and max_grad_norm must be positive")
+        if self.learning_rate <= 0 or self.max_grad_norm <= 0 or self.batch_size < 1:
+            raise ValueError("learning_rate, max_grad_norm, and batch_size must be positive")
+        if self.world_size != 8 or self.mixed_precision != "bf16" or self.gradient_accumulation_steps != 1:
+            raise ValueError("memorization gate requires world_size=8, bf16, and one accumulation step")
+        if self.required_consecutive_checks != 3:
+            raise ValueError("memorization gate requires exactly three consecutive checks")
+        if self.optimizer_betas != (0.9, 0.999) or self.optimizer_eps != 1e-8 or self.optimizer_weight_decay != 0.01:
+            raise ValueError("memorization gate requires the fixed production AdamW hyperparameters")
+        if (
+            self.optimizer_foreach is not None
+            or self.optimizer_capturable is not False
+            or self.optimizer_differentiable is not False
+            or self.optimizer_fused is not None
+        ):
+            raise ValueError("memorization gate requires the fixed production AdamW execution settings")
+        if type(self.scheduler_spec) is not SchedulerSpec:
+            raise ValueError("scheduler_spec must be a SchedulerSpec")
+        if not isinstance(self.dataloader_identity, str) or not self.dataloader_identity:
+            raise ValueError("dataloader_identity must be a nonempty string")
+        if not isinstance(self.tokenizer_identity, str) or not self.tokenizer_identity:
+            raise ValueError("tokenizer_identity must be a nonempty string")
 
 
 def run_memorization_gate(request: MemorizationRequest) -> MemorizationReport:
@@ -109,7 +151,7 @@ def run_memorization_gate(request: MemorizationRequest) -> MemorizationReport:
     rows = select_memorization_rows(request.split_plan, request.cache, request.seed)
     cache_checksum = _cache_checksum(request.cache)
     accelerator = _memorization_accelerator(request)
-    if getattr(accelerator, "num_processes", None) != 8:
+    if getattr(accelerator, "num_processes", None) != request.world_size:
         raise MemorizationGateError("memorization gate requires exactly eight Accelerate ranks")
     target = Path(request.output_root) / "memorization"
     temporary = Path(request.output_root) / ".memorization.incomplete"
@@ -127,8 +169,20 @@ def run_memorization_gate(request: MemorizationRequest) -> MemorizationReport:
         trainable = [parameter for parameter in adapted.parameters() if parameter.requires_grad]
         if not trainable:
             raise MemorizationGateError("fresh memorization adapter has no trainable parameters")
-        optimizer = torch.optim.AdamW(trainable, lr=request.learning_rate)
-        scheduler = _build_scheduler(optimizer, SchedulerSpec())
+        optimizer = torch.optim.AdamW(
+            trainable,
+            lr=request.learning_rate,
+            betas=request.optimizer_betas,
+            eps=request.optimizer_eps,
+            weight_decay=request.optimizer_weight_decay,
+            amsgrad=False,
+            maximize=False,
+            foreach=request.optimizer_foreach,
+            capturable=request.optimizer_capturable,
+            differentiable=request.optimizer_differentiable,
+            fused=request.optimizer_fused,
+        )
+        scheduler = _build_scheduler(optimizer, request.scheduler_spec)
         train_loader = _memorization_loader(request, rows)
         prepared = accelerator.prepare(adapted, optimizer, scheduler, train_loader)
         adapted, optimizer, scheduler, train_loader = prepared
@@ -161,7 +215,7 @@ def run_memorization_gate(request: MemorizationRequest) -> MemorizationReport:
             checks.append(check)
             exact = all(sample.exact for sample in samples)
             consecutive = consecutive + 1 if exact else 0
-            if consecutive == 3:
+            if consecutive == request.required_consecutive_checks:
                 report: MemorizationReport | None = None
                 if accelerator.is_main_process:
                     report = _publish_success(
@@ -202,7 +256,11 @@ def _memorization_accelerator(request: MemorizationRequest) -> Any:
         from accelerate import Accelerator
 
         factory = Accelerator
-    return factory(mixed_precision="bf16", gradient_accumulation_steps=1, log_with="wandb")
+    return factory(
+        mixed_precision=request.mixed_precision,
+        gradient_accumulation_steps=request.gradient_accumulation_steps,
+        log_with="wandb",
+    )
 
 
 def _memorization_loader(
@@ -210,16 +268,19 @@ def _memorization_loader(
     rows: tuple[CachedRow, CachedRow, CachedRow, CachedRow],
 ) -> Iterable[Mapping[str, Any]]:
     if request.dataloader_factory is not None:
-        return request.dataloader_factory(rows, tokenizer=request.tokenizer, batch_size=1)
+        return request.dataloader_factory(rows, tokenizer=request.tokenizer, batch_size=request.batch_size)
     from .data import build_memorization_dataloader
 
-    return build_memorization_dataloader(rows, tokenizer=request.tokenizer, batch_size=1)
+    return build_memorization_dataloader(rows, tokenizer=request.tokenizer, batch_size=request.batch_size)
 
 
 def _loss(result: Any) -> torch.Tensor:
     if not isinstance(result, Mapping) or not isinstance(result.get("loss"), torch.Tensor):
         raise MemorizationGateError("adapted model must return a tensor loss")
-    return result["loss"]
+    loss = result["loss"]
+    if loss.numel() != 1 or not bool(torch.isfinite(loss).all().item()):
+        raise MemorizationGateError("loss must be finite scalar before optimization or evaluation")
+    return loss
 
 
 def _evaluate_all_rows(
@@ -241,6 +302,7 @@ def _evaluate_all_rows(
             result = model(batch, accelerator.device)
             if not isinstance(result, Mapping):
                 raise MemorizationGateError("adapted model returned an invalid evaluation result")
+            _loss(result)
             correct = result.get("correct_tokens_per_sample")
             total = result.get("target_tokens_per_sample")
             if not isinstance(correct, torch.Tensor) or not isinstance(total, torch.Tensor):
@@ -293,7 +355,7 @@ def _publish_success(
         wav_root = root / "generated_wavs"
         wav_root.mkdir()
         request.wav_writer(model, rows, wav_root)
-        generated = tuple(sorted(path.name for path in wav_root.glob("*.wav") if path.is_file()))
+        generated = tuple(sorted(str(path.relative_to(root)) for path in wav_root.rglob("*") if path.is_file()))
     base_checksum = getattr(model, "_balalaika_base_checkpoint_sha256", None)
     if not isinstance(base_checksum, str) or len(base_checksum) != 64:
         raise MemorizationGateError("adapted model lacks a base checkpoint checksum")
@@ -302,24 +364,28 @@ def _publish_success(
         raise MemorizationGateError("adapter audit is not serializable")
     atomic_write_json(root / "cross_entropy.json", {"per_optimizer_step": list(losses)})
     atomic_write_json(root / "teacher_forced_tokens.json", dict(teacher_forced_tokens))
+    evidence = _evidence_checksums(root)
+    rows_payload = [
+        {
+            "source_relative_path": row.source_relative_path,
+            "speech_token_len": row.speech_token_len,
+            "speech_token_sha256": hashlib.sha256(json.dumps(list(row.speech_token)).encode("utf-8")).hexdigest(),
+        }
+        for row in rows
+    ]
     atomic_write_json(
         root / "memorization_manifest.json",
         {
-            "format_version": 1,
-            "seed": request.seed,
-            "steps": steps,
-            "check_every": request.check_every,
-            "cache_checksum": cache_checksum,
-            "base_checkpoint_sha256": base_checksum,
+            "format_version": 2,
+            "provenance": {
+                "cache_checksum": cache_checksum,
+                "base_checkpoint_sha256": base_checksum,
+                "rows": rows_payload,
+                "run_config": _run_config(request),
+                "adapter": {"settings": asdict(LoraSettings()), "trainable_inventory": dict(audit_payload)},
+            },
             "adapter": {"settings": asdict(LoraSettings()), "trainable_inventory": dict(audit_payload)},
-            "rows": [
-                {
-                    "source_relative_path": row.source_relative_path,
-                    "speech_token_len": row.speech_token_len,
-                    "speech_token_sha256": hashlib.sha256(json.dumps(list(row.speech_token)).encode("utf-8")).hexdigest(),
-                }
-                for row in rows
-            ],
+            "rows": rows_payload,
             "checks": [
                 {
                     "check_index": check.check_index,
@@ -332,8 +398,97 @@ def _publish_success(
                 for check in checks
             ],
             "generated_wavs": list(generated),
+            "evidence": evidence,
         },
     )
+
+
+def _run_config(request: MemorizationRequest) -> dict[str, object]:
+    return {
+        "max_steps": request.max_steps,
+        "learning_rate": request.learning_rate,
+        "max_grad_norm": request.max_grad_norm,
+        "optimizer": {
+            "class": "torch.optim.adamw.AdamW",
+            "betas": list(request.optimizer_betas),
+            "eps": request.optimizer_eps,
+            "weight_decay": request.optimizer_weight_decay,
+            "amsgrad": False,
+            "maximize": False,
+            "foreach": request.optimizer_foreach,
+            "capturable": request.optimizer_capturable,
+            "differentiable": request.optimizer_differentiable,
+            "fused": request.optimizer_fused,
+        },
+        "scheduler": {"kind": request.scheduler_spec.kind.value},
+        "mixed_precision": request.mixed_precision,
+        "gradient_accumulation_steps": request.gradient_accumulation_steps,
+        "world_size": request.world_size,
+        "local_batch_size": request.batch_size,
+        "effective_batch_size": request.batch_size * request.gradient_accumulation_steps * request.world_size,
+        "check_every": request.check_every,
+        "required_consecutive_checks": request.required_consecutive_checks,
+        "seed": request.seed,
+        "dataloader_identity": request.dataloader_identity,
+        "tokenizer_identity": request.tokenizer_identity,
+    }
+
+
+def _evidence_checksums(root: Path) -> dict[str, dict[str, str]]:
+    return {
+        str(path.relative_to(root)): {
+            "path": str(path.relative_to(root)),
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and path.name != "memorization_manifest.json"
+    }
+
+
+def require_memorization_gate(
+    path: Path,
+    *,
+    expected_provenance: Mapping[str, object] | None = None,
+) -> VerifiedMemorizationEvidence:
+    """Reject a missing, altered, or provenance-mismatched gate before use."""
+
+    root = Path(path)
+    manifest_path = root / "memorization_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("memorization success manifest is missing or invalid") from exc
+    if not isinstance(manifest, dict) or manifest.get("format_version") != 2:
+        raise ValueError("memorization success manifest format is invalid")
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("memorization success provenance is invalid")
+    if expected_provenance is not None and provenance != dict(expected_provenance):
+        raise ValueError("memorization success provenance changed")
+    evidence = manifest.get("evidence")
+    if not isinstance(evidence, dict) or evidence != _evidence_checksums(root):
+        raise ValueError("memorization evidence checksum changed")
+    rows = provenance.get("rows")
+    checks = manifest.get("checks")
+    config = provenance.get("run_config")
+    if not isinstance(rows, list) or len(rows) != 4 or not isinstance(checks, list) or not isinstance(config, dict):
+        raise ValueError("memorization success provenance is incomplete")
+    required_checks = config.get("required_consecutive_checks")
+    if required_checks != 3 or len(checks) < required_checks:
+        raise ValueError("memorization success checks are incomplete")
+    identities = [row.get("source_relative_path") for row in rows if isinstance(row, dict)]
+    if len(identities) != 4 or len(set(identities)) != 4 or any(not isinstance(item, str) for item in identities):
+        raise ValueError("memorization row provenance is invalid")
+    for check in checks[-required_checks:]:
+        if not isinstance(check, dict) or not isinstance(check.get("samples"), list):
+            raise ValueError("memorization check evidence is invalid")
+        samples = check["samples"]
+        if len(samples) != 4 or {sample.get("source_relative_path") for sample in samples if isinstance(sample, dict)} != set(identities):
+            raise ValueError("memorization check sample identities changed")
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("correct_tokens") != sample.get("target_tokens") or not isinstance(sample.get("target_tokens"), int) or sample["target_tokens"] < 1:
+                raise ValueError("memorization check is not exact per sample")
+    return VerifiedMemorizationEvidence(root, manifest)
     return MemorizationReport(
         root,
         steps,

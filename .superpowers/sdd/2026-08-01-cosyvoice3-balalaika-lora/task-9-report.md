@@ -29,3 +29,26 @@
 ## Deliberately not run
 
 No real model, GPU, corpus, training run, install, upload, or credential access was performed.
+
+## Fix Round 1: audit hardening
+
+### Root cause
+
+- The runner accepted the model loss as any tensor and immediately called `Accelerator.backward`; NaN and infinities therefore reached optimizer/scheduler progress and only surfaced when strict JSON evidence publication rejected the non-finite float.
+- The v1 manifest recorded only selected provenance fields and listed diagnostic names without checksums; there was no downstream require function to validate artifacts and compare expected provenance.
+
+### TDD evidence
+
+1. RED: `rtk python -m unittest tests.finetune.balalaika.test_memorization.MemorizationSelectionTests.test_nonfinite_training_loss_stops_before_backward_or_optimizer_progress -v` reproduced NaN, `+Inf`, and `-Inf` reaching `_publish_success`; JSON rejected each value after optimization, not before it.
+2. GREEN: `_loss` now requires exactly one finite value before backward, clipping, AdamW/scheduler stepping, evaluation, or publication. The test passes and proves zero fake-Accelerate backward/clip calls, unchanged model weight, and no success directory for all three values.
+3. RED: the new identity/evidence tests initially failed with missing `require_memorization_gate` and absent manifest `provenance`/`evidence` fields.
+4. GREEN: the v2 success manifest binds validated `max_steps`, LR, grad norm, fixed AdamW hyperparameters, constant scheduler spec, bf16, one accumulation step, eight ranks, local/effective batch sizes, evaluation cadence, three-check rule, seed, loader/tokenizer identities, base checksum, selected rows, fixed LoRA settings, and audited trainables. It records relative paths and SHA-256 values for every diagnostic artifact.
+5. RED: a final provenance test failed until tokenizer identity and adapter audit were moved into the compared provenance object.
+6. GREEN: `require_memorization_gate` now rejects missing/invalid manifests, changed expected provenance, missing/extra/tampered evidence, incomplete row provenance, and non-exact final checks. Focused memorization/model tests passed 30 tests.
+7. RED/GREEN: the complete-config assertion exposed omitted AdamW execution defaults; `foreach=None`, `capturable=False`, `differentiable=False`, and `fused=None` are now explicit, immutable request fields and serialized with the remaining optimizer trajectory settings.
+
+### Verification
+
+- `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -v` — 30 passed.
+- `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -v` — 125 passed.
+- `rtk python -m compileall -q cosyvoice/finetune/balalaika/memorization.py cosyvoice/llm/llm.py` and `rtk git diff --check` passed.
