@@ -490,12 +490,51 @@ class AccelerateTrainingTests(unittest.TestCase):
                         {"utts": ["only"], "target": torch.tensor([1.0])}
                     ],
                     accelerator_factory=FakeAccelerator,
+                    validation_index_base=16,
+                    initial_adapter_sha256="a" * 64,
                 ),
                 api.TrainingCallbacks(validate=lambda event: indices.append(event.validation_index)),
             )
 
         self.assertTrue(result.completed)
         self.assertEqual(indices, list(range(17, 41)))
+        self.assertEqual(result.progress.validation_index, 40)
+
+    def test_validation_index_base_is_literal_and_phase_bound(self) -> None:
+        api = _api()
+        common = {
+            "model": ToyAdapterModel([]),
+            "eligible_samples": 1,
+            "cache_checksum": "c" * 64,
+            "checkpoint_root": Path("unused"),
+            "token_limit": 2_000,
+            "accumulation_steps": 1,
+            "dataloader_factory": lambda _epoch, _accelerator: [],
+        }
+        self.assertEqual(
+            api.TrainRequest(phase=PhaseSpec.for_phase(1), validation_index_base=None, **common).validation_index_base,
+            0,
+        )
+        self.assertEqual(
+            api.TrainRequest(
+                phase=PhaseSpec.for_phase(2), validation_index_base=None,
+                initial_adapter_sha256="a" * 64, **common,
+            ).validation_index_base,
+            16,
+        )
+        for phase, changed in ((1, 16), (2, 0)):
+            with self.subTest(phase=phase), self.assertRaisesRegex(ValueError, "validation_index_base"):
+                api.TrainRequest(
+                    phase=PhaseSpec.for_phase(phase), validation_index_base=changed,
+                    initial_adapter_sha256=None if phase == 1 else "a" * 64,
+                    **common,
+                )
+        with self.assertRaisesRegex(ValueError, "fresh no-op"):
+            api.TrainRequest(
+                phase=PhaseSpec.for_phase(1), initial_adapter_sha256="a" * 64, **common,
+            )
+        with self.assertRaisesRegex(ValueError, "phase-1 adapter"):
+            api.TrainRequest(phase=PhaseSpec.for_phase(2), initial_adapter_sha256=None, **common)
 
     def test_checkpoint_records_complete_identity_rng_and_state_checksums(self) -> None:
         api = _api()
@@ -530,6 +569,7 @@ class AccelerateTrainingTests(unittest.TestCase):
                 "cache_manifest_sha256",
                 "dataloader_identity",
                 "eligible_samples",
+                "initial_adapter_sha256",
                 "lora",
                 "max_grad_norm",
                 "phase",
@@ -538,6 +578,7 @@ class AccelerateTrainingTests(unittest.TestCase):
                 "sampler_window_size",
                 "scheduler",
                 "token_limit",
+                "validation_index_base",
                 "world_size",
             },
         )
@@ -568,7 +609,13 @@ class AccelerateTrainingTests(unittest.TestCase):
             first = api.train_phase(request, api.TrainingCallbacks(validate=lambda event: False))
             for changed in (
                 replace(request, resume_from=first.checkpoint, cache_checksum="d" * 64),
-                replace(request, resume_from=first.checkpoint, phase=PhaseSpec.for_phase(2)),
+                replace(
+                    request,
+                    resume_from=first.checkpoint,
+                    phase=PhaseSpec.for_phase(2),
+                    validation_index_base=16,
+                    initial_adapter_sha256="a" * 64,
+                ),
                 replace(request, resume_from=first.checkpoint, eligible_samples=2),
                 replace(request, resume_from=first.checkpoint, max_grad_norm=2.0),
                 replace(request, resume_from=first.checkpoint, token_limit=3000),

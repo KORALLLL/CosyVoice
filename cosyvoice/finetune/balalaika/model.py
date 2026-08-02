@@ -1435,10 +1435,10 @@ def _validate_phase2_training_identity(value: object, adapter: Mapping[str, obje
     from cosyvoice.finetune.balalaika.config import PhaseSpec
 
     fields = {
-        "cache_manifest_sha256", "phase", "phase_spec", "eligible_samples",
+        "cache_manifest_sha256", "phase", "phase_spec", "eligible_samples", "initial_adapter_sha256",
         "base_checkpoint_sha256", "lora", "token_limit", "accumulation_steps",
         "max_grad_norm", "sampler_seed", "sampler_window_size", "dataloader_identity",
-        "scheduler", "world_size",
+        "scheduler", "validation_index_base", "world_size",
     }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("phase-2 training identity schema is invalid")
@@ -1451,6 +1451,9 @@ def _validate_phase2_training_identity(value: object, adapter: Mapping[str, obje
         raise ValueError("phase-2 training base checksum differs from the adapter")
     if value.get("scheduler") != {"kind": "constant-v1"}:
         raise ValueError("phase-2 training scheduler identity is invalid")
+    if value.get("validation_index_base") != 16 or isinstance(value.get("validation_index_base"), bool):
+        raise ValueError("phase-2 training validation index base must be exactly 16")
+    _require_digest(value.get("initial_adapter_sha256"), "phase-2 training phase-1 adapter lineage checksum")
     for name in ("eligible_samples", "token_limit", "accumulation_steps", "sampler_window_size"):
         item = value.get(name)
         if isinstance(item, bool) or not isinstance(item, int) or item < 1:

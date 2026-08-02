@@ -344,6 +344,18 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(items[0].voice_id, "voice_00")
         self.assertEqual(items[20].voice_id, "voice_00")
 
+    def test_public_committed_verifier_never_regenerates_or_relogs(self) -> None:
+        api = _api()
+        request, report, logger = self._published_final_validation()
+        with (
+            mock.patch.object(api, "require_memorization_gate", return_value=object()),
+            mock.patch.object(request.synthesizer, "synthesize", side_effect=AssertionError("must not generate")),
+            mock.patch.object(logger, "log", side_effect=AssertionError("must not relog")),
+        ):
+            evidence = api.verify_committed_evaluation(request, wandb_logger=logger)
+        self.assertEqual(evidence.report.identity_checksum, report.identity_checksum)
+        self.assertEqual(evidence.wandb.run_id, "run-123")
+
     def test_assignment_refuses_anything_except_exact_fixed_inputs(self) -> None:
         api = _api()
 

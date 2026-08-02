@@ -207,6 +207,7 @@ class FinalMergeTests(unittest.TestCase):
             "phase": 2,
             "phase_spec": asdict(PhaseSpec.for_phase(2)),
             "eligible_samples": 800,
+            "initial_adapter_sha256": "1" * 64,
             "base_checkpoint_sha256": self.adapter.base_checkpoint_sha256,
             "lora": {"r": 64, "alpha": 128, "dropout": 0.05, "bias": "none"},
             "token_limit": 4096,
@@ -216,6 +217,7 @@ class FinalMergeTests(unittest.TestCase):
             "sampler_window_size": 128,
             "dataloader_identity": "cosyvoice.balalaika.cached-rank-loader:v1",
             "scheduler": {"kind": "constant-v1"},
+            "validation_index_base": 16,
             "world_size": 8,
         }
 
@@ -346,6 +348,8 @@ class FinalMergeTests(unittest.TestCase):
             "extra": lambda identity: identity.update({"unexpected": True}),
             "phase-spec": lambda identity: identity["phase_spec"].update({"epochs": 2}),
             "scheduler": lambda identity: identity.update({"scheduler": {"kind": "cosine"}}),
+            "validation-base": lambda identity: identity.update({"validation_index_base": 0}),
+            "initial-adapter": lambda identity: identity.update({"initial_adapter_sha256": None}),
             "world-size": lambda identity: identity.update({"world_size": 4}),
             "eligible-bool": lambda identity: identity.update({"eligible_samples": True}),
             "gradient-nan": lambda identity: identity.update({"max_grad_norm": float("nan")}),

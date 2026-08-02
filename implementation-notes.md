@@ -116,3 +116,15 @@
 - Decision: Validate the complete staged final directory before publication and again afterward. Matching retries are idempotent; corrupt, incomplete, differently sourced, or consistently resealed-but-semantically-invalid artifacts are refused.
 - Validation: Merge tests pass 36/36, evaluation plus merge tests pass 70/70, model tests pass 24/24, and all Balalaika tests pass 200/200. Independent scoped review found no remaining issues.
 - Follow-up: Real CosyVoice3/GigaAM CUDA inference remains part of hardware qualification; no production export or training has run.
+
+## 2026-08-02 - Task 12 two-phase launch workflow
+
+- Decision: Expose exactly two operator shell launchers; both route phase execution through the pinned eight-process BF16 Accelerate config, while `--status` uses the same read-only Python state machine without launching workers.
+- Decision: Preserve the pilot-before-preprocessing contract with a deterministic four-row memorization mini-cache. Rank zero retains a bounded hash sample from each split, extracts duration-short/long rows, tokenizes only those four, and publishes a checksum-bound 2+2 cache before the full 519-shard cache is allowed.
+- Decision: Synchronize every main-only operation result/error and gather every collective result/error through one Accelerator context, preventing rank-local exceptions from letting peers enter a later collective.
+- Decision: Extend the immutable Task 8 identity with the exact global validation base (`0` for phase 1, `16` for phase 2) and phase-bound adapter lineage (`None` for phase 1, sealed phase-1 adapter SHA-256 for phase 2). Task 11 now requires the resulting exact 16-field phase-2 identity.
+- Decision: Store every Task 10 validation report identity and artifact inventory in phase evidence. Resume authentication uses a non-generating public Task 10 verifier to recompute the sealed report and require the live local ledger plus both remote W&B markers for validation 0 and the exact phase ranges 1–16 and 17–40.
+- Decision: Reuse one `WandbValidationLogger` per Accelerate launch. The separate phase-2 launch resumes the persisted W&B run with `resume="must"`; it never creates a second logical validation run.
+- Security: Hugging Face and W&B credentials remain environment-only. CLI/status configuration is recursively redacted for keys containing `TOKEN`, `KEY`, or `SECRET`, and the workflow has no Hub publication surface.
+- Validation: Focused Task 8/workflow/public-Task-10 tests pass 40/40; targeted Task 11 identity/export tests pass 17/17; all Balalaika tests pass 217/217; both shell launchers pass `bash -n`; Python compilation and whitespace checks pass.
+- Follow-up: No real network, CUDA, cache build, training, evaluation, export, or upload ran in Task 12. Real qualification still stops for manual pilot listening approval.

@@ -225,6 +225,42 @@ class WandbCommitEvidence:
     remote_markers: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class CommittedEvaluationEvidence:
+    """Authenticated local report and live W&B commit for any index 0--40."""
+
+    report: EvaluationReport
+    wandb: WandbCommitEvidence
+
+
+def verify_committed_evaluation(
+    request: EvaluationRequest,
+    *,
+    wandb_logger: "WandbValidationLogger",
+) -> CommittedEvaluationEvidence:
+    """Revalidate an existing Task 10 point without generating or logging it."""
+
+    if not isinstance(request, EvaluationRequest):
+        raise TypeError("request must be EvaluationRequest")
+    require_memorization_gate(
+        request.memorization_path,
+        expected_provenance=request.memorization_expected_provenance,
+    )
+    items = build_voice_assignment(request.rows, request.prompts)
+    assignment_checksum = _ensure_assignment_manifest(request, items)
+    identity = build_evaluation_identity(
+        request.validation_index,
+        items,
+        request.provenance,
+        asr_batch_size=request.asr_batch_size,
+    )
+    report = _require_published_report(request, items, identity, assignment_checksum)
+    if not isinstance(wandb_logger, WandbValidationLogger):
+        raise TypeError("committed evaluation requires WandbValidationLogger")
+    wandb = wandb_logger.verify_committed(report, request.validation_index)
+    return CommittedEvaluationEvidence(report, wandb)
+
+
 def final_validation_evidence_payload(evidence: FinalValidationEvidence) -> dict[str, object]:
     """Return the complete finalization evidence in JSON-safe canonical form."""
 

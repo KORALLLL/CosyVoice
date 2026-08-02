@@ -7,8 +7,9 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import re
 import shutil
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 import torch
 from torch import nn
@@ -144,6 +145,8 @@ class TrainRequest:
     sampler_seed: int = DEFAULT_SEED
     sampler_window_size: int = DEFAULT_LENGTH_WINDOW
     dataloader_identity: str = "cosyvoice.balalaika.cached-rank-loader:v1"
+    validation_index_base: int | None = None
+    initial_adapter_sha256: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -152,6 +155,25 @@ class TrainRequest:
             raise ValueError("phase must be an exact approved phase schedule") from exc
         if self.phase != approved_phase:
             raise ValueError("phase must be an exact approved phase schedule")
+        approved_validation_base = 0 if self.phase.number == 1 else 16
+        if self.validation_index_base is None:
+            object.__setattr__(self, "validation_index_base", approved_validation_base)
+        elif (
+            isinstance(self.validation_index_base, bool)
+            or not isinstance(self.validation_index_base, int)
+            or self.validation_index_base != approved_validation_base
+        ):
+            raise ValueError(
+                f"phase {self.phase.number} validation_index_base must be {approved_validation_base}"
+            )
+        if self.phase.number == 1:
+            if self.initial_adapter_sha256 is not None:
+                raise ValueError("phase 1 must start from a fresh no-op adapter")
+        elif (
+            not isinstance(self.initial_adapter_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.initial_adapter_sha256) is None
+        ):
+            raise ValueError("phase 2 requires the authenticated phase-1 adapter SHA-256")
         if type(self.scheduler_spec) is not SchedulerSpec:
             raise ValueError("scheduler_spec must be a SchedulerSpec")
         if isinstance(self.eligible_samples, bool) or self.eligible_samples < 1:
@@ -204,8 +226,10 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
     scheduler = _build_scheduler(optimizer, request.scheduler_spec)
     run_identity = _identity(request, accelerator)
 
-    initial_validation = 0 if request.phase.number == 1 else 16
-    progress = ProgressState(phase=request.phase.number, validation_index=initial_validation)
+    progress = ProgressState(
+        phase=request.phase.number,
+        validation_index=cast(int, request.validation_index_base),
+    )
     resume_manifest: Mapping[str, object] | None = None
     if request.resume_from is not None:
         resume_manifest = _require_resume_manifest(Path(request.resume_from), run_identity, request.phase.number)
@@ -583,6 +607,7 @@ def _identity(request: TrainRequest, accelerator: Any) -> dict[str, object]:
         "phase": request.phase.number,
         "phase_spec": asdict(request.phase),
         "eligible_samples": request.eligible_samples,
+        "initial_adapter_sha256": request.initial_adapter_sha256,
         "base_checkpoint_sha256": base_checksum,
         "lora": asdict(settings),
         "token_limit": request.token_limit,
@@ -592,6 +617,7 @@ def _identity(request: TrainRequest, accelerator: Any) -> dict[str, object]:
         "sampler_window_size": request.sampler_window_size,
         "dataloader_identity": request.dataloader_identity,
         "scheduler": asdict(request.scheduler_spec),
+        "validation_index_base": request.validation_index_base,
         "world_size": accelerator.num_processes,
     }
 
