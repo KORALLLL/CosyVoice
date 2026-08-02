@@ -570,6 +570,7 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "production_ready": False,
             "base_assets": base_assets,
             "base_assets_sha256": _canonical_mapping_sha256(base_assets),
+            "task10_evidence": asdict(lineage["validation_evidence"]) if lineage["validation_evidence"] is not None else None,
             "code_revision": _code_revision(),
         }
         manifest_path = temporary / "final_model_manifest.json"
@@ -824,7 +825,11 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
     if not request.test_mode:
         from cosyvoice.finetune.balalaika.evaluation import verify_final_validation_evidence
 
-        verify_final_validation_evidence(
+        request_summary = getattr(request.validation_request, "summary_json", None)
+        if not isinstance(request_summary, Path) or request_summary.resolve() != request.validation_summary.resolve():
+            raise ValueError("production export validation_summary must be exactly Task 10 request.summary_json")
+
+        evidence = verify_final_validation_evidence(
             request.validation_request,
             expected_checkpoint_sha256=checkpoint_sha256,
             expected_model_state_sha256=model_state_sha256,
@@ -840,6 +845,7 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
         "checkpoint_sha256": checkpoint_sha256,
         "model_state_sha256": model_state_sha256,
         "validation_sha256": sha256_file(request.validation_summary),
+        "validation_evidence": evidence if not request.test_mode else None,
     }
 
 
