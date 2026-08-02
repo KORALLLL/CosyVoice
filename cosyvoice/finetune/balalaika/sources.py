@@ -1,0 +1,477 @@
+"""Read-only canonical Balalaika sidecar join and deterministic split plans."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import subprocess
+import tarfile
+from typing import Iterable, Iterator, Mapping, TextIO
+
+from .artifacts import atomic_write_json, sha256_file
+from .config import RunPaths
+
+
+COMBINED_SIDECAR_RELATIVE = Path("combined_sidecars/rover-punctuation-stress-v1/rover-punctuation-stress.jsonl")
+ROVER_ARCHIVE_RELATIVE = Path("punctuation_artifacts/20260729T135419Z/balalaika-rover-results-20260729T135419Z.tar.zst")
+SCHEMA_VERSION = "rover-punctuation-stress-v1"
+INSTRUCT = "You are a helpful assistant.<|endofprompt|>"
+EXPECTED_SOURCE_TARS = 519
+EXPECTED_SOURCE_ROWS = 4_075_032
+EXPECTED_NULL_ROWS = 309
+PROMPT_RESERVATION_COUNT = 20
+MAX_ROWS_PER_SHARD = 8_000
+
+_SOURCE_PATH = re.compile(r"(?P<shard>\d{6})/(?P<name>[^/]+\.mp3)")
+
+
+class SourceIntegrityError(RuntimeError):
+    """Raised when a supposedly canonical corpus input cannot be reconciled."""
+
+
+@dataclass(frozen=True)
+class JoinedRow:
+    """The auditable text/agreement record for one source MP3."""
+
+    source_relative_path: str
+    text: str
+    agreement: float | None
+    instruct: str = INSTRUCT
+    phase: int | None = None
+    reserved: bool = False
+    reservation_score: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceInventory:
+    """Checksummed immutable inputs required to construct one split plan."""
+
+    source_archives: tuple[Path, ...]
+    source_archive_sha256: Mapping[str, str]
+    combined_sidecar: Path
+    combined_sha256: str
+    rover_archive: Path
+    rover_sha256: str
+
+
+@dataclass(frozen=True)
+class SplitCounts:
+    """Reconciled split totals and the published plan location."""
+
+    phase1: int
+    phase2: int
+    null: int
+    reserved: int
+    model_limit_exclusions: int
+    total: int
+    plan_dir: Path
+    manifest_sha256: str
+
+
+@dataclass
+class _JoinAudit:
+    combined_rows: int = 0
+    rover_rows: int = 0
+
+
+def inventory_sources(paths: RunPaths) -> SourceInventory:
+    """Validate the exact immutable archive set and checksum every input file."""
+
+    train_dir = paths.dataset_root / "train"
+    archives = tuple(sorted(train_dir.glob("shard_*.tar")))
+    expected_names = {f"shard_{shard:06d}.tar" for shard in range(EXPECTED_SOURCE_TARS)}
+    if {archive.name for archive in archives} != expected_names:
+        raise SourceIntegrityError(f"expected exactly {EXPECTED_SOURCE_TARS} source tar archives named shard_000000.tar through shard_000518.tar")
+
+    combined = paths.dataset_root / COMBINED_SIDECAR_RELATIVE
+    rover = paths.dataset_root / ROVER_ARCHIVE_RELATIVE
+    if not combined.is_file():
+        raise SourceIntegrityError(f"missing combined sidecar: {combined}")
+    if not rover.is_file():
+        raise SourceIntegrityError(f"missing ROVER archive: {rover}")
+
+    return SourceInventory(
+        source_archives=archives,
+        source_archive_sha256={archive.name: sha256_file(archive) for archive in archives},
+        combined_sidecar=combined,
+        combined_sha256=sha256_file(combined),
+        rover_archive=rover,
+        rover_sha256=sha256_file(rover),
+    )
+
+
+def reservation_score(source_relative_path: str, seed: int) -> bytes:
+    """Return the order-independent selection key prescribed for prompt clips."""
+
+    material = f"{seed}\0{source_relative_path}".encode("utf-8")
+    return hashlib.sha256(material).digest()
+
+
+def reserve_prompt_ids(rows: Iterable[JoinedRow], count: int = PROMPT_RESERVATION_COUNT, seed: int = 1986) -> tuple[str, ...]:
+    """Select the ``count`` lexicographically lowest deterministic prompt scores."""
+
+    if count < 0:
+        raise ValueError("prompt reservation count must be non-negative")
+    selected: list[tuple[bytes, str]] = []
+    for row in rows:
+        if row.agreement is None or row.agreement < 0.95 or _model_limit_excluded(row):
+            continue
+        candidate = (reservation_score(row.source_relative_path, seed), row.source_relative_path)
+        if len(selected) < count:
+            selected.append(candidate)
+            selected.sort(reverse=True)
+        elif count and candidate < selected[0]:
+            selected[0] = candidate
+            selected.sort(reverse=True)
+    return tuple(source_relative_path for _, source_relative_path in sorted(selected))
+
+
+def assign_phases(rows: Iterable[JoinedRow], reserved: set[str]) -> list[JoinedRow]:
+    """Assign only non-null, non-reserved rows to their literal agreement phase."""
+
+    assigned: list[JoinedRow] = []
+    for row in rows:
+        if row.agreement is None:
+            assigned.append(replace(row, phase=None, reserved=False, reservation_score=None))
+        elif row.source_relative_path in reserved:
+            assigned.append(replace(row, phase=None, reserved=True))
+        elif row.agreement < 0.95:
+            assigned.append(replace(row, phase=1, reserved=False, reservation_score=None))
+        else:
+            assigned.append(replace(row, phase=2, reserved=False, reservation_score=None))
+    return assigned
+
+
+def build_split_plan(paths: RunPaths, seed: int = 1986) -> SplitCounts:
+    """Publish a per-source-shard plan only after full canonical reconciliation."""
+
+    inventory = inventory_sources(paths)
+    first_audit = _JoinAudit()
+    selected_ids = reserve_prompt_ids(_iter_joined_rows(inventory, first_audit), PROMPT_RESERVATION_COUNT, seed)
+    if first_audit.combined_rows != EXPECTED_SOURCE_ROWS or first_audit.rover_rows != EXPECTED_SOURCE_ROWS:
+        raise SourceIntegrityError(
+            "canonical sidecar row counts must both equal "
+            f"{EXPECTED_SOURCE_ROWS}, got combined={first_audit.combined_rows}, ROVER={first_audit.rover_rows}"
+        )
+    if len(selected_ids) != PROMPT_RESERVATION_COUNT:
+        raise SourceIntegrityError(f"expected exactly {PROMPT_RESERVATION_COUNT} reservable phase-2 prompt rows, got {len(selected_ids)}")
+
+    plan_dir = paths.run_root / "split_plan"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    counts, shard_sha256, selected_scores = _write_split_rows(inventory, plan_dir, set(selected_ids), seed)
+    if counts.null != EXPECTED_NULL_ROWS:
+        raise SourceIntegrityError(f"expected exactly {EXPECTED_NULL_ROWS} null agreement rows, got {counts.null}")
+    if counts.reserved != PROMPT_RESERVATION_COUNT:
+        raise SourceIntegrityError(f"expected exactly {PROMPT_RESERVATION_COUNT} reserved rows, got {counts.reserved}")
+    if counts.total != EXPECTED_SOURCE_ROWS:
+        raise SourceIntegrityError(f"split total must equal {EXPECTED_SOURCE_ROWS}, got {counts.total}")
+    if counts.phase1 + counts.phase2 + counts.null + counts.reserved + counts.model_limit_exclusions != EXPECTED_SOURCE_ROWS:
+        raise SourceIntegrityError("phase/null/reserved/model-limit counts do not reconcile to the canonical source total")
+
+    manifest_path = plan_dir / "manifest.json"
+    atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "seed": seed,
+            "phase1": counts.phase1,
+            "phase2": counts.phase2,
+            "null": counts.null,
+            "reserved": counts.reserved,
+            "model_limit_exclusions": counts.model_limit_exclusions,
+            "total": counts.total,
+            "source_inventory": {
+                "source_archives": dict(inventory.source_archive_sha256),
+                "combined_sidecar": str(inventory.combined_sidecar),
+                "combined_sha256": inventory.combined_sha256,
+                "rover_archive": str(inventory.rover_archive),
+                "rover_sha256": inventory.rover_sha256,
+            },
+            "plan_shards": shard_sha256,
+            "reserved_prompts": [
+                {"source_relative_path": source_relative_path, "reservation_score": selected_scores[source_relative_path]}
+                for source_relative_path in selected_ids
+            ],
+        },
+    )
+    return replace(counts, manifest_sha256=sha256_file(manifest_path))
+
+
+def iter_split_rows(plan_dir: Path, shard: int) -> Iterator[JoinedRow]:
+    """Yield one shard's published plan rows without loading other shards."""
+
+    if shard < 0 or shard >= EXPECTED_SOURCE_TARS:
+        raise ValueError(f"invalid split-plan shard: {shard}")
+    path = plan_dir / f"shard_{shard:06d}.jsonl"
+    if not path.is_file():
+        raise SourceIntegrityError(f"missing split-plan shard: {path}")
+    with path.open(encoding="utf-8") as handle:
+        for number, line in enumerate(handle, start=1):
+            data = _json_mapping(line, path, number)
+            yield JoinedRow(
+                source_relative_path=_source_relative_path(data, path, number),
+                text=_string_field(data, "text", path, number),
+                instruct=_string_field(data, "instruct", path, number),
+                agreement=_agreement(data, path, number),
+                phase=_phase(data, path, number),
+                reserved=_bool_field(data, "reserved", path, number),
+                reservation_score=_optional_string_field(data, "reservation_score", path, number),
+            )
+
+
+def _write_split_rows(
+    inventory: SourceInventory, plan_dir: Path, reserved_ids: set[str], seed: int
+) -> tuple[SplitCounts, dict[str, str], dict[str, str]]:
+    counts = SplitCounts(0, 0, 0, 0, 0, 0, plan_dir, "")
+    shard_sha256: dict[str, str] = {}
+    scores: dict[str, str] = {}
+    current_shard: int | None = None
+    handle: TextIO | None = None
+    partial: Path | None = None
+
+    def close_current() -> None:
+        nonlocal handle, partial
+        if handle is None or partial is None or current_shard is None:
+            return
+        handle.flush()
+        handle.close()
+        completed = plan_dir / f"shard_{current_shard:06d}.jsonl"
+        partial.replace(completed)
+        shard_sha256[completed.name] = sha256_file(completed)
+        handle = None
+        partial = None
+
+    try:
+        for row in _iter_joined_rows(inventory, _JoinAudit()):
+            shard = _shard_number(row.source_relative_path)
+            if current_shard != shard:
+                close_current()
+                current_shard = shard
+                partial = plan_dir / f".shard_{shard:06d}.jsonl.partial"
+                if partial.exists():
+                    partial.unlink()
+                handle = partial.open("w", encoding="utf-8")
+            is_model_excluded = _model_limit_excluded(row)
+            score = reservation_score(row.source_relative_path, seed).hex() if row.source_relative_path in reserved_ids else None
+            assigned = assign_phases([row], reserved_ids)[0]
+            assigned = replace(assigned, reservation_score=score)
+            if is_model_excluded:
+                assigned = replace(assigned, phase=None, reserved=False, reservation_score=None)
+                counts = replace(counts, model_limit_exclusions=counts.model_limit_exclusions + 1)
+            elif assigned.reserved:
+                scores[assigned.source_relative_path] = score or ""
+                counts = replace(counts, reserved=counts.reserved + 1)
+            elif assigned.phase == 1:
+                counts = replace(counts, phase1=counts.phase1 + 1)
+            elif assigned.phase == 2:
+                counts = replace(counts, phase2=counts.phase2 + 1)
+            else:
+                counts = replace(counts, null=counts.null + 1)
+            counts = replace(counts, total=counts.total + 1)
+            assert handle is not None
+            handle.write(json.dumps(_row_json(assigned), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n")
+        close_current()
+    except Exception:
+        if handle is not None:
+            handle.close()
+        if partial is not None and partial.exists():
+            partial.unlink()
+        raise
+    return counts, shard_sha256, scores
+
+
+def _iter_joined_rows(inventory: SourceInventory, audit: _JoinAudit) -> Iterator[JoinedRow]:
+    rover_rows = iter(_iter_rover_rows(inventory.rover_archive))
+    rover = next(rover_rows, None)
+    for shard, combined in _iter_combined_groups(inventory.combined_sidecar, audit):
+        if rover is not None and _shard_number(_source_relative_path(rover, inventory.rover_archive, 0)) < shard:
+            raise SourceIntegrityError("combined and ROVER join keys differ")
+        seen_rover: set[str] = set()
+        while rover is not None and _shard_number(_source_relative_path(rover, inventory.rover_archive, 0)) == shard:
+            audit.rover_rows += 1
+            source_relative_path = _source_relative_path(rover, inventory.rover_archive, audit.rover_rows)
+            if source_relative_path in seen_rover:
+                raise SourceIntegrityError(f"duplicate ROVER source_relative_path: {source_relative_path}")
+            seen_rover.add(source_relative_path)
+            combined_row = combined.pop(source_relative_path, None)
+            if combined_row is None:
+                raise SourceIntegrityError("combined and ROVER join keys differ")
+            text = _string_field(combined_row, "rover_punctuated_accented", inventory.combined_sidecar, audit.combined_rows)
+            agreement = _agreement(rover, inventory.rover_archive, audit.rover_rows, required=True)
+            yield JoinedRow(source_relative_path=source_relative_path, text=text, agreement=agreement)
+            rover = next(rover_rows, None)
+        if combined:
+            raise SourceIntegrityError("combined and ROVER join keys differ")
+    if rover is not None:
+        raise SourceIntegrityError("combined and ROVER join keys differ")
+
+
+def _iter_combined_groups(path: Path, audit: _JoinAudit) -> Iterator[tuple[int, dict[str, Mapping[str, object]]]]:
+    current_shard: int | None = None
+    rows: dict[str, Mapping[str, object]] = {}
+    with path.open(encoding="utf-8") as handle:
+        for number, line in enumerate(handle, start=1):
+            row = _json_mapping(line, path, number)
+            _schema(row, path, number)
+            source_relative_path = _source_relative_path(row, path, number)
+            shard = _shard_number(source_relative_path)
+            if current_shard is not None and shard < current_shard:
+                raise SourceIntegrityError("combined sidecar shards are not in ascending order")
+            if current_shard is not None and shard != current_shard:
+                yield current_shard, rows
+                rows = {}
+            current_shard = shard
+            audit.combined_rows += 1
+            if source_relative_path in rows:
+                raise SourceIntegrityError(f"duplicate combined source_relative_path: {source_relative_path}")
+            rows[source_relative_path] = row
+            if len(rows) > MAX_ROWS_PER_SHARD:
+                raise SourceIntegrityError(f"combined shard {shard:06d} exceeds {MAX_ROWS_PER_SHARD} rows")
+    if current_shard is not None:
+        yield current_shard, rows
+
+
+def _iter_rover_rows(path: Path) -> Iterator[Mapping[str, object]]:
+    if path.suffix == ".jsonl":
+        with path.open(encoding="utf-8") as handle:
+            for number, line in enumerate(handle, start=1):
+                row = _json_mapping(line, path, number)
+                _schema(row, path, number)
+                yield row
+        return
+
+    process: subprocess.Popen[bytes] | None = None
+    archive: tarfile.TarFile | None = None
+    try:
+        process = subprocess.Popen(["unzstd", "-c", str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if process.stdout is None:
+            raise SourceIntegrityError("unzstd did not provide stdout")
+        archive = tarfile.open(fileobj=process.stdout, mode="r|")
+        for member in archive:
+            if not member.isfile() or not member.name.endswith(".jsonl"):
+                continue
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise SourceIntegrityError(f"cannot read ROVER archive member: {member.name}")
+            for number, raw in enumerate(extracted, start=1):
+                row = _json_mapping(raw.decode("utf-8"), path, number)
+                _schema(row, path, number)
+                yield row
+        archive.close()
+        archive = None
+        process.stdout.close()
+        return_code = process.wait()
+        if return_code != 0:
+            raise SourceIntegrityError(f"unzstd failed while reading ROVER archive with exit code {return_code}")
+    except (OSError, UnicodeDecodeError, tarfile.TarError, json.JSONDecodeError) as exc:
+        raise SourceIntegrityError(f"cannot stream ROVER archive: {path}") from exc
+    finally:
+        if archive is not None:
+            archive.close()
+        if process is not None:
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+            process.wait()
+
+
+def _schema(row: Mapping[str, object], path: Path, number: int) -> None:
+    if row.get("schema_version") != SCHEMA_VERSION:
+        raise SourceIntegrityError(f"unexpected schema version in {path}:{number}")
+
+
+def _json_mapping(line: str, path: Path, number: int) -> Mapping[str, object]:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SourceIntegrityError(f"invalid JSON in {path}:{number}") from exc
+    if not isinstance(value, dict):
+        raise SourceIntegrityError(f"expected JSON object in {path}:{number}")
+    return value
+
+
+def _source_relative_path(row: Mapping[str, object], path: Path, number: int) -> str:
+    value = row.get("source_relative_path")
+    match = _SOURCE_PATH.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise SourceIntegrityError(f"invalid source_relative_path in {path}:{number}")
+    if int(match.group("shard")) >= EXPECTED_SOURCE_TARS:
+        raise SourceIntegrityError(f"source_relative_path outside canonical tar range in {path}:{number}")
+    return value
+
+
+def _string_field(row: Mapping[str, object], field: str, path: Path, number: int) -> str:
+    value = row.get(field)
+    if not isinstance(value, str) or not value:
+        raise SourceIntegrityError(f"missing non-empty {field} in {path}:{number}")
+    return value
+
+
+def _optional_string_field(row: Mapping[str, object], field: str, path: Path, number: int) -> str | None:
+    value = row.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SourceIntegrityError(f"invalid {field} in {path}:{number}")
+    return value
+
+
+def _agreement(row: Mapping[str, object], path: Path, number: int, *, required: bool = False) -> float | None:
+    if "asr_agreement_mean" in row:
+        value = row["asr_agreement_mean"]
+    elif "agreement" in row:
+        value = row["agreement"]
+    elif required:
+        raise SourceIntegrityError(f"missing agreement in {path}:{number}")
+    else:
+        value = None
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
+        raise SourceIntegrityError(f"non-finite agreement in {path}:{number}")
+    return float(value)
+
+
+def _phase(row: Mapping[str, object], path: Path, number: int) -> int | None:
+    value = row.get("phase")
+    if value is None:
+        return None
+    if value not in (1, 2):
+        raise SourceIntegrityError(f"invalid phase in {path}:{number}")
+    return int(value)
+
+
+def _bool_field(row: Mapping[str, object], field: str, path: Path, number: int) -> bool:
+    value = row.get(field)
+    if not isinstance(value, bool):
+        raise SourceIntegrityError(f"invalid {field} in {path}:{number}")
+    return value
+
+
+def _shard_number(source_relative_path: str) -> int:
+    match = _SOURCE_PATH.fullmatch(source_relative_path)
+    assert match is not None
+    return int(match.group("shard"))
+
+
+def _model_limit_excluded(row: JoinedRow) -> bool:
+    """Task 2 has no tokenizer-dependent limits; reject no valid canonical row."""
+
+    return False
+
+
+def _row_json(row: JoinedRow) -> dict[str, object]:
+    return {
+        "source_relative_path": row.source_relative_path,
+        "text": row.text,
+        "instruct": row.instruct,
+        "agreement": row.agreement,
+        "phase": row.phase,
+        "reserved": row.reserved,
+        "reservation_score": row.reservation_score,
+    }
