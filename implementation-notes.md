@@ -13,3 +13,10 @@
 - Decision: Reject any base-model path containing an `_RL` path component, including nested checkpoint paths.
 - Validation: Task 1 focused unit tests pass 14/14; Python compilation and whitespace checks pass.
 - Follow-up: The specified Flake8 check could not run because neither the executable nor module is installed; no package was installed during implementation.
+
+## 2026-08-02 - Task 2 corpus split planning
+
+- Decision: Apply the CosyVoice3 recipe's authoritative 1–200 Qwen text-token limit before prompt reservation; load the production tokenizer lazily and keep a private injection boundary for fixture tests.
+- Decision: Accept only the canonical `asr_agreement_mean` field for phase assignment; legacy `agreement` input is rejected.
+- Validation: Task 1+2 focused unit tests pass 27/27; scoped re-review approved the model-limit and canonical-schema fixes.
+- Follow-up: Actual 4,075,032-row source reconciliation remains a real-data qualification step; Task 2 tests intentionally use fixtures.
