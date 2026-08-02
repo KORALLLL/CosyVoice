@@ -36,3 +36,11 @@
 - Decision: Reject directory and other non-file tar members as unexpected input rather than silently skipping them.
 - Validation: Cache tests pass 11/11 and all Balalaika tests pass 50/50; scoped re-review approved prompt reconciliation and transactional recovery.
 - Follow-up: Real source decoding and cache generation remain gated behind tokenizer pilot approval and hardware qualification.
+
+## 2026-08-02 - Task 5 tokenizer and pilot gate
+
+- Decision: Treat missing, erroring, empty, or CPU-only ONNX provider reports as fatal; a tokenizer session is usable only when CUDA execution is positively verified.
+- Decision: Pilot approval is revalidated against every recorded listening artifact checksum, not only the pilot stage JSON.
+- Decision: Cache completion is reconciled against the canonical source-archive shard set; worker results and pre-existing manifests cannot introduce or omit shards.
+- Validation: Tokenizer tests pass 12/12 and all Balalaika tests pass 62/62; scoped re-review approved provider, pilot-artifact, lease-result, and exact-shard-set controls.
+- Follow-up: No real pilot or approval exists yet; real CUDA qualification and manual listening remain mandatory before corpus tokenization.
