@@ -20,3 +20,11 @@
 - Decision: Accept only the canonical `asr_agreement_mean` field for phase assignment; legacy `agreement` input is rejected.
 - Validation: Task 1+2 focused unit tests pass 27/27; scoped re-review approved the model-limit and canonical-schema fixes.
 - Follow-up: Actual 4,075,032-row source reconciliation remains a real-data qualification step; Task 2 tests intentionally use fixtures.
+
+## 2026-08-02 - Task 3 hard-number validation contract
+
+- Decision: The global credential policy overrides the draft helper signature; `fetch_validation_rows` reads `HF_TOKEN` internally and accepts no credential argument.
+- Decision: Treat empty raw-text anchors as strict utterance boundaries so valid leading and trailing number phrases remain scoreable.
+- Decision: Validate the temporary private-dataset Parquet and all 2,000 number spans before publishing either final artifact.
+- Validation: All Balalaika unit tests pass 39/39; scoped re-review approved atomic cleanup, typed schema provenance, boundary spans, and environment-only authentication.
+- Follow-up: The real authenticated 2,000-row fetch remains deferred to qualification and must use a rotated environment token.
