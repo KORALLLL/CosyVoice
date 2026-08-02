@@ -154,3 +154,9 @@
 - Security: The operator guide contains placeholders only, requires rotation of the credential exposed during design, keeps HF/W&B secrets environment-only, and explicitly defers every upload.
 - Validation: The review-strengthened integration test passes 1/1 in 78.539 seconds; focused workflow tests pass 20/20; and all Balalaika tests pass 227/227 in 250.756 seconds. Both shell launchers pass `bash -n`; Python compilation, exact two-script inventory, diff/whitespace, and long-line checks pass. Top-level discovery remains at the approved baseline 23/24 because `asset/qwen_ref_4.wav` is absent. `flake8` is not installed in the current environment, so that optional check could not run.
 - Follow-up: No network, real tokenization, CUDA/GPU training, real validation generation, online W&B logging, production export, or upload was run. Task 14 must stop after generating the real pilot and wait for explicit user listening approval.
+
+### Fix round 1
+
+- Changed: The tiny fixture patches the workflow's validation-generation constant to its eight-row benchmark only for the fixture invocation. Its backend rejects any different count and publishes the actual `EvaluationReport.row_count`, preventing scaled reports from claiming the production 2,000-generation contract.
+- Decision: Read the committed validation-0, phase-1, and phase-2 stage evidence back from the authenticated workflow store and independently require both all 41 report row counts and all 41 persisted evidence counts to equal eight.
+- Validation: The strengthened integration test passes 1/1 in 78.039 seconds, the unchanged production workflow contract passes 20/20 with 2,000 generations at all 41 points, and all Balalaika tests pass 227/227 in 255.710 seconds.

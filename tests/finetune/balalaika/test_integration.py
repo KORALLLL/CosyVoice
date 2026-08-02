@@ -46,6 +46,8 @@ class BalalaikaRecipeIntegrationTests(unittest.TestCase):
             self.assertTrue(result.phase_resumed_after_interruption)
             self.assertTrue(result.phase2_loaded_sealed_phase1_adapter)
             self.assertEqual(result.evaluate_checkpoint_calls, 41)
+            self.assertEqual(result.evaluation_report_row_counts, (8,) * 41)
+            self.assertEqual(result.stage_evidence_row_counts, (8,) * 41)
             self.assertEqual(result.wandb_mode, "offline")
             self.assertEqual(result.upload_calls, 0)
 

@@ -63,6 +63,8 @@ class TinyWorkflowResult:
     phase_resumed_after_interruption: bool
     phase2_loaded_sealed_phase1_adapter: bool
     evaluate_checkpoint_calls: int
+    evaluation_report_row_counts: tuple[int, ...]
+    stage_evidence_row_counts: tuple[int, ...]
     wandb_mode: str
     upload_calls: int
 
@@ -376,6 +378,7 @@ class _TinyWorkflowBackend:
         self.memorization_verified = False
         self.validation_indices: list[int] = []
         self.evaluate_checkpoint_calls = 0
+        self.evaluation_report_row_counts: list[int] = []
         self.phase1_adapter_sha256: str | None = None
         self.phase2_checkpoint: Path | None = None
         self.final_manifest: Path | None = None
@@ -511,13 +514,14 @@ class _TinyWorkflowBackend:
         return {"mode": "offline", "logger_class": self.wandb_logger.__class__.__name__}
 
     def evaluate(self, options: WorkflowOptions, validation_index: int, generations: int) -> dict[str, object]:
-        if generations != 2_000:
-            raise ValueError("workflow validation generation contract changed")
+        if generations != self.benchmark_rows:
+            raise ValueError("tiny workflow must scale validation generations to its benchmark row count")
         report = self._evaluate_checkpoint(options, validation_index)
+        self.evaluation_report_row_counts.append(report.row_count)
         self.validation_indices.append(validation_index)
         return {
             "validation_index": validation_index,
-            "generations": generations,
+            "generations": report.row_count,
             "summary": str(report.summary_json),
             "summary_sha256": sha256_file(report.summary_json),
             "identity_sha256": report.identity_checksum,
@@ -619,7 +623,7 @@ class _TinyWorkflowBackend:
 
         def validate(event: object) -> bool:
             self._evaluation_checkpoint = Path(getattr(event, "checkpoint"))
-            evidence = self.evaluate(options, int(getattr(event, "validation_index")), 2_000)
+            evidence = self.evaluate(options, int(getattr(event, "validation_index")), self.benchmark_rows)
             validations.append(evidence)
             return phase.number != 1 or int(getattr(event, "validation_index")) < 3
 
@@ -658,7 +662,7 @@ class _TinyWorkflowBackend:
 
     def _resume_validate(self, options: WorkflowOptions, event: object, validations: list[dict[str, object]]) -> bool:
         self._evaluation_checkpoint = Path(getattr(event, "checkpoint"))
-        validations.append(self.evaluate(options, int(getattr(event, "validation_index")), 2_000))
+        validations.append(self.evaluate(options, int(getattr(event, "validation_index")), self.benchmark_rows))
         return True
 
     def export(self, options: WorkflowOptions, phase2: dict[str, object]) -> dict[str, object]:
@@ -722,6 +726,8 @@ def run_tiny_workflow(
 
     with mock.patch.object(HfApi, "upload_file", side_effect=trap), mock.patch.object(
         HfApi, "upload_folder", side_effect=trap
+    ), mock.patch(
+        "cosyvoice.finetune.balalaika.workflow.VALIDATION_GENERATIONS", benchmark_rows
     ), mock.patch.dict(os.environ, {"WANDB_API_KEY": "offline-fixture-key"}, clear=False):
         calls.append("run_phase1")
         first_exit = run_phase1(argparse.Namespace(options=options, backend=backend))
@@ -732,11 +738,13 @@ def run_tiny_workflow(
         calls.append("run_phase2")
         phase2_exit = run_phase2(argparse.Namespace(options=options, backend=backend))
 
-    complete = StageStore(
+    workflow_store = StageStore(
         paths.run_root / "workflow_stages",
         dependency_lock={"workflow_version": "cosyvoice3-balalaika-two-phase-v1"},
         input_provenance=_workflow_identity_for_fixture(options),
-    ).require("complete")
+    )
+    complete = workflow_store.require("complete")
+    stage_evidence_row_counts = _committed_evidence_row_counts(workflow_store)
     assert backend.final_manifest is not None and backend.phase2_checkpoint is not None
     final_payload = json.loads(backend.final_manifest.read_text(encoding="utf-8"))
     return TinyWorkflowResult(
@@ -766,6 +774,8 @@ def run_tiny_workflow(
         phase_resumed_after_interruption=backend.phase_interrupted,
         phase2_loaded_sealed_phase1_adapter=backend.phase2_loaded,
         evaluate_checkpoint_calls=backend.evaluate_checkpoint_calls,
+        evaluation_report_row_counts=tuple(backend.evaluation_report_row_counts),
+        stage_evidence_row_counts=stage_evidence_row_counts,
         wandb_mode="offline",
         upload_calls=trap.calls,
     )
@@ -775,6 +785,14 @@ def _workflow_identity_for_fixture(options: WorkflowOptions) -> dict[str, object
     from cosyvoice.finetune.balalaika.workflow import _workflow_identity
 
     return _workflow_identity(options)
+
+
+def _committed_evidence_row_counts(store: StageStore) -> tuple[int, ...]:
+    validation_zero = store.require("validation_00").payload["evidence"]
+    phase1 = store.require("phase1_complete").payload["evidence"]
+    phase2 = store.require("phase2_training").payload["evidence"]
+    evidence = [validation_zero, *phase1["validations"], *phase2["validations"]]
+    return tuple(int(item["generations"]) for item in evidence)
 
 
 def _prepare_base(base_dir: Path) -> CosyVoice3LM:
