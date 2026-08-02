@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import tempfile
 import types
@@ -14,7 +16,9 @@ import wave
 import torch
 
 from cosyvoice.finetune.balalaika.artifacts import sha256_file
+from cosyvoice.finetune.balalaika import evaluation as evaluation_api
 from cosyvoice.finetune.balalaika import model as api
+from tests.finetune.balalaika import test_evaluation as evaluation_fixtures
 from tests.finetune.balalaika.test_model import _logits, tiny_cosyvoice3_llm
 
 
@@ -150,6 +154,76 @@ class FinalMergeTests(unittest.TestCase):
         with mock.patch.object(api, "load_base_llm", side_effect=lambda _: copy.deepcopy(self.fresh_base)):
             return api.export_final_llm(self.export_request)
 
+    def _production_export_request(self, name="production-final"):
+        root = self.root / name
+        rows = evaluation_fixtures._rows()
+        prompts = evaluation_fixtures._prompts(root / "prompts")
+        checkpoint = json.loads((self.phase2 / "checkpoint_manifest.json").read_text(encoding="utf-8"))
+        provenance = evaluation_api.EvaluationProvenance(
+            checkpoint_sha256=api.checkpoint_identity_sha256(checkpoint),
+            model_state_sha256=api.model_state_identity_sha256(checkpoint["state_files"]),
+            adapter_sha256=self.adapter.weights_sha256,
+            base_checkpoint_sha256=self.adapter.base_checkpoint_sha256,
+            benchmark_snapshot_sha256="5" * 64,
+            benchmark_revision="private-revision-1",
+            asr_config=evaluation_fixtures._FakeRecognizer().provenance(),
+            synthesis_config=evaluation_fixtures._FakeSynthesizer().provenance(),
+            code_version="commit-a",
+            config_version="balalaika-v1",
+        )
+        remote = evaluation_fixtures._seal_remote_records(
+            evaluation_api,
+            evaluation_fixtures._remote_records(root),
+            rows,
+            prompts,
+            provenance,
+            validation_index=40,
+        )
+        accelerator = evaluation_fixtures._FakeAccelerator(remote)
+        accelerator.run.resumed = True
+        evaluation_api.atomic_write_json(root / "wandb-run.json", {"format_version": 1, "run_id": "run-123"})
+        logger = evaluation_fixtures._logger(evaluation_api, accelerator, root)
+        request = evaluation_api.EvaluationRequest(
+            rows=rows,
+            prompts=prompts,
+            accelerator=accelerator,
+            synthesizer=evaluation_fixtures._FakeSynthesizer(),
+            recognizer=evaluation_fixtures._FakeRecognizer(),
+            provenance=provenance,
+            validation_index=40,
+            output_jsonl=root / "validation-40/results.jsonl",
+            summary_json=root / "validation-40/summary.json",
+            panel_dir=root / "validation-40/listening-panel",
+            temporary_audio_dir=root / "validation-40/audio",
+            assignment_manifest=root / "voice-assignment.json",
+            memorization_path=root / "memorization",
+            wandb_logger=logger,
+        )
+        items = evaluation_api.build_voice_assignment(rows, prompts)
+        assignment = evaluation_api._semantic_assignment(items)
+        evaluation_api.atomic_write_json(
+            request.assignment_manifest,
+            {
+                "format_version": 1,
+                "assignment_sha256": evaluation_api._canonical_sha256(assignment),
+                "rows": 2_000,
+                "voices": 20,
+                "assignment": assignment,
+            },
+        )
+        with mock.patch.object(evaluation_api, "require_memorization_gate", return_value=object()):
+            evaluation_api.evaluate_checkpoint(request)
+        return api.ExportRequest(
+            base_model_dir=self.base_dir,
+            phase2_checkpoint=self.phase2,
+            validation_summary=request.summary_json,
+            output_dir=self.root / f"{name}-export",
+            validation_request=request,
+            wandb_run_manifest=root / "wandb-run.json",
+            wandb_logger=logger,
+            expected_training_identity=checkpoint["identity"],
+        )
+
     def test_merged_checkpoint_has_original_keys_only(self):
         manifest = self._export()
 
@@ -174,6 +248,53 @@ class FinalMergeTests(unittest.TestCase):
         seal.write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "validation"):
             self._export()
+
+    def test_production_export_consumes_authenticated_task10_prompt_schema(self):
+        with mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"}):
+            request = self._production_export_request()
+            with (
+                mock.patch.object(api, "load_base_llm", side_effect=lambda _: copy.deepcopy(self.fresh_base)),
+                mock.patch.object(evaluation_api, "GigaAmRecognizer", return_value=evaluation_fixtures._FakeRecognizer()),
+                mock.patch.object(api, "_normal_cosyvoice3_pipeline", side_effect=lambda view, factory: _Pipeline(view)),
+            ):
+                manifest = api.export_final_llm(request)
+
+        payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+        strict = json.loads((manifest.path.parent / "strict-verification/strict-verification.json").read_text(encoding="utf-8"))
+        normalized, expected_inventory_sha256 = evaluation_api.authenticated_prompt_inventory(request.validation_request.prompts)
+        self.assertTrue(manifest.production_ready)
+        self.assertTrue(payload["production_ready"])
+        self.assertEqual(payload["prompt_inventory_sha256"], expected_inventory_sha256)
+        self.assertEqual(strict["prompt_source"], "task10_validation_request")
+        self.assertEqual(strict["selected_voices"], [value["voice_id"] for value in normalized[:4]])
+
+    def test_production_export_rejects_different_validation_summary_path(self):
+        with mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"}):
+            request = self._production_export_request("summary-path")
+            copied_summary = self.root / "copied-task10/summary.json"
+            copied_summary.parent.mkdir(parents=True)
+            copied_summary.write_bytes(request.validation_summary.read_bytes())
+            copied_seal = copied_summary.with_name("validation-success.json")
+            seal = json.loads(request.validation_summary.with_name("validation-success.json").read_text(encoding="utf-8"))
+            seal["artifacts"]["summary_json"] = sha256_file(copied_summary)
+            evaluation_api.atomic_write_json(copied_seal, seal)
+            changed = replace(request, validation_summary=copied_summary)
+
+            with self.assertRaisesRegex(ValueError, "exactly Task 10"):
+                api.export_final_llm(changed)
+
+    def test_production_export_rejects_task10_checkpoint_or_model_state_mismatch(self):
+        with mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"}):
+            request = self._production_export_request("provenance-mismatch")
+            for field in ("checkpoint_sha256", "model_state_sha256"):
+                with self.subTest(field=field):
+                    provenance = replace(request.validation_request.provenance, **{field: "f" * 64})
+                    changed = replace(
+                        request,
+                        validation_request=replace(request.validation_request, provenance=provenance),
+                    )
+                    with self.assertRaisesRegex(evaluation_api.EvaluationIntegrityError, "lineage"):
+                        api.export_final_llm(changed)
 
     def test_strict_loader_accepts_merged_checkpoint(self):
         manifest = self._export()

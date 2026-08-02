@@ -676,10 +676,10 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
             "llm_sha256": request.final_manifest.llm_sha256,
             "strict_load": True,
             "smoke_utterances": 4,
-            "prompt_inventory_sha256": _canonical_mapping_sha256({"voices": [
+            "prompt_inventory_sha256": _canonical_mapping_sha256([
                 {"voice_id": value["voice_id"], "prompt_text": value["prompt_text"], "prompt_sha256": value["prompt_sha256"]}
                 for value in inventory
-            ]}),
+            ]),
             "selected_voices": [value["voice_id"] for value in voices],
             "prompt_source": "test_fixture" if request.test_mode else "task10_validation_request",
             "audio": [
@@ -740,7 +740,7 @@ def build_base_asset_manifest(base_dir: Path) -> dict[str, object]:
     return {"format_version": 1, "base_dir_name": base_dir.name, "files": entries}
 
 
-def _canonical_mapping_sha256(value: Mapping[str, object]) -> str:
+def _canonical_mapping_sha256(value: object) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 

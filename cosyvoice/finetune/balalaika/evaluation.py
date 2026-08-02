@@ -1479,17 +1479,26 @@ def _wandb_remote_markers(
     history_reader: Callable[[Any, Sequence[str]], Any],
 ) -> dict[str, object]:
     result = {scalar_marker: None, media_marker: None}
+    committed_rows: list[dict[str, object]] = []
     try:
         for row in history_reader(run, [scalar_marker, media_marker]):
             if not isinstance(row, Mapping):
                 raise WandbSyncError("W&B remote history returned an invalid marker row")
-            for name in result:
-                if row.get(name) is not None:
-                    result[name] = row[name]
+            values = {name: row.get(name) for name in result}
+            present = tuple(value is not None for value in values.values())
+            if present == (False, False):
+                continue
+            if present != (True, True):
+                raise WandbSyncError("W&B remote validation markers are missing or changed")
+            committed_rows.append(values)
     except WandbSyncError:
         raise
     except Exception as exc:
         raise WandbSyncError("W&B remote commit marker query failed") from exc
+    if len(committed_rows) > 1:
+        raise WandbSyncError("W&B remote validation markers are ambiguous")
+    if committed_rows:
+        result.update(committed_rows[0])
     return result
 
 

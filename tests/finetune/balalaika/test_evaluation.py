@@ -5,11 +5,13 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+from types import MappingProxyType
 import unittest
 from unittest import mock
 import wave
@@ -249,6 +251,17 @@ def _wandb_report(api, root, prompts):
     )
 
 
+def _committed_wandb(api, root, prompts, *, validation_index=40):
+    root.mkdir(parents=True, exist_ok=True)
+    report = replace(_wandb_report(api, root, prompts), validation_index=validation_index)
+    accelerator = _FakeAccelerator()
+    accelerator.run.resumed = True
+    api.atomic_write_json(root / "wandb-run.json", {"format_version": 1, "run_id": "run-123"})
+    logger = _logger(api, accelerator, root)
+    logger.log(report, validation_index)
+    return report, accelerator, logger
+
+
 class _FailingLogger:
     def log(self, report, validation_index) -> None:
         raise _api().WandbSyncError("offline")
@@ -266,6 +279,55 @@ class EvaluationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.environment.stop()
         self.temporary.cleanup()
+
+    def _published_final_validation(self, name="final-validation", *, provenance=None):
+        api = _api()
+        root = self.root / name
+        synthesizer = _FakeSynthesizer()
+        provenance = provenance or _provenance(api, synthesizer=synthesizer)
+        remote = _seal_remote_records(
+            api,
+            _remote_records(root),
+            self.rows_2000,
+            self.prompts_20,
+            provenance,
+            validation_index=40,
+        )
+        accelerator = _FakeAccelerator(remote)
+        accelerator.run.resumed = True
+        api.atomic_write_json(root / "wandb-run.json", {"format_version": 1, "run_id": "run-123"})
+        logger = _logger(api, accelerator, root)
+        request = api.EvaluationRequest(
+            rows=self.rows_2000,
+            prompts=self.prompts_20,
+            accelerator=accelerator,
+            synthesizer=synthesizer,
+            recognizer=_FakeRecognizer(),
+            provenance=provenance,
+            validation_index=40,
+            output_jsonl=root / "validation-40/results.jsonl",
+            summary_json=root / "validation-40/summary.json",
+            panel_dir=root / "validation-40/listening-panel",
+            temporary_audio_dir=root / "validation-40/audio",
+            assignment_manifest=root / "voice-assignment.json",
+            memorization_path=root / "memorization",
+            wandb_logger=logger,
+        )
+        items = api.build_voice_assignment(self.rows_2000, self.prompts_20)
+        assignment = api._semantic_assignment(items)
+        api.atomic_write_json(
+            request.assignment_manifest,
+            {
+                "format_version": 1,
+                "assignment_sha256": api._canonical_sha256(assignment),
+                "rows": 2_000,
+                "voices": 20,
+                "assignment": assignment,
+            },
+        )
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            report = api.evaluate_checkpoint(request)
+        return request, report, logger
 
     def test_each_benchmark_row_is_generated_once(self) -> None:
         api = _api()
@@ -377,6 +439,102 @@ class EvaluationTests(unittest.TestCase):
             api.build_evaluation_identity(0, items, _provenance(api)).sha256,
             api.build_evaluation_identity(0, changed, _provenance(api)).sha256,
         )
+
+    def test_final_validation_authenticates_exact_real_prompt_inventory(self) -> None:
+        api = _api()
+        request, report, logger = self._published_final_validation()
+
+        normalized, inventory_sha256 = api.authenticated_prompt_inventory(self.prompts_20)
+        evidence = api.verify_final_validation_evidence(
+            request,
+            expected_checkpoint_sha256=request.provenance.checkpoint_sha256,
+            expected_model_state_sha256=request.provenance.model_state_sha256,
+            expected_base_checkpoint_sha256=request.provenance.base_checkpoint_sha256,
+            expected_adapter_sha256=request.provenance.adapter_sha256,
+            wandb_logger=logger,
+        )
+
+        expected_inventory = [
+            {
+                "voice_id": f"voice_{index:02d}",
+                "prompt_text": f"prompt {index}",
+                "prompt_sha256": self.prompts_20[index]["wav_sha256"],
+            }
+            for index in range(20)
+        ]
+        expected_sha256 = hashlib.sha256(
+            json.dumps(expected_inventory, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(inventory_sha256, expected_sha256)
+        self.assertEqual(evidence.prompt_inventory_sha256, expected_sha256)
+        self.assertEqual(evidence.identity_sha256, report.identity_checksum)
+        self.assertEqual(len(normalized), 20)
+        self.assertEqual(set(normalized[0]), {"voice_id", "prompt_text", "prompt_wav", "prompt_sha256"})
+        self.assertIsInstance(normalized[0]["prompt_wav"], Path)
+        self.assertTrue(all(api._is_pcm_24khz_mono(value["prompt_wav"]) for value in normalized))
+
+    def test_final_validation_rejects_prompt_text_or_freshly_rehashed_wav(self) -> None:
+        api = _api()
+        request, _, logger = self._published_final_validation()
+
+        changed_text = [dict(prompt) for prompt in self.prompts_20]
+        changed_text[0]["text"] = "подменённый текст"
+        with self.subTest("changed prompt text"):
+            with self.assertRaises(api.EvaluationIntegrityError):
+                api.verify_final_validation_evidence(
+                    replace(request, prompts=changed_text),
+                    expected_checkpoint_sha256=request.provenance.checkpoint_sha256,
+                    expected_model_state_sha256=request.provenance.model_state_sha256,
+                    expected_base_checkpoint_sha256=request.provenance.base_checkpoint_sha256,
+                    expected_adapter_sha256=request.provenance.adapter_sha256,
+                    wandb_logger=logger,
+                )
+
+        replacement_wav = self.root / "freshly-rehashed.wav"
+        replacement_wav.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(replacement_wav), "wb") as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(24_000)
+            stream.writeframes(b"\x01\x00" * 16)
+        changed_wav = [dict(prompt) for prompt in self.prompts_20]
+        changed_wav[0]["audio_path"] = replacement_wav
+        changed_wav[0]["wav_sha256"] = hashlib.sha256(replacement_wav.read_bytes()).hexdigest()
+        with self.subTest("changed WAV with matching fresh checksum"):
+            with self.assertRaises(api.EvaluationIntegrityError):
+                api.verify_final_validation_evidence(
+                    replace(request, prompts=changed_wav),
+                    expected_checkpoint_sha256=request.provenance.checkpoint_sha256,
+                    expected_model_state_sha256=request.provenance.model_state_sha256,
+                    expected_base_checkpoint_sha256=request.provenance.base_checkpoint_sha256,
+                    expected_adapter_sha256=request.provenance.adapter_sha256,
+                    wandb_logger=logger,
+                )
+
+    def test_authenticated_prompt_inventory_rejects_missing_or_duplicate_voice(self) -> None:
+        api = _api()
+        with self.assertRaisesRegex(api.EvaluationIntegrityError, "exact"):
+            api.authenticated_prompt_inventory(self.prompts_20[:-1])
+        duplicate = [dict(prompt) for prompt in self.prompts_20]
+        duplicate[-1]["voice_id"] = "voice_00"
+        with self.assertRaisesRegex(api.EvaluationIntegrityError, "exact"):
+            api.authenticated_prompt_inventory(duplicate)
+
+    def test_final_validation_rejects_checkpoint_and_model_state_provenance_mismatch(self) -> None:
+        api = _api()
+        request, _, logger = self._published_final_validation()
+        expected = {
+            "expected_checkpoint_sha256": request.provenance.checkpoint_sha256,
+            "expected_model_state_sha256": request.provenance.model_state_sha256,
+            "expected_base_checkpoint_sha256": request.provenance.base_checkpoint_sha256,
+            "expected_adapter_sha256": request.provenance.adapter_sha256,
+        }
+
+        for field in ("expected_checkpoint_sha256", "expected_model_state_sha256"):
+            with self.subTest(field=field):
+                changed = {**expected, field: "f" * 64}
+                with self.assertRaisesRegex(api.EvaluationIntegrityError, "lineage"):
+                    api.verify_final_validation_evidence(request, wandb_logger=logger, **changed)
 
     def test_wandb_remote_history_uses_api_run_not_active_run(self) -> None:
         api = _api()
@@ -1028,6 +1186,169 @@ class EvaluationTests(unittest.TestCase):
         commit = json.loads((self.root / "wandb-validation-commits/validation-00.json").read_text(encoding="utf-8"))
         self.assertTrue(commit["committed"])
         self.assertNotIn("secret", json.dumps(manifest) + json.dumps(commit))
+
+    def test_wandb_verify_committed_returns_exact_authenticated_evidence(self) -> None:
+        api = _api()
+        root = self.root / "verified"
+        report, accelerator, logger = _committed_wandb(api, root, self.prompts_20)
+
+        evidence = logger.verify_committed(report, 40)
+
+        artifacts = {
+            "results_jsonl": hashlib.sha256(report.output_jsonl.read_bytes()).hexdigest(),
+            "summary_json": hashlib.sha256(report.summary_json.read_bytes()).hexdigest(),
+            "panel_manifest": hashlib.sha256((report.panel_dir / "manifest.json").read_bytes()).hexdigest(),
+            "validation_seal": hashlib.sha256(report.summary_json.with_name("validation-success.json").read_bytes()).hexdigest(),
+        }
+        metrics_sha256 = hashlib.sha256(
+            json.dumps(report.metrics, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        expected_context = {
+            "evaluation_identity_sha256": "b" * 64,
+            "assignment_sha256": "a" * 64,
+            "artifact_checksums": artifacts,
+            "metrics_sha256": metrics_sha256,
+        }
+        expected_marker = hashlib.sha256(
+            json.dumps(expected_context, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(evidence.run_id, "run-123")
+        self.assertEqual(evidence.context, expected_context)
+        self.assertEqual(evidence.marker, expected_marker)
+        self.assertEqual(
+            evidence.remote_markers,
+            {
+                "validation/commit/40/scalars": expected_marker,
+                "validation/commit/40/media": expected_marker,
+            },
+        )
+        self.assertEqual(evidence.run_manifest_sha256, hashlib.sha256((root / "wandb-run.json").read_bytes()).hexdigest())
+        self.assertEqual(evidence.ledger_sha256, hashlib.sha256(evidence.ledger_path.read_bytes()).hexdigest())
+        self.assertEqual(len(accelerator.run.history), 1)
+
+    def test_wandb_verify_committed_rejects_local_remote_and_context_mismatches(self) -> None:
+        api = _api()
+
+        def committed(name):
+            return _committed_wandb(api, self.root / name, self.prompts_20)
+
+        with self.subTest("incomplete local ledger"):
+            report, _, logger = committed("incomplete-ledger")
+            ledger_path = logger.commit_dir / "validation-40.json"
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger["committed"] = False
+            api.atomic_write_json(ledger_path, ledger)
+            with self.assertRaisesRegex(api.WandbSyncError, "incomplete"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("forged local ledger"):
+            report, _, logger = committed("forged-ledger")
+            ledger_path = logger.commit_dir / "validation-40.json"
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger["metrics_sha256"] = "f" * 64
+            api.atomic_write_json(ledger_path, ledger)
+            with self.assertRaisesRegex(api.WandbSyncError, "changed"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("missing remote markers"):
+            report, accelerator, logger = committed("missing-remote")
+            accelerator.run.history.clear()
+            with self.assertRaisesRegex(api.WandbSyncError, "missing or changed"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("wrong remote markers"):
+            report, accelerator, logger = committed("wrong-remote")
+            accelerator.run.history[0]["validation/commit/40/scalars"] = "f" * 64
+            with self.assertRaisesRegex(api.WandbSyncError, "missing or changed"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("half remote marker"):
+            report, accelerator, logger = committed("half-remote")
+            accelerator.run.history[0].pop("validation/commit/40/media")
+            with self.assertRaisesRegex(api.WandbSyncError, "missing or changed"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("split half remote markers"):
+            report, accelerator, logger = committed("split-half-remote")
+            row = accelerator.run.history.pop()
+            accelerator.run.history.extend(
+                [
+                    {"_step": 40, "validation/commit/40/scalars": row["validation/commit/40/scalars"]},
+                    {"_step": 40, "validation/commit/40/media": row["validation/commit/40/media"]},
+                ]
+            )
+            with self.assertRaisesRegex(api.WandbSyncError, "missing or changed"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("active run mismatch"):
+            report, accelerator, logger = committed("active-run")
+            accelerator.run.id = "different-run"
+            with self.assertRaisesRegex(api.WandbSyncError, "run ID changed"):
+                logger.verify_committed(report, 40)
+
+        with self.subTest("report index mismatch"):
+            report, _, logger = committed("report-index")
+            with self.assertRaisesRegex(api.WandbSyncError, "index"):
+                logger.verify_committed(report, 39)
+
+        with self.subTest("report context mismatch"):
+            report, _, logger = committed("report-context")
+            changed = replace(report, metrics={**report.metrics, "utt-wer": 0.9})
+            with self.assertRaisesRegex(api.WandbSyncError, "changed"):
+                logger.verify_committed(changed, 40)
+
+        with self.subTest("report artifact mismatch"):
+            report, _, logger = committed("report-artifact")
+            changed = replace(report, artifact_checksums={**report.artifact_checksums, "summary_json": "f" * 64})
+            with self.assertRaisesRegex(api.WandbSyncError, "checksums changed"):
+                logger.verify_committed(changed, 40)
+
+    def test_final_validation_evidence_payload_is_deeply_json_safe(self) -> None:
+        api = _api()
+        root = self.root / "json-safe"
+        report, _, logger = _committed_wandb(api, root, self.prompts_20)
+        committed = logger.verify_committed(report, 40)
+        frozen = api.WandbCommitEvidence(
+            run_id=committed.run_id,
+            context=MappingProxyType({
+                **committed.context,
+                "artifact_checksums": MappingProxyType(dict(committed.context["artifact_checksums"])),
+            }),
+            marker=committed.marker,
+            run_manifest_sha256=committed.run_manifest_sha256,
+            ledger_path=committed.ledger_path,
+            ledger_sha256=committed.ledger_sha256,
+            remote_markers=MappingProxyType(dict(committed.remote_markers)),
+        )
+        evidence = api.FinalValidationEvidence(
+            identity_sha256="1" * 64,
+            artifact_checksums=MappingProxyType(dict(report.artifact_checksums)),
+            checkpoint_sha256="2" * 64,
+            model_state_sha256="3" * 64,
+            wandb=frozen,
+            prompt_inventory_sha256="4" * 64,
+        )
+
+        payload = api.final_validation_evidence_payload(evidence)
+        destination = root / "final-evidence.json"
+        api.atomic_write_json(destination, payload)
+        round_trip = json.loads(destination.read_text(encoding="utf-8"))
+
+        self.assertEqual(round_trip, payload)
+        self.assertEqual(round_trip["artifact_checksums"], dict(report.artifact_checksums))
+        self.assertEqual(round_trip["wandb"]["ledger_path"], str(committed.ledger_path))
+        self.assertEqual(round_trip["wandb"]["ledger_sha256"], hashlib.sha256(committed.ledger_path.read_bytes()).hexdigest())
+
+        def assert_plain(value):
+            self.assertNotIsInstance(value, (Path, MappingProxyType))
+            if isinstance(value, dict):
+                for child in value.values():
+                    assert_plain(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_plain(child)
+
+        assert_plain(payload)
 
     def test_wandb_remote_marker_survives_success_then_local_ledger_crash(self) -> None:
         api = _api()
