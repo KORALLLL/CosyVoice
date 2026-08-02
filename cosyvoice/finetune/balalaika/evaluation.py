@@ -211,6 +211,7 @@ class FinalValidationEvidence:
     checkpoint_sha256: str
     model_state_sha256: str
     wandb: "WandbCommitEvidence"
+    prompt_inventory_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,7 @@ def final_validation_evidence_payload(evidence: FinalValidationEvidence) -> dict
         "artifact_checksums": dict(evidence.artifact_checksums),
         "checkpoint_sha256": evidence.checkpoint_sha256,
         "model_state_sha256": evidence.model_state_sha256,
+        "prompt_inventory_sha256": evidence.prompt_inventory_sha256,
         "wandb": {
             "run_id": wandb.run_id,
             "context": _thaw_json(wandb.context),
@@ -261,6 +263,7 @@ def verify_final_validation_evidence(
     if not isinstance(request, EvaluationRequest) or request.validation_index != 40:
         raise EvaluationIntegrityError("final export requires Task 10 validation index 40")
     items = build_voice_assignment(request.rows, request.prompts)
+    _, prompt_inventory_sha256 = authenticated_prompt_inventory(request.prompts)
     identity = build_evaluation_identity(request.validation_index, items, request.provenance, asr_batch_size=request.asr_batch_size)
     expected = {
         "checkpoint_sha256": expected_checkpoint_sha256,
@@ -274,7 +277,7 @@ def verify_final_validation_evidence(
     if not isinstance(wandb_logger, WandbValidationLogger):
         raise TypeError("final validation evidence requires WandbValidationLogger")
     wandb = wandb_logger.verify_committed(report, 40)
-    return FinalValidationEvidence(identity.sha256, report.artifact_checksums, expected_checkpoint_sha256, expected_model_state_sha256, wandb)
+    return FinalValidationEvidence(identity.sha256, report.artifact_checksums, expected_checkpoint_sha256, expected_model_state_sha256, wandb, prompt_inventory_sha256)
 
 
 class WandbValidationLogger:
@@ -1706,6 +1709,19 @@ def _prompt_fields(prompt: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(checksum, str) or len(checksum) != 64 or sha256_file(path) != checksum:
         raise EvaluationIntegrityError(f"prompt WAV checksum changed for {voice_value}")
     return {"voice_id": voice_value, "audio_path": path, "text": text, "wav_sha256": checksum}
+
+
+def authenticated_prompt_inventory(prompts: Sequence[Mapping[str, object]]) -> tuple[tuple[Mapping[str, object], ...], str]:
+    """Normalize and authenticate the exact reserved Task 10 prompt inventory."""
+
+    values = tuple(sorted((_prompt_fields(prompt) for prompt in prompts), key=lambda item: str(item["voice_id"])))
+    expected = {f"voice_{index:02d}" for index in range(20)}
+    if len(values) != 20 or {value["voice_id"] for value in values} != expected:
+        raise EvaluationIntegrityError("prompt inventory must be exact voice_00 through voice_19")
+    if any(not _is_pcm_24khz_mono(value["audio_path"]) for value in values):
+        raise EvaluationIntegrityError("prompt inventory contains invalid PCM audio")
+    normalized = tuple({"voice_id": value["voice_id"], "prompt_text": value["text"], "prompt_wav": value["audio_path"], "prompt_sha256": value["wav_sha256"]} for value in values)
+    return normalized, _canonical_sha256([{"voice_id": item["voice_id"], "prompt_text": item["prompt_text"], "prompt_sha256": item["prompt_sha256"]} for item in normalized])
 
 
 def _require_gigaam_cuda(model: Any, local_rank: int) -> None:

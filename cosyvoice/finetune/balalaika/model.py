@@ -590,10 +590,11 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
                 pipeline_factory=request.pipeline_factory, test_mode=True,
             ))
         else:
-            from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer
+            from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer, authenticated_prompt_inventory
+            production_voices, _ = authenticated_prompt_inventory(request.validation_request.prompts)
             report = strict_verify_final_model(VerifyRequest(
                 base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=GigaAmRecognizer(),
-                voices=request.validation_request.prompts, output_dir=temporary / "strict-verification",
+                voices=production_voices, output_dir=temporary / "strict-verification",
             ))
         payload["strict_verification"] = {
             "report": "strict-verification/strict-verification.json",
