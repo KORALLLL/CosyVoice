@@ -1,13 +1,15 @@
 # Implementation Notes
 
-## 2026-08-02 - Distinguish combined-sidecar and ROVER schemas
+## 2026-08-02 - Validate canonical sidecar schemas
 
-- The real canonical ROVER archive and its repair manifest use integer
-  `schema_version: 1`; the combined normalized/stress-marked transcription
-  sidecar independently uses `"rover-punctuation-stress-v1"`.
-- Fixture-derived code incorrectly applied the combined-sidecar schema to both
-  sources. The two contracts are now validated separately and recorded in the
-  split manifest provenance. Cross-use is rejected in both directions.
+- The real canonical ROVER archive, ROVER repair manifest, combined
+  normalized/stress-marked sidecar, and combined-sidecar metadata all use
+  integer `schema_version: 1`. The `rover-punctuation-stress-v1` directory name
+  is a data-product label, not the JSON schema value.
+- Fixtures incorrectly used that directory label as their schema. The two
+  source contracts now remain separately named, both validate integer `1`, and
+  both are recorded in split-manifest provenance so they can diverge safely in
+  a future source revision.
 - The production launch stopped during preflight before publishing artifacts;
   no pilot, memorization, cache, validation, or training work ran.
 

@@ -18,7 +18,7 @@ from .config import RunPaths
 
 COMBINED_SIDECAR_RELATIVE = Path("combined_sidecars/rover-punctuation-stress-v1/rover-punctuation-stress.jsonl")
 ROVER_ARCHIVE_RELATIVE = Path("punctuation_artifacts/20260729T135419Z/balalaika-rover-results-20260729T135419Z.tar.zst")
-COMBINED_SCHEMA_VERSION = "rover-punctuation-stress-v1"
+COMBINED_SCHEMA_VERSION = 1
 ROVER_SCHEMA_VERSION = 1
 SPLIT_PLAN_SCHEMA_VERSION = "rover-punctuation-stress-v1"
 INSTRUCT = "You are a helpful assistant.<|endofprompt|>"

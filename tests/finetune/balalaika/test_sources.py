@@ -140,7 +140,7 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(manifest["phase1"] + manifest["phase2"] + manifest["null"] + manifest["reserved"] + manifest["model_limit_exclusions"], 3)
         self.assertEqual(
             manifest["source_schema_versions"],
-            {"combined_sidecar": "rover-punctuation-stress-v1", "rover_archive": 1},
+            {"combined_sidecar": 1, "rover_archive": 1},
         )
         rows = list(iter_split_rows(counts.plan_dir, 0))
         self.assertEqual([row.instruct for row in rows], [INSTRUCT, INSTRUCT, INSTRUCT])
@@ -162,10 +162,10 @@ class SourceTests(unittest.TestCase):
         with self.assertRaisesRegex(SourceIntegrityError, "schema version"):
             self._build_fixture_plan()
 
-    def test_combined_and_rover_schema_contracts_are_not_interchangeable(self) -> None:
+    def test_combined_and_rover_each_require_canonical_integer_schema(self) -> None:
         combined = self._combined_path()
         combined_rows = [json.loads(line) for line in combined.read_text(encoding="utf-8").splitlines()]
-        combined_rows[0]["schema_version"] = 1
+        combined_rows[0]["schema_version"] = "rover-punctuation-stress-v1"
         combined.write_text(
             "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in combined_rows),
             encoding="utf-8",
