@@ -34,11 +34,14 @@ class RunPaths:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "RunPaths":
         values = os.environ if env is None else env
+        base_model_dir = Path(values.get("BALALAIKA_BASE_MODEL_DIR", str(DEFAULT_BASE_MODEL_DIR)))
+        if "_RL" in base_model_dir.name.upper():
+            raise ValueError("BALALAIKA_BASE_MODEL_DIR must select the base/non-RL checkpoint")
         return cls(
             dataset_root=Path(values.get("BALALAIKA_DATASET_ROOT", str(DEFAULT_DATASET_ROOT))),
             repository_root=Path(values.get("BALALAIKA_REPOSITORY_ROOT", str(DEFAULT_REPOSITORY_ROOT))),
             run_root=Path(values.get("BALALAIKA_RUN_ROOT", str(DEFAULT_RUN_ROOT))),
-            base_model_dir=Path(values.get("BALALAIKA_BASE_MODEL_DIR", str(DEFAULT_BASE_MODEL_DIR))),
+            base_model_dir=base_model_dir,
             visible_devices=_parse_visible_devices(values.get("BALALAIKA_VISIBLE_DEVICES")),
             seed=_parse_seed(values.get("BALALAIKA_SEED")),
         )
@@ -115,13 +118,14 @@ def collect_environment() -> dict[str, object]:
     onnxruntime = import_module("onnxruntime")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
-    if torch.cuda.device_count() < 8:
-        raise RuntimeError("Balalaika recipe requires at least eight GPUs")
+    device_count = torch.cuda.device_count()
+    if device_count != 8:
+        raise RuntimeError(f"Balalaika recipe requires exactly eight GPUs, found {device_count}")
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 is unavailable")
 
     gpus: list[dict[str, object]] = []
-    for index in range(torch.cuda.device_count()):
+    for index in range(device_count):
         name = torch.cuda.get_device_name(index)
         capability = tuple(torch.cuda.get_device_capability(index))
         if "RTX 5090" not in name:

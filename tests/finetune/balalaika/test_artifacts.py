@@ -48,6 +48,10 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(paths.visible_devices, (2, 3))
         self.assertEqual(paths.seed, 7)
 
+    def test_run_paths_rejects_rl_base_model_override(self):
+        with self.assertRaisesRegex(ValueError, "base/non-RL"):
+            RunPaths.from_env({"BALALAIKA_BASE_MODEL_DIR": "/models/Fun-CosyVoice3-0.5B-2512_RL"})
+
     def test_atomic_write_replaces_complete_json_document(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "manifest.json"
@@ -150,6 +154,24 @@ class ArtifactTests(unittest.TestCase):
             patch("cosyvoice.finetune.balalaika.config._distribution_version", return_value="1.0.0"),
         ):
             with self.assertRaisesRegex(RuntimeError, "onnxruntime-gpu must be below 1.27"):
+                collect_environment()
+
+    def test_collect_environment_rejects_more_than_eight_gpus(self):
+        cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 9,
+            get_device_name=lambda index: "NVIDIA GeForce RTX 5090",
+            get_device_capability=lambda index: (12, 0),
+            is_bf16_supported=lambda: True,
+        )
+        torch = types.SimpleNamespace(__version__="2.8.0+cu128", version=types.SimpleNamespace(cuda="12.8"), cuda=cuda)
+        onnxruntime = types.SimpleNamespace(__version__="1.26.0", get_available_providers=lambda: ["CUDAExecutionProvider"])
+
+        with (
+            patch("cosyvoice.finetune.balalaika.config.import_module", side_effect=lambda name: {"torch": torch, "onnxruntime": onnxruntime}[name]),
+            patch("cosyvoice.finetune.balalaika.config._distribution_version", return_value="1.0.0"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exactly eight GPUs"):
                 collect_environment()
 
 
