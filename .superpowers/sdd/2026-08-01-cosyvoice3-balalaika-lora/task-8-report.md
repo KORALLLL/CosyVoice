@@ -308,3 +308,64 @@ exit 0
 ### Concerns and qualification boundary
 
 No model checkpoint, production data, credential, installation, upload, or other external work was used. The smoke remains real two-process CPU DDP through Accelerate; real eight-GPU BF16 behavior remains a hardware qualification boundary rather than a claim of this fix round.
+
+## Fix Round 5
+
+### Finding addressed
+
+Scheduler callable identity now rejects `IMPORT_NAME`, `IMPORT_FROM`, and `IMPORT_STAR` anywhere in the root callable or recursively nested code. This closes the runtime-local namespace bypass where `import builtins; builtins.globals()[name]` or `from builtins import globals` could discover mutable global values that were absent from the fingerprint.
+
+Direct `__import__`, `eval`, and `exec` rejection remains covered, and `compile` is now rejected by the same resolved-builtin identity check. Direct function namespace paths through `__globals__`, `__builtins__`, or `__getattribute__` are also rejected alongside `__dict__`. The production default lambda, statically resolved immutable globals, closures, defaults, and nested code retain their existing stable fingerprints.
+
+### TDD evidence
+
+Before the implementation change, root, from-import, nested, and import-star bytecode were all accepted. Direct `compile` and the three equivalent function-namespace paths were also accepted; direct `__import__`, `eval`, and `exec` already failed closed:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_runtime_imports_in_nested_code tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_dynamic_import_and_evaluation tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_unresolved_namespace_attributes -v
+Ran 3 tests in 0.055s
+FAILED (failures=8)
+```
+
+After the recursive opcode, builtin, and namespace-attribute validation:
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_runtime_imports_in_nested_code tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_dynamic_import_and_evaluation tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_unresolved_namespace_attributes -v
+Ran 3 tests in 0.063s
+OK
+```
+
+### Files and commit
+
+- `cosyvoice/finetune/balalaika/training.py`: rejects runtime import opcodes, `compile`, and direct unresolved function-namespace attributes.
+- `tests/finetune/balalaika/test_training.py`: covers inline and nested imports, from-import and import-star forms, `__import__`, `eval`, `exec`, `compile`, and direct function namespace paths.
+- Code/tests commit: `b196cf6bdc2c9ef9ba5828520cf059f16fc13039` (`fix: reject imported scheduler namespaces`).
+
+### Verification
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_runtime_imports_in_nested_code tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_dynamic_import_and_evaluation tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_unresolved_namespace_attributes tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_globals_dynamic_name_lookup tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_equivalent_dynamic_name_lookups tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_fingerprints_globals_in_nested_code tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_scheduler_identity_rejects_module_backed_mutable_attribute tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_default_lambda_scheduler_identity_is_stable_across_instances tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_lambda_scheduler_identity_includes_future_callable_semantics tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_resume_rejects_changed_lambda_scheduler_semantics -v
+Ran 10 tests in 1.513s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 28 tests in 2.510s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_artifacts tests.finetune.balalaika.test_cache tests.finetune.balalaika.test_data tests.finetune.balalaika.test_metrics tests.finetune.balalaika.test_model tests.finetune.balalaika.test_sources tests.finetune.balalaika.test_tokenizer tests.finetune.balalaika.test_training tests.finetune.balalaika.test_validation_data -v
+Ran 121 tests in 6.438s
+OK
+
+rtk accelerate launch --cpu --num_processes 2 -m tests.finetune.balalaika.accelerate_smoke
+exit 0
+
+rtk python -m py_compile cosyvoice/finetune/balalaika/training.py tests/finetune/balalaika/test_training.py tests/finetune/balalaika/accelerate_smoke.py
+exit 0
+
+rtk git diff --check
+exit 0
+```
+
+### Self-review and qualification boundary
+
+The import check is opcode-based rather than spelling-based, so aliases and local bindings cannot bypass it, and the existing recursive code walk applies the same rule to nested functions. Forbidden dynamic builtins are checked by resolved object identity, preserving shadowed pure Python functions with the same source-level name. No model checkpoint, production data, credential, installation, upload, or other external work was used. The smoke remains real two-process CPU DDP through Accelerate; real eight-GPU BF16 behavior remains a hardware qualification boundary.
