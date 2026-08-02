@@ -429,3 +429,47 @@ The smoke artifact records `world_size: 2`, boundary ordinals `1..8`, `global_sa
 ### Concerns and qualification boundary
 
 The supported scheduler set is intentionally limited to the versioned constant schedule required by this recipe. Adding a new schedule requires a new explicit enum/schema member, construction branch, trajectory test, and identity behavior; arbitrary Python injection is not available. No model checkpoint, production data, credential, installation, upload, or other external work was used. The passing smoke remains real two-process CPU DDP through Accelerate, not evidence of real eight-GPU BF16 hardware qualification.
+
+## Architectural Review Fix Round 1
+
+### Test-only finding addressed
+
+The closed scheduler implementation already had no `TrainRequest.scheduler_factory` field and already required `type(scheduler_spec) is SchedulerSpec`, but the public constructor contract lacked direct regressions for those two escape hatches.
+
+Two behavioral tests now construct the real dataclass and prove that:
+
+- the retired `scheduler_factory=<callable>` keyword is rejected by the generated `TrainRequest` initializer with `TypeError`; and
+- a callable supplied as `scheduler_spec` is rejected by `TrainRequest.__post_init__` with `ValueError`.
+
+No production change was necessary. A separate `dataclasses.fields` assertion was omitted because the runtime constructor tests exercise the stronger public behavior directly.
+
+### Evidence
+
+```text
+rtk python -m unittest tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_train_request_has_no_retired_scheduler_factory_keyword tests.finetune.balalaika.test_training.AccelerateTrainingTests.test_train_request_rejects_callable_scheduler_spec -v
+Ran 2 tests in 0.053s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_training -v
+Ran 23 tests in 1.127s
+OK
+
+rtk python -m unittest tests.finetune.balalaika.test_artifacts tests.finetune.balalaika.test_cache tests.finetune.balalaika.test_data tests.finetune.balalaika.test_metrics tests.finetune.balalaika.test_model tests.finetune.balalaika.test_sources tests.finetune.balalaika.test_tokenizer tests.finetune.balalaika.test_training tests.finetune.balalaika.test_validation_data -v
+Ran 116 tests in 5.648s
+OK
+
+rtk accelerate launch --cpu --num_processes 2 -m tests.finetune.balalaika.accelerate_smoke
+exit 0
+
+rtk python -m py_compile cosyvoice/finetune/balalaika/training.py tests/finetune/balalaika/test_training.py tests/finetune/balalaika/accelerate_smoke.py
+exit 0
+
+rtk git diff --check
+exit 0
+```
+
+Tests-only commit: `55d55977e04cc0a587afea7048433576e13a2a52` (`test: close scheduler callable escape hatches`).
+
+### Concerns and qualification boundary
+
+No scheduler callable escape was found, and production code was not modified. No model checkpoint, production data, credential, installation, upload, or other external work was used. The smoke remains real two-process CPU DDP through Accelerate; real eight-GPU BF16 qualification remains external.
