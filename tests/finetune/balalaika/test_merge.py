@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
@@ -19,6 +19,7 @@ import torch
 from cosyvoice.finetune.balalaika.artifacts import sha256_file
 from cosyvoice.finetune.balalaika import evaluation as evaluation_api
 from cosyvoice.finetune.balalaika import model as api
+from cosyvoice.finetune.balalaika.config import PhaseSpec
 from tests.finetune.balalaika import test_evaluation as evaluation_fixtures
 from tests.finetune.balalaika.test_model import _logits, tiny_cosyvoice3_llm
 
@@ -34,6 +35,23 @@ class _Recognizer:
 class _ProductionRecognizer:
     local_rank = 0
     max_batch_size = 8
+
+    def __init__(self):
+        session = types.SimpleNamespace(
+            get_providers=lambda: ["CUDAExecutionProvider"],
+            get_provider_options=lambda: {"CUDAExecutionProvider": {"device_id": "0"}},
+        )
+        self.model = types.SimpleNamespace(
+            asr=types.SimpleNamespace(
+                runtime_config={
+                    "providers": [("CUDAExecutionProvider", {"device_id": 0})],
+                    "provider_options": None,
+                },
+                _encoder=session,
+                _decoder=session,
+                _joiner=session,
+            )
+        )
 
     def transcribe(self, paths):
         return ["проверка" for _ in paths]
@@ -78,6 +96,10 @@ class _Pipeline:
 
     def inference_zero_shot(self, *args, **kwargs):
         return [{"tts_speech": torch.tensor([[0.1, -0.1, 0.0]], dtype=torch.float32)}]
+
+
+_Pipeline.__module__ = "cosyvoice.cli.cosyvoice"
+_Pipeline.__qualname__ = "CosyVoice3"
 
 
 class _FailingPipeline(_Pipeline):
@@ -169,17 +191,31 @@ class FinalMergeTests(unittest.TestCase):
                 {
                     "format_version": 1,
                     "validation_status": "succeeded",
-                    "identity": {
-                        "phase": 2,
-                        "base_checkpoint_sha256": self.adapter.base_checkpoint_sha256,
-                        "lora": {"r": 64, "alpha": 128, "dropout": 0.05, "bias": "none"},
-                    },
+                    "identity": self._training_identity(),
                     "progress": {"phase": 2, "validation_index": 40},
                     "state_files": adapter_files,
                 }
             ),
             encoding="utf-8",
         )
+
+    def _training_identity(self):
+        return {
+            "cache_manifest_sha256": "c" * 64,
+            "phase": 2,
+            "phase_spec": asdict(PhaseSpec.for_phase(2)),
+            "eligible_samples": 800,
+            "base_checkpoint_sha256": self.adapter.base_checkpoint_sha256,
+            "lora": {"r": 64, "alpha": 128, "dropout": 0.05, "bias": "none"},
+            "token_limit": 4096,
+            "accumulation_steps": 2,
+            "max_grad_norm": 1.0,
+            "sampler_seed": 1986,
+            "sampler_window_size": 128,
+            "dataloader_identity": "cosyvoice.balalaika.cached-rank-loader:v1",
+            "scheduler": {"kind": "constant-v1"},
+            "world_size": 8,
+        }
 
     def _export(self):
         with mock.patch.object(api, "load_base_llm", side_effect=lambda _: copy.deepcopy(self.fresh_base)):
@@ -254,10 +290,30 @@ class FinalMergeTests(unittest.TestCase):
             validation_summary=request.summary_json,
             output_dir=self.root / f"{name}-export",
             validation_request=request,
-            wandb_run_manifest=root / "wandb-run.json",
             wandb_logger=logger,
             expected_training_identity=checkpoint["identity"],
         )
+
+    def _export_production(self, name):
+        with mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"}):
+            request = self._production_export_request(name)
+            with (
+                mock.patch.object(api, "load_base_llm", side_effect=lambda _: copy.deepcopy(self.fresh_base)),
+                mock.patch.object(evaluation_api, "GigaAmRecognizer", _ProductionRecognizer),
+                mock.patch.object(api, "_normal_cosyvoice3_pipeline", side_effect=lambda view, factory: _Pipeline(view)),
+            ):
+                manifest = api.export_final_llm(request)
+        return request, manifest
+
+    def _reseal_final(self, root):
+        manifest_path = root / "final_model_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        seal_path = root / "final-success.json"
+        seal = json.loads(seal_path.read_text(encoding="utf-8"))
+        seal["manifest_sha256"] = sha256_file(manifest_path)
+        seal["logit_verification_sha256"] = api._canonical_mapping_sha256(manifest["logit_verification"])
+        seal["artifacts"] = api._regular_file_inventory(root, excluded={"final-success.json"})
+        evaluation_api.atomic_write_json(seal_path, seal)
 
     def test_merged_checkpoint_has_original_keys_only(self):
         manifest = self._export()
@@ -276,6 +332,27 @@ class FinalMergeTests(unittest.TestCase):
         self.assertTrue((manifest.path.parent / "final-success.json").is_file())
         self.assertTrue((manifest.path.parent / "strict-verification/strict-verification.json").is_file())
 
+    def test_phase2_training_identity_requires_exact_training_schema(self):
+        checkpoint_path = self.phase2 / "checkpoint_manifest.json"
+        mutations = {
+            "missing": lambda identity: identity.pop("scheduler"),
+            "extra": lambda identity: identity.update({"unexpected": True}),
+            "phase-spec": lambda identity: identity["phase_spec"].update({"epochs": 2}),
+            "scheduler": lambda identity: identity.update({"scheduler": {"kind": "cosine"}}),
+            "world-size": lambda identity: identity.update({"world_size": 4}),
+            "eligible-bool": lambda identity: identity.update({"eligible_samples": True}),
+            "gradient-nan": lambda identity: identity.update({"max_grad_norm": float("nan")}),
+            "empty-loader": lambda identity: identity.update({"dataloader_identity": ""}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                mutate(checkpoint["identity"])
+                checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "training|world_size"):
+                    self._export_changed(replace(self.export_request, output_dir=self.root / f"identity-{name}"))
+                self._write_phase2_manifest()
+
     def test_export_binds_structured_logit_evidence(self):
         manifest = self._export()
         payload = json.loads(manifest.path.read_text(encoding="utf-8"))
@@ -289,7 +366,7 @@ class FinalMergeTests(unittest.TestCase):
             set(evidence),
             {
                 "format_version", "probe", "probe_sha256", "atol", "rtol",
-                "max_abs_error", "max_relative_error", "finite", "pass",
+                "max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass",
             },
         )
         self.assertEqual(evidence["probe"], expected_probe)
@@ -299,8 +376,20 @@ class FinalMergeTests(unittest.TestCase):
         self.assertTrue(evidence["pass"])
         self.assertGreaterEqual(evidence["max_abs_error"], 0.0)
         self.assertGreaterEqual(evidence["max_relative_error"], 0.0)
+        self.assertLessEqual(evidence["max_tolerance_ratio"], 1.0)
         seal = json.loads((manifest.path.parent / "final-success.json").read_text(encoding="utf-8"))
         self.assertEqual(seal["logit_verification_sha256"], api._canonical_mapping_sha256(evidence))
+
+    def test_resealed_impossible_logit_metrics_are_rejected(self):
+        manifest = self._export()
+        root = manifest.path.parent
+        payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+        payload["logit_verification"]["max_tolerance_ratio"] = 2.0
+        evaluation_api.atomic_write_json(manifest.path, payload)
+        self._reseal_final(root)
+
+        with self.assertRaisesRegex(ValueError, "tolerance"):
+            api.require_committed_final(root, expected_mode="test")
 
     def test_logit_drift_aborts_without_publishing_output(self):
         original = api._fixed_probe_logits
@@ -474,6 +563,22 @@ class FinalMergeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "lineage"):
                 self._export_changed(request)
 
+    def test_code_identity_hashes_untracked_file_contents(self):
+        repository = Path(api.__file__).resolve().parents[3]
+        path = repository / "codex-untracked-identity-probe.bin"
+        self.assertFalse(path.exists())
+        try:
+            path.write_bytes(b"first")
+            first = api._code_identity()
+            path.write_bytes(b"second")
+            second = api._code_identity()
+        finally:
+            path.unlink(missing_ok=True)
+
+        self.assertTrue(first["dirty"])
+        self.assertTrue(second["dirty"])
+        self.assertNotEqual(first["diff_sha256"], second["diff_sha256"])
+
     def test_existing_final_reauthenticates_current_base_inventory(self):
         manifest = self._export()
         (self.base_dir / "flow.pt").write_bytes(b"changed-flow")
@@ -550,6 +655,132 @@ class FinalMergeTests(unittest.TestCase):
             wrong_rank = replace(verify, recognizer=_ProductionRecognizer(), expected_local_rank=1)
             with self.assertRaisesRegex(ValueError, "local rank"):
                 api.strict_verify_final_model(wrong_rank)
+
+    def test_production_expected_training_identity_must_exactly_match_checkpoint(self):
+        with mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"}):
+            request = self._production_export_request("expected-training-identity")
+            changed_identity = {**request.expected_training_identity, "sampler_seed": 7}
+            with self.assertRaisesRegex(ValueError, "differs"):
+                api.export_final_llm(replace(request, expected_training_identity=changed_identity))
+
+    def test_committed_production_rejects_consistently_resealed_crosslink_mutations(self):
+        _, manifest = self._export_production("crosslinks")
+        root = manifest.path.parent
+        originals = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+        def restore():
+            for path, content in originals.items():
+                path.write_bytes(content)
+
+        def mutate_phase(payload):
+            payload["phase2_checkpoint_manifest_sha256"] = "f" * 64
+
+        def mutate_state(payload):
+            payload["phase2_model_state_sha256"] = "f" * 64
+
+        def mutate_summary(payload):
+            payload["validation_summary_sha256"] = "f" * 64
+
+        def mutate_base(payload):
+            for item in payload["base_assets"]["files"]:
+                if item["path"] == "llm.pt":
+                    item["sha256"] = "f" * 64
+            payload["base_assets_sha256"] = api._canonical_mapping_sha256(payload["base_assets"])
+
+        def mutate_evaluation(payload):
+            payload["task10_evidence"]["evaluation_identity_sha256"] = "f" * 64
+
+        def mutate_artifacts(payload):
+            payload["task10_evidence"]["artifact_checksums"]["results_jsonl"] = "f" * 64
+
+        mutations = {
+            "checkpoint": (mutate_phase, "checkpoint"),
+            "model-state": (mutate_state, "model state"),
+            "summary": (mutate_summary, "summary"),
+            "base": (mutate_base, "base checkpoint"),
+            "evaluation-wandb": (mutate_evaluation, "evaluation identity"),
+            "artifacts-wandb": (mutate_artifacts, "artifact checksums"),
+        }
+        for name, (mutate, message) in mutations.items():
+            with self.subTest(name=name):
+                restore()
+                payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+                mutate(payload)
+                if name == "base":
+                    report_path = root / "strict-verification/strict-verification.json"
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                    report["immutable_inputs"]["base_assets_sha256"] = payload["base_assets_sha256"]
+                    evaluation_api.atomic_write_json(report_path, report)
+                    payload["strict_verification"]["report_sha256"] = sha256_file(report_path)
+                evaluation_api.atomic_write_json(manifest.path, payload)
+                self._reseal_final(root)
+                with self.assertRaisesRegex(ValueError, message):
+                    api.require_committed_final(root, expected_mode="production")
+
+    def test_resealed_unexpected_final_file_is_rejected(self):
+        manifest = self._export()
+        root = manifest.path.parent
+        (root / "unexpected.bin").write_bytes(b"self-declared extra")
+        self._reseal_final(root)
+
+        with self.assertRaisesRegex(ValueError, "unexpected files"):
+            api.require_committed_final(root, expected_mode="test")
+
+    def test_committed_production_rejects_resealed_wandb_context_schema_and_digests(self):
+        _, manifest = self._export_production("wandb-context")
+        root = manifest.path.parent
+        original = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+        for name in ("missing-field", "bad-digest"):
+            with self.subTest(name=name):
+                for path, content in original.items():
+                    path.write_bytes(content)
+                payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+                wandb = payload["task10_evidence"]["wandb"]
+                if name == "missing-field":
+                    wandb["context"].pop("metrics_sha256")
+                else:
+                    wandb["context"]["assignment_sha256"] = "not-a-digest"
+                marker = api._canonical_mapping_sha256(wandb["context"])
+                wandb["marker"] = marker
+                wandb["remote_markers"] = {
+                    "validation/commit/40/scalars": marker,
+                    "validation/commit/40/media": marker,
+                }
+                evaluation_api.atomic_write_json(manifest.path, payload)
+                self._reseal_final(root)
+                with self.assertRaisesRegex(ValueError, "context"):
+                    api.require_committed_final(root, expected_mode="production")
+
+    def test_production_report_rejects_resealed_fake_pipeline_identity(self):
+        _, manifest = self._export_production("pipeline-identity")
+        root = manifest.path.parent
+        report_path = root / "strict-verification/strict-verification.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["libraries"]["pipeline_class"] = "tests.FakePipeline"
+        evaluation_api.atomic_write_json(report_path, report)
+        payload = json.loads(manifest.path.read_text(encoding="utf-8"))
+        payload["strict_verification"]["report_sha256"] = sha256_file(report_path)
+        evaluation_api.atomic_write_json(manifest.path, payload)
+        self._reseal_final(root)
+
+        with self.assertRaisesRegex(ValueError, "exact CosyVoice3"):
+            api.require_committed_final(root, expected_mode="production")
+
+    def test_production_recognizer_requalifies_current_cuda_sessions(self):
+        request, manifest = self._export_production("recognizer-runtime")
+        voices, _ = evaluation_api.authenticated_prompt_inventory(request.validation_request.prompts)
+        recognizer = _ProductionRecognizer()
+        recognizer.model = object()
+        verify = api.VerifyRequest(
+            base_model_dir=self.base_dir,
+            final_manifest=manifest,
+            recognizer=recognizer,
+            voices=voices,
+            output_dir=self.root / "replaced-recognizer-model",
+        )
+        with mock.patch.object(evaluation_api, "GigaAmRecognizer", _ProductionRecognizer):
+            with self.assertRaises(evaluation_api.GigaAmError):
+                api.strict_verify_final_model(verify)
 
     def test_production_export_rejects_different_validation_summary_path(self):
         with mock.patch.dict(os.environ, {"WANDB_API_KEY": "unit-test-key"}):

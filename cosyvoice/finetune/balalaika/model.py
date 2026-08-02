@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from importlib import metadata
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 import random
@@ -87,7 +88,6 @@ class ExportRequest:
     validation_summary: Path
     output_dir: Path
     validation_request: object | None = None
-    wandb_run_manifest: Path | None = None
     wandb_logger: object | None = None
     test_mode: bool = False
     expected_training_identity: Mapping[str, object] | None = None
@@ -901,7 +901,7 @@ def _validate_code_identity(value: object) -> None:
 def _validate_logit_evidence(value: object) -> None:
     fields = {
         "format_version", "probe", "probe_sha256", "atol", "rtol",
-        "max_abs_error", "max_relative_error", "finite", "pass",
+        "max_abs_error", "max_relative_error", "max_tolerance_ratio", "finite", "pass",
     }
     if not isinstance(value, Mapping) or set(value) != fields or value.get("format_version") != 1:
         raise ValueError("logit verification schema is invalid")
@@ -910,10 +910,12 @@ def _validate_logit_evidence(value: object) -> None:
         raise ValueError("logit verification probe identity changed")
     if value.get("atol") != 0.02 or value.get("rtol") != 0.02 or value.get("finite") is not True or value.get("pass") is not True:
         raise ValueError("logit verification tolerance or result is invalid")
-    for name in ("max_abs_error", "max_relative_error"):
+    for name in ("max_abs_error", "max_relative_error", "max_tolerance_ratio"):
         number = value.get(name)
         if isinstance(number, bool) or not isinstance(number, (int, float)) or not torch.isfinite(torch.tensor(float(number))) or number < 0:
             raise ValueError("logit verification error metrics are invalid")
+    if value["max_tolerance_ratio"] > 1.0:
+        raise ValueError("logit verification exceeds its elementwise tolerance")
 
 
 def _validate_task10_evidence(value: object, prompt_inventory_sha256: str) -> None:
@@ -953,11 +955,45 @@ def _validate_task10_evidence(value: object, prompt_inventory_sha256: str) -> No
         or sha256_file(run_manifest_path) != run_manifest_sha256
     ):
         raise ValueError("production final W&B local evidence changed")
-    if not isinstance(wandb.get("context"), Mapping) or not isinstance(wandb.get("remote_markers"), Mapping):
+    context = wandb.get("context")
+    if not isinstance(context, Mapping) or set(context) != {
+        "evaluation_identity_sha256", "assignment_sha256", "artifact_checksums", "metrics_sha256"
+    } or not isinstance(wandb.get("remote_markers"), Mapping):
         raise ValueError("production final W&B context is invalid")
+    for name in ("evaluation_identity_sha256", "assignment_sha256", "metrics_sha256"):
+        _require_digest(context.get(name), f"W&B context {name}")
+    context_artifacts = context.get("artifact_checksums")
+    if not isinstance(context_artifacts, Mapping) or set(context_artifacts) != set(artifacts):
+        raise ValueError("production final W&B artifact context is invalid")
+    for digest in context_artifacts.values():
+        _require_digest(digest, "W&B context artifact checksum")
+    if value["evaluation_identity_sha256"] != context["evaluation_identity_sha256"]:
+        raise ValueError("Task 10 evaluation identity differs from W&B context")
+    if dict(artifacts) != dict(context_artifacts):
+        raise ValueError("Task 10 artifact checksums differ from W&B context")
     expected_markers = {"validation/commit/40/scalars": marker, "validation/commit/40/media": marker}
-    if dict(wandb["remote_markers"]) != expected_markers or _canonical_mapping_sha256(wandb["context"]) != marker:
+    if dict(wandb["remote_markers"]) != expected_markers or _canonical_mapping_sha256(context) != marker:
         raise ValueError("production final W&B remote marker evidence changed")
+    ledger = _read_json_mapping(ledger_path, "production W&B ledger")
+    if set(ledger) != {
+        "format_version", "validation_index", "run_id", "evaluation_identity_sha256",
+        "assignment_sha256", "artifact_checksums", "metrics_sha256", "remote_marker_sha256",
+        "media_logged", "scalars_logged", "committed",
+    } or (
+        ledger.get("format_version") != 2
+        or ledger.get("validation_index") != 40
+        or ledger.get("run_id") != wandb["run_id"]
+        or ledger.get("evaluation_identity_sha256") != context["evaluation_identity_sha256"]
+        or ledger.get("assignment_sha256") != context["assignment_sha256"]
+        or ledger.get("artifact_checksums") != context_artifacts
+        or ledger.get("metrics_sha256") != context["metrics_sha256"]
+        or ledger.get("remote_marker_sha256") != marker
+        or tuple(ledger.get(name) for name in ("media_logged", "scalars_logged", "committed")) != (True, True, True)
+    ):
+        raise ValueError("production W&B ledger differs from final evidence")
+    run_manifest = _read_json_mapping(run_manifest_path, "production W&B run manifest")
+    if run_manifest != {"format_version": 1, "run_id": wandb["run_id"]}:
+        raise ValueError("production W&B run manifest differs from final evidence")
 
 
 def require_committed_final(
@@ -970,6 +1006,16 @@ def require_committed_final(
 
     output_dir = Path(output_dir)
     inventory = _regular_file_inventory(output_dir, excluded={"final-success.json"})
+    expected_files = {
+        "llm.pt",
+        "adapter/adapter_manifest.json",
+        "adapter/adapter_model.safetensors",
+        "final_model_manifest.json",
+        "strict-verification/strict-verification.json",
+        *(f"strict-verification/audio/smoke-{index:02d}.wav" for index in range(1, 5)),
+    }
+    if set(inventory) != expected_files:
+        raise ValueError("final artifact file inventory contains missing or unexpected files")
     seal_path = output_dir / "final-success.json"
     if seal_path.is_symlink() or not seal_path.is_file():
         raise ValueError("final success seal is missing or invalid")
@@ -1049,8 +1095,21 @@ def require_committed_final(
         raise ValueError("final strict verification audio inventory changed")
     if mode == "production":
         _validate_task10_evidence(manifest.get("task10_evidence"), manifest["prompt_inventory_sha256"])
+        task10 = manifest["task10_evidence"]
+        if manifest["phase2_checkpoint_manifest_sha256"] != task10["checkpoint_sha256"]:
+            raise ValueError("final phase-2 checkpoint identity differs from Task 10 evidence")
+        if manifest["phase2_model_state_sha256"] != task10["model_state_sha256"]:
+            raise ValueError("final phase-2 model state differs from Task 10 evidence")
+        if manifest["validation_summary_sha256"] != task10["artifact_checksums"]["summary_json"]:
+            raise ValueError("final validation summary differs from Task 10 evidence")
     elif manifest.get("task10_evidence") is not None:
         raise ValueError("test final cannot carry production Task 10 evidence")
+    base_llm = next(
+        (item["sha256"] for item in manifest["base_assets"]["files"] if item["path"] == "llm.pt"),
+        None,
+    )
+    if manifest["base_checkpoint_sha256"] != base_llm:
+        raise ValueError("final base checkpoint differs from the embedded base asset inventory")
     if expected_lineage is not None:
         if any(manifest.get(name) != value for name, value in expected_lineage.items()):
             raise ValueError("existing final export differs from the requested lineage")
@@ -1122,6 +1181,8 @@ def _validate_strict_report(root: Path, report: Mapping[str, object], manifest: 
     if libraries.get("recognizer_class") != recognizer.get("class"):
         raise ValueError("strict verification recognizer class identity changed")
     if mode == "production":
+        if libraries.get("pipeline_class") != "cosyvoice.cli.cosyvoice.CosyVoice3":
+            raise ValueError("production final was not verified by the exact CosyVoice3 pipeline class")
         if recognizer.get("class") != "cosyvoice.finetune.balalaika.evaluation.GigaAmRecognizer":
             raise ValueError("production final was not verified by Task 10 GigaAmRecognizer")
         provenance = recognizer.get("provenance")
@@ -1188,10 +1249,13 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
         raise ValueError("final export requires phase-2 checkpoint lineage")
     if progress.get("validation_index") != 40:
         raise ValueError("final export requires validation index 40")
-    if not request.test_mode and identity != request.expected_training_identity:
-        raise ValueError("phase-2 checkpoint training identity differs from the workflow identity")
     adapter_dir = request.phase2_checkpoint / "adapter"
     adapter, adapter_manifest_sha256 = _require_exact_adapter_directory(adapter_dir)
+    _validate_phase2_training_identity(identity, adapter)
+    if not request.test_mode:
+        _validate_phase2_training_identity(request.expected_training_identity, adapter)
+        if identity != request.expected_training_identity:
+            raise ValueError("phase-2 checkpoint training identity differs from the workflow identity")
     settings = LoraSettings(**adapter["settings"])
     if identity.get("lora") != asdict(settings):
         raise ValueError("phase-2 LoRA rank/alpha settings differ from the final adapter")
@@ -1267,6 +1331,45 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
     }
 
 
+def _validate_phase2_training_identity(value: object, adapter: Mapping[str, object]) -> None:
+    """Validate the exact immutable identity emitted by ``training._identity``."""
+
+    from cosyvoice.finetune.balalaika.config import PhaseSpec
+
+    fields = {
+        "cache_manifest_sha256", "phase", "phase_spec", "eligible_samples",
+        "base_checkpoint_sha256", "lora", "token_limit", "accumulation_steps",
+        "max_grad_norm", "sampler_seed", "sampler_window_size", "dataloader_identity",
+        "scheduler", "world_size",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("phase-2 training identity schema is invalid")
+    _require_digest(value.get("cache_manifest_sha256"), "training cache manifest checksum")
+    if value.get("phase") != 2 or value.get("phase_spec") != asdict(PhaseSpec.for_phase(2)):
+        raise ValueError("phase-2 training schedule identity is invalid")
+    if value.get("lora") != asdict(LoraSettings()) or value.get("lora") != adapter.get("settings"):
+        raise ValueError("phase-2 training LoRA identity is invalid")
+    if value.get("base_checkpoint_sha256") != adapter.get("base_checkpoint_sha256"):
+        raise ValueError("phase-2 training base checksum differs from the adapter")
+    if value.get("scheduler") != {"kind": "constant-v1"}:
+        raise ValueError("phase-2 training scheduler identity is invalid")
+    for name in ("eligible_samples", "token_limit", "accumulation_steps", "sampler_window_size"):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError(f"phase-2 training {name} must be a positive integer")
+    if value.get("world_size") != 8 or isinstance(value.get("world_size"), bool):
+        raise ValueError("phase-2 training world_size must be exactly eight")
+    seed = value.get("sampler_seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("phase-2 training sampler_seed must be non-negative")
+    norm = value.get("max_grad_norm")
+    if isinstance(norm, bool) or not isinstance(norm, (int, float)) or not math.isfinite(float(norm)) or norm <= 0:
+        raise ValueError("phase-2 training max_grad_norm must be finite and positive")
+    loader = value.get("dataloader_identity")
+    if not isinstance(loader, str) or not loader.strip():
+        raise ValueError("phase-2 training dataloader identity must be nonempty")
+
+
 def _require_original_key_layout(base_path: Path, merged_path: Path) -> None:
     base = torch.load(base_path, map_location="cpu", weights_only=True)
     merged = torch.load(merged_path, map_location="cpu", weights_only=True)
@@ -1303,9 +1406,11 @@ def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path
         raise RuntimeError("adapter-active and merged logits contain non-finite values")
     difference = (expected - actual).abs()
     denominator = expected.abs().clamp_min(torch.finfo(expected.dtype).eps)
+    tolerance = atol + rtol * expected.abs()
     max_abs_error = float(difference.max().item())
     max_relative_error = float((difference / denominator).max().item())
-    passed = bool(torch.allclose(expected, actual, rtol=rtol, atol=atol))
+    max_tolerance_ratio = float((difference / tolerance).max().item())
+    passed = max_tolerance_ratio <= 1.0
     if not passed:
         raise RuntimeError("adapter-active and merged logits exceed BF16 tolerance")
     probe = {"token_ids": [[0, 0, 0]], "input_shape": [1, 3]}
@@ -1317,6 +1422,7 @@ def _verify_adapter_active_logits(base_dir: Path, adapter_dir: Path, merged_path
         "rtol": rtol,
         "max_abs_error": max_abs_error,
         "max_relative_error": max_relative_error,
+        "max_tolerance_ratio": max_tolerance_ratio,
         "finite": finite,
         "pass": passed,
     }
@@ -1368,7 +1474,7 @@ def _require_staged_final_inputs(manifest: FinalModelManifest) -> None:
 
 
 def _require_production_recognizer(recognizer: object, expected_local_rank: int) -> dict[str, object]:
-    from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer
+    from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer, require_gigaam_cuda_runtime
 
     if type(recognizer) is not GigaAmRecognizer:
         raise TypeError("production strict verification requires the exact Task 10 GigaAmRecognizer class")
@@ -1392,6 +1498,7 @@ def _require_production_recognizer(recognizer: object, expected_local_rank: int)
         or getattr(recognizer, "max_batch_size", None) != batch
     ):
         raise ValueError("production GigaAM provenance does not match the expected CUDA local rank")
+    require_gigaam_cuda_runtime(getattr(recognizer, "model", None), expected_local_rank)
     return dict(provenance)
 
 
@@ -1662,14 +1769,41 @@ def _code_identity() -> dict[str, object]:
     diff = subprocess.run(
         ["git", "diff", "--binary", "HEAD", "--", "."], cwd=repository, check=False, capture_output=True
     )
-    if any(result.returncode != 0 for result in (head, status, diff)):
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+    )
+    if any(result.returncode != 0 for result in (head, status, diff, untracked)):
         raise RuntimeError("unable to determine final export code identity")
     revision = head.stdout.decode("utf-8", errors="strict").strip()
     if not revision:
         raise RuntimeError("unable to determine final export Git HEAD")
     dirty = bool(status.stdout)
+    digest = hashlib.sha256()
+    digest.update(status.stdout)
+    digest.update(b"\0")
+    digest.update(diff.stdout)
+    paths = tuple(sorted(path for path in untracked.stdout.split(b"\0") if path))
+    if len(paths) > 1_000:
+        raise RuntimeError("code identity has too many untracked files")
+    total_size = 0
+    for raw_path in paths:
+        relative = Path(os.fsdecode(raw_path))
+        path = repository / relative
+        if relative.is_absolute() or ".." in relative.parts or path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(repository):
+            raise RuntimeError("code identity contains an unsafe untracked path")
+        total_size += path.stat().st_size
+        if total_size > 100 * 1024 * 1024:
+            raise RuntimeError("code identity untracked content exceeds safe bound")
+        digest.update(len(raw_path).to_bytes(8, "big"))
+        digest.update(raw_path)
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
     return {
         "head": revision,
         "dirty": dirty,
-        "diff_sha256": hashlib.sha256(status.stdout + b"\0" + diff.stdout).hexdigest(),
+        "diff_sha256": digest.hexdigest(),
     }

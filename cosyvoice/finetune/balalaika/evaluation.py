@@ -1778,6 +1778,12 @@ def _require_gigaam_cuda(model: Any, local_rank: int) -> None:
             )
 
 
+def require_gigaam_cuda_runtime(model: Any, local_rank: int) -> None:
+    """Publicly re-qualify all GigaAM v3 RNN-T ONNX sessions on one CUDA rank."""
+
+    _require_gigaam_cuda(model, local_rank)
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     message = str(exc).lower()
     return "cuda" in message and ("out of memory" in message or "oom" in message)
