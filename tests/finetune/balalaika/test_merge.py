@@ -88,11 +88,16 @@ class FinalMergeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        validation = json.loads(self.validation_summary.read_text(encoding="utf-8"))
+        validation["evaluation_identity_sha256"] = __import__("hashlib").sha256(
+            json.dumps(validation["evaluation_identity"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.validation_summary.write_text(json.dumps(validation), encoding="utf-8")
         (self.root / "validation-success.json").write_text(
             json.dumps(
                 {
                     "format_version": 1,
-                    "evaluation_identity_sha256": "0" * 64,
+                    "evaluation_identity_sha256": validation["evaluation_identity_sha256"],
                     "artifacts": {"summary_json": sha256_file(self.validation_summary)},
                 }
             ),
@@ -103,6 +108,7 @@ class FinalMergeTests(unittest.TestCase):
             phase2_checkpoint=self.phase2,
             validation_summary=self.validation_summary,
             output_dir=self.root / "final",
+            test_mode=True,
         )
 
     def tearDown(self) -> None:
@@ -147,10 +153,18 @@ class FinalMergeTests(unittest.TestCase):
         torch.testing.assert_close(_logits(strict), self.adapter_active_logits, rtol=2e-2, atol=2e-2)
         self.assertTrue((self.adapter_dir / "adapter_model.safetensors").is_file())
 
+    def test_export_rejects_fabricated_validation_seal(self):
+        seal = self.root / "validation-success.json"
+        payload = json.loads(seal.read_text(encoding="utf-8"))
+        payload["evaluation_identity_sha256"] = "0" * 64
+        seal.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "validation"):
+            self._export()
+
     def test_strict_loader_accepts_merged_checkpoint(self):
         manifest = self._export()
         voice_paths = []
-        for index in range(4):
+        for index in range(20):
             voice = self.root / f"voice_{index:02d}.wav"
             with wave.open(str(voice), "wb") as stream:
                 stream.setnchannels(1)
@@ -163,11 +177,12 @@ class FinalMergeTests(unittest.TestCase):
             final_manifest=manifest,
             recognizer=_Recognizer(),
             voices=tuple(
-                {"voice_id": f"reserved_{index}", "prompt_text": "проверка", "prompt_wav": path}
+                {"voice_id": f"voice_{index:02d}", "prompt_text": "проверка", "prompt_wav": path, "prompt_sha256": sha256_file(path)}
                 for index, path in enumerate(voice_paths)
             ),
             output_dir=self.root / "verification",
             pipeline_factory=_Pipeline,
+            test_mode=True,
         )
 
         report = api.strict_verify_final_model(request)

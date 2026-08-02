@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from importlib import metadata
 import json
+import hashlib
 import os
 from pathlib import Path
 import random
@@ -85,11 +86,16 @@ class ExportRequest:
     phase2_checkpoint: Path
     validation_summary: Path
     output_dir: Path
+    validation_request: object | None = None
+    wandb_run_manifest: Path | None = None
+    test_mode: bool = False
 
     def __post_init__(self) -> None:
         for name in ("base_model_dir", "phase2_checkpoint", "validation_summary", "output_dir"):
             if not isinstance(getattr(self, name), Path):
                 raise TypeError(f"{name} must be a pathlib.Path")
+        if self.test_mode is not True and (self.validation_request is None or not isinstance(self.wandb_run_manifest, Path)):
+            raise ValueError("production export requires Task 10 evidence request and W&B run manifest")
 
 
 @dataclass(frozen=True)
@@ -105,6 +111,8 @@ class FinalModelManifest:
     target_modules: tuple[str, ...]
     phase2_checkpoint_sha256: str
     validation_summary_sha256: str
+    production_ready: bool = False
+    base_assets_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,7 @@ class VerifyRequest:
     voices: Sequence[Mapping[str, object]]
     output_dir: Path
     pipeline_factory: object | None = None
+    test_mode: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_model_dir, Path) or not isinstance(self.output_dir, Path):
@@ -125,8 +134,10 @@ class VerifyRequest:
             raise TypeError("final_manifest must be FinalModelManifest")
         if not isinstance(self.voices, Sequence) or isinstance(self.voices, (str, bytes)):
             raise TypeError("voices must be a sequence of reserved voice mappings")
-        if len(self.voices) != 4:
-            raise ValueError("strict verification requires exactly four reserved voices")
+        if len(self.voices) != 20:
+            raise ValueError("strict verification requires exactly twenty reserved voices")
+        if self.test_mode is not True and self.pipeline_factory is not None:
+            raise ValueError("production strict verification constructs normal CosyVoice3 directly")
 
 
 @dataclass(frozen=True)
@@ -519,6 +530,7 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
     if not isinstance(request, ExportRequest):
         raise TypeError("request must be ExportRequest")
     lineage = _require_final_export_lineage(request)
+    base_assets = build_base_asset_manifest(request.base_model_dir)
     output_dir = request.output_dir
     if output_dir.exists() or output_dir.is_symlink():
         raise FileExistsError(f"final model output already exists: {output_dir}")
@@ -543,6 +555,9 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "phase2_checkpoint_manifest_sha256": lineage["checkpoint_sha256"],
             "validation_summary": str(request.validation_summary),
             "validation_summary_sha256": lineage["validation_sha256"],
+            "production_ready": not request.test_mode,
+            "base_assets": base_assets,
+            "base_assets_sha256": _canonical_mapping_sha256(base_assets),
             "code_revision": _code_revision(),
         }
         manifest_path = temporary / "final_model_manifest.json"
@@ -562,6 +577,8 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
         target_modules=merge.target_modules,
         phase2_checkpoint_sha256=lineage["checkpoint_sha256"],
         validation_summary_sha256=lineage["validation_sha256"],
+        production_ready=not request.test_mode,
+        base_assets_sha256=_canonical_mapping_sha256(base_assets),
     )
 
 
@@ -570,40 +587,43 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
 
     if not isinstance(request, VerifyRequest):
         raise TypeError("request must be VerifyRequest")
+    if request.final_manifest.production_ready and request.test_mode:
+        raise ValueError("test-double verification cannot satisfy a production-ready final manifest")
     _require_final_manifest(request.final_manifest)
-    voices = _strict_smoke_voices(request.voices)
-    request.output_dir.mkdir(parents=True, exist_ok=True)
-    audio_dir = request.output_dir / "audio"
-    if audio_dir.exists() or audio_dir.is_symlink():
-        raise FileExistsError(f"strict verification audio output already exists: {audio_dir}")
-    with tempfile.TemporaryDirectory(prefix=".cosyvoice3-strict-", dir=request.output_dir) as raw_view:
-        view = Path(raw_view)
-        _make_verification_view(request.base_model_dir, request.final_manifest.llm_path, view)
-        pipeline = _normal_cosyvoice3_pipeline(view, request.pipeline_factory)
-        _require_frozen_inference_components(pipeline)
-        _strict_load_pipeline_llm(pipeline, request.final_manifest.llm_path)
-        audio_dir.mkdir()
-        random.seed(1986)
-        torch.manual_seed(1986)
-        audio_paths = tuple(
-            _synthesize_smoke_voice(pipeline, voice, prompt, audio_dir / f"smoke-{index + 1:02d}.wav")
-            for index, (voice, prompt) in enumerate(zip(voices, _SMOKE_PROMPTS, strict=True))
-        )
-    _require_pcm_24khz_mono(audio_paths)
-    transcribe = getattr(request.recognizer, "transcribe", None)
-    if not callable(transcribe):
-        raise TypeError("recognizer must expose transcribe(paths)")
-    hypotheses = transcribe(audio_paths)
-    if (
+    if _canonical_mapping_sha256(build_base_asset_manifest(request.base_model_dir)) != request.final_manifest.base_assets_sha256:
+        raise ValueError("strict verification base asset identity differs from exported base")
+    voices = _strict_smoke_voices(request.voices)[:4]
+    if request.output_dir.exists() or request.output_dir.is_symlink():
+        raise FileExistsError(f"strict verification destination already exists: {request.output_dir}")
+    request.output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{request.output_dir.name}.", dir=request.output_dir.parent))
+    try:
+        audio_dir = stage / "audio"
+        with tempfile.TemporaryDirectory(prefix=".cosyvoice3-strict-", dir=stage) as raw_view:
+            view = Path(raw_view)
+            _make_verification_view(request.base_model_dir, request.final_manifest.llm_path, view)
+            pipeline = _normal_cosyvoice3_pipeline(view, request.pipeline_factory)
+            _require_frozen_inference_components(pipeline)
+            _strict_load_pipeline_llm(pipeline, request.final_manifest.llm_path)
+            audio_dir.mkdir()
+            random.seed(1986)
+            torch.manual_seed(1986)
+            audio_paths = tuple(_synthesize_smoke_voice(pipeline, voice, prompt, audio_dir / f"smoke-{index + 1:02d}.wav") for index, (voice, prompt) in enumerate(zip(voices, _SMOKE_PROMPTS, strict=True)))
+        _require_pcm_24khz_mono(audio_paths)
+        transcribe = getattr(request.recognizer, "transcribe", None)
+        if not callable(transcribe):
+            raise TypeError("recognizer must expose transcribe(paths)")
+        hypotheses = transcribe(audio_paths)
+        if (
         not isinstance(hypotheses, Sequence)
         or isinstance(hypotheses, (str, bytes))
         or len(hypotheses) != 4
         or any(not isinstance(value, str) or not value.strip() for value in hypotheses)
-    ):
-        raise ValueError("GigaAM strict-verification transcription is invalid")
-    checksums = {path.name: sha256_file(path) for path in audio_paths}
-    libraries = _library_identities(request.recognizer)
-    payload = {
+        ):
+            raise ValueError("GigaAM strict-verification transcription is invalid")
+        checksums = {path.name: sha256_file(path) for path in audio_paths}
+        libraries = _library_identities(request.recognizer)
+        payload = {
         "format_version": 1,
         "final_model_manifest_sha256": sha256_file(request.final_manifest.path),
         "llm_sha256": request.final_manifest.llm_sha256,
@@ -614,9 +634,16 @@ def strict_verify_final_model(request: VerifyRequest) -> VerificationReport:
             for voice, prompt, path, asr in zip(voices, _SMOKE_PROMPTS, audio_paths, hypotheses, strict=True)
         ],
         "libraries": libraries,
-    }
+        }
+        report_path = stage / "strict-verification.json"
+        atomic_write_json(report_path, payload)
+        _publish_directory(stage, request.output_dir)
+    except Exception:
+        if stage.exists() and not stage.is_symlink():
+            shutil.rmtree(stage)
+        raise
+    audio_paths = tuple(request.output_dir / "audio" / path.name for path in audio_paths)
     report_path = request.output_dir / "strict-verification.json"
-    atomic_write_json(report_path, payload)
     return VerificationReport(
         path=report_path,
         strict_load=True,
@@ -634,6 +661,34 @@ _SMOKE_PROMPTS = (
     "Русская речь должна звучать ясно и естественно.",
     "Это короткая проверка голосового клонирования.",
 )
+
+
+def build_base_asset_manifest(base_dir: Path) -> dict[str, object]:
+    """Return a bounded fail-closed inventory for every regular base-model asset."""
+
+    base_dir = Path(base_dir)
+    required = {"cosyvoice3.yaml", "llm.pt", "flow.pt", "hift.pt"}
+    if base_dir.is_symlink() or not base_dir.is_dir():
+        raise ValueError("base model directory must be a real directory")
+    entries: list[dict[str, str]] = []
+    for path in sorted(base_dir.rglob("*")):
+        if len(entries) > 10_000:
+            raise ValueError("base model asset inventory exceeds safe bound")
+        if path.is_symlink() or not path.resolve().is_relative_to(base_dir.resolve()):
+            raise ValueError("base model assets must not contain symlinks or path escapes")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError("base model assets must be regular files")
+        entries.append({"path": str(path.relative_to(base_dir)), "sha256": sha256_file(path)})
+    names = {entry["path"] for entry in entries}
+    if not required.issubset(names):
+        raise ValueError("base model asset manifest lacks required CosyVoice3 files")
+    return {"format_version": 1, "base_dir_name": base_dir.name, "files": entries}
+
+
+def _canonical_mapping_sha256(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
@@ -692,10 +747,31 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
         or seal.get("format_version") != 1
         or not isinstance(seal.get("evaluation_identity_sha256"), str)
         or len(seal["evaluation_identity_sha256"]) != 64
+        or set(seal["evaluation_identity_sha256"]) == {"0"}
         or not isinstance(artifacts, Mapping)
         or artifacts.get("summary_json") != sha256_file(request.validation_summary)
     ):
         raise ValueError("validation-40 success seal does not bind the summary")
+    identity_sha256 = hashlib.sha256(
+        json.dumps(dict(evaluation_identity), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if validation.get("evaluation_identity_sha256") != identity_sha256 or seal["evaluation_identity_sha256"] != identity_sha256:
+        raise ValueError("validation-40 identity checksum is fabricated or changed")
+    if not request.test_mode:
+        from cosyvoice.finetune.balalaika.evaluation import verify_final_validation_evidence
+
+        checkpoint_identity = evaluation_identity.get("checkpoint_sha256")
+        model_state_identity = evaluation_identity.get("model_state_sha256")
+        if not isinstance(checkpoint_identity, str) or not isinstance(model_state_identity, str):
+            raise ValueError("validation-40 evaluation identity lacks checkpoint/model-state checksums")
+        verify_final_validation_evidence(
+            request.validation_request,
+            expected_checkpoint_sha256=checkpoint_identity,
+            expected_model_state_sha256=model_state_identity,
+            expected_base_checkpoint_sha256=str(adapter["base_checkpoint_sha256"]),
+            expected_adapter_sha256=str(adapter["weights_sha256"]),
+            wandb_run_manifest=request.wandb_run_manifest,
+        )
     base_path = request.base_model_dir / "llm.pt"
     if not base_path.is_file() or sha256_file(base_path) != adapter["base_checkpoint_sha256"]:
         raise ValueError("requested base checkpoint differs from the final adapter")
@@ -772,6 +848,8 @@ def _require_final_manifest(manifest: FinalModelManifest) -> None:
         "base_checkpoint_sha256", "target_modules", "phase2_checkpoint",
         "phase2_checkpoint_manifest_sha256", "validation_summary",
         "validation_summary_sha256", "code_revision",
+        "production_ready",
+        "base_assets", "base_assets_sha256",
     }
     if not isinstance(payload, Mapping) or set(payload) != required or payload.get("format_version") != 1:
         raise ValueError("final model manifest schema is invalid")
@@ -784,9 +862,13 @@ def _require_final_manifest(manifest: FinalModelManifest) -> None:
         "phase2_checkpoint_manifest_sha256": manifest.phase2_checkpoint_sha256,
         "validation_summary_sha256": manifest.validation_summary_sha256,
         "target_modules": list(manifest.target_modules),
+        "production_ready": manifest.production_ready,
+        "base_assets_sha256": manifest.base_assets_sha256,
     }
     if any(payload[name] != value for name, value in expected.items()):
         raise ValueError("final model manifest provenance changed")
+    if _canonical_mapping_sha256(payload["base_assets"]) != manifest.base_assets_sha256:
+        raise ValueError("final model manifest base asset inventory changed")
     if not manifest.llm_path.is_file() or sha256_file(manifest.llm_path) != manifest.llm_sha256:
         raise ValueError("final llm.pt checksum changed")
     adapter = _read_adapter_manifest(manifest.adapter_dir / ADAPTER_MANIFEST_NAME)
@@ -806,13 +888,29 @@ def _strict_smoke_voices(voices: Sequence[Mapping[str, object]]) -> tuple[dict[s
         voice_id = voice.get("voice_id")
         prompt_text = voice.get("prompt_text")
         prompt_wav = voice.get("prompt_wav")
+        prompt_sha256 = voice.get("prompt_sha256")
         path = Path(prompt_wav) if isinstance(prompt_wav, (str, Path)) else None
         if not isinstance(voice_id, str) or not voice_id or not isinstance(prompt_text, str) or not prompt_text.strip() or path is None or not path.is_file():
             raise ValueError("reserved voice is incomplete")
-        values.append({"voice_id": voice_id, "prompt_text": prompt_text, "prompt_wav": path})
-    if len({value["voice_id"] for value in values}) != 4:
-        raise ValueError("strict verification voices must have four unique IDs")
-    return tuple(values)
+        values.append({"voice_id": voice_id, "prompt_text": prompt_text, "prompt_wav": path, "prompt_sha256": prompt_sha256})
+    expected = {f"voice_{index:02d}" for index in range(20)}
+    if {value["voice_id"] for value in values} != expected or len(values) != 20:
+        raise ValueError("strict verification requires the approved voice_00 through voice_19 inventory")
+    for value in values:
+        checksum = value.get("prompt_sha256")
+        if not isinstance(checksum, str) or checksum != sha256_file(value["prompt_wav"]):
+            raise ValueError(f"reserved voice prompt checksum changed for {value['voice_id']}")
+        if not _is_pcm_input(value["prompt_wav"]):
+            raise ValueError(f"reserved voice prompt is not nonempty 24 kHz mono PCM for {value['voice_id']}")
+    return tuple(sorted(values, key=lambda value: str(value["voice_id"])))
+
+
+def _is_pcm_input(path: Path) -> bool:
+    try:
+        with wave.open(str(path), "rb") as stream:
+            return stream.getframerate() == 24_000 and stream.getnchannels() == 1 and stream.getnframes() > 0
+    except wave.Error:
+        return False
 
 
 def _make_verification_view(base_dir: Path, llm_path: Path, view: Path) -> None:

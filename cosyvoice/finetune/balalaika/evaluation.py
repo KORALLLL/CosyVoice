@@ -202,6 +202,55 @@ class EvaluationReport:
     asr_latency_seconds: float
 
 
+@dataclass(frozen=True)
+class FinalValidationEvidence:
+    """Validated Task 10 publication identity for final-export consumers."""
+
+    identity_sha256: str
+    artifact_checksums: Mapping[str, str]
+    checkpoint_sha256: str
+    model_state_sha256: str
+
+
+def verify_final_validation_evidence(
+    request: EvaluationRequest,
+    *,
+    expected_checkpoint_sha256: str,
+    expected_model_state_sha256: str,
+    expected_base_checkpoint_sha256: str,
+    expected_adapter_sha256: str,
+    wandb_run_manifest: Path,
+) -> FinalValidationEvidence:
+    """Fail closed on any changed Task 10 validation-40 publication or ledger."""
+
+    if not isinstance(request, EvaluationRequest) or request.validation_index != 40:
+        raise EvaluationIntegrityError("final export requires Task 10 validation index 40")
+    items = build_voice_assignment(request.rows, request.prompts)
+    identity = build_evaluation_identity(request.validation_index, items, request.provenance, asr_batch_size=request.asr_batch_size)
+    expected = {
+        "checkpoint_sha256": expected_checkpoint_sha256,
+        "model_state_sha256": expected_model_state_sha256,
+        "base_checkpoint_sha256": expected_base_checkpoint_sha256,
+        "adapter_sha256": expected_adapter_sha256,
+    }
+    if any(identity.payload.get(name) != value for name, value in expected.items()):
+        raise EvaluationIntegrityError("Task 10 evaluation identity differs from final export lineage")
+    report = _require_published_report(request, items, identity, _canonical_sha256(_semantic_assignment(items)))
+    run = _read_wandb_manifest(Path(wandb_run_manifest))
+    context = _wandb_commit_context(report)
+    marker = _canonical_sha256(context)
+    ledger = _read_wandb_commit(
+        Path(wandb_run_manifest).parent / "wandb-validation-commits" / "validation-40.json",
+        40,
+        str(run["run_id"]),
+        context,
+        marker,
+    )
+    if (ledger["media_logged"], ledger["scalars_logged"], ledger["committed"]) != (True, True, True):
+        raise WandbSyncError("Task 10 validation-40 W&B ledger is incomplete")
+    return FinalValidationEvidence(identity.sha256, report.artifact_checksums, expected_checkpoint_sha256, expected_model_state_sha256)
+
+
 class WandbValidationLogger:
     """Idempotently commit validation evidence to Task 8's existing W&B run."""
 
