@@ -274,7 +274,7 @@ class ProductionBackend:
 
         environment = collect_environment()
         inventory = inventory_sources(options.paths)
-        split = build_split_plan(options.paths, options.paths.seed)
+        split = build_split_plan(options.paths, options.paths.seed, source_inventory=inventory)
         validation_dir = options.paths.run_root / "validation_data"
         rows = fetch_validation_rows(validation_dir)
         validation_manifest = validation_dir / MANIFEST_NAME

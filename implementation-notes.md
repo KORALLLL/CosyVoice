@@ -1,5 +1,15 @@
 # Implementation Notes
 
+## 2026-08-02 - Reuse the prequalified source inventory
+
+- Production evidence showed preflight checksumming the immutable 373 GB source
+  archive set once directly and then again inside `build_split_plan()`.
+- Split construction now accepts and reuses the immediately preceding
+  `SourceInventory`; all archive names and SHA-256 values remain identical, but
+  the main rank performs one full corpus hash pass instead of two.
+- A regression test injects a qualified inventory while making any second call
+  to `inventory_sources()` fail.
+
 ## 2026-08-02 - Validate canonical sidecar schemas
 
 - The real canonical ROVER archive, ROVER repair manifest, combined

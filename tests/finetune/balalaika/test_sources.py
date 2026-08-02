@@ -117,6 +117,26 @@ class SourceTests(unittest.TestCase):
         (self.dataset_root / "train/shard_000518.tar").unlink()
         with self.assertRaisesRegex(SourceIntegrityError, "519 source tar archives"):
             inventory_sources(self.paths)
+
+    def test_split_plan_reuses_prequalified_inventory_without_rehashing(self) -> None:
+        with patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/rover.jsonl"):
+            inventory = inventory_sources(self.paths)
+            with (
+                patch(
+                    "cosyvoice.finetune.balalaika.sources.inventory_sources",
+                    side_effect=AssertionError("source inventory must not be rebuilt"),
+                ),
+                patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
+                patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 1),
+                patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
+            ):
+                counts = build_split_plan(
+                    self.paths,
+                    source_inventory=inventory,
+                    _count_text_tokens=lambda text: 1,
+                )
+
+        self.assertEqual(counts.total, 3)
         (self.dataset_root / "train/shard_000518.tar").touch()
         (self.dataset_root / "train/shard_000519.tar").touch()
         with self.assertRaisesRegex(SourceIntegrityError, "519 source tar archives"):

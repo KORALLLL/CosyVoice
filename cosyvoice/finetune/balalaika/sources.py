@@ -154,11 +154,15 @@ def assign_phases(rows: Iterable[JoinedRow], reserved: set[str]) -> list[JoinedR
 
 
 def build_split_plan(
-    paths: RunPaths, seed: int = 1986, *, _count_text_tokens: Callable[[str], int] | None = None
+    paths: RunPaths,
+    seed: int = 1986,
+    *,
+    source_inventory: SourceInventory | None = None,
+    _count_text_tokens: Callable[[str], int] | None = None,
 ) -> SplitCounts:
     """Publish a per-source-shard plan only after full canonical reconciliation."""
 
-    inventory = inventory_sources(paths)
+    inventory = source_inventory if source_inventory is not None else inventory_sources(paths)
     count_text_tokens = _count_text_tokens or _load_cosyvoice3_text_token_counter(paths)
     first_audit = _JoinAudit()
     selected_ids = reserve_prompt_ids(
