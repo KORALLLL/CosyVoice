@@ -105,8 +105,10 @@ or rename the `_RL` checkpoint.
 
 ```bash
 hf download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --exclude llm.rl.pt \
   --local-dir /workspace/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512
 test -f /workspace/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512/llm.pt
+test ! -e /workspace/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512/llm.rl.pt
 ```
 
 Verify the canonical inputs are present and keep them read-only:
