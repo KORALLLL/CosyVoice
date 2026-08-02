@@ -1,5 +1,15 @@
 # Implementation Notes
 
+## 2026-08-02 - Audit verified missing-text rows as zero-token exclusions
+
+- The combined-sidecar producer metadata marks the release complete and
+  verified and explicitly reports 168 `missing_text` / `empty_rover` rows.
+- The split planner already excluded zero-token texts from phases and prompt
+  reservation, but a non-empty field validator made that branch unreachable.
+  Canonical text must now be a string, may be empty, and is preserved in the
+  plan with `text_token_length=0` for audit while receiving no training phase.
+- Non-string or absent text remains a hard integrity failure.
+
 ## 2026-08-02 - Join descending ROVER members without materializing the corpus
 
 - The canonical ROVER tar stores JSONL members from shard 518 down to shard 0,

@@ -272,6 +272,26 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(rows["000000/c.mp3"].model_limit_exclusion, "text_token_length>200")
         self.assertEqual(rows["000000/c.mp3"].text_token_count, 201)
 
+    def test_empty_canonical_text_is_audited_and_excluded_from_training(self) -> None:
+        combined = self._combined_path()
+        rows = [json.loads(line) for line in combined.read_text(encoding="utf-8").splitlines()]
+        rows[0]["rover_punctuated_accented"] = ""
+        combined.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        counts = self._build_fixture_plan(expected_nulls=1, count_tokens=lambda text: len(text))
+
+        self.assertEqual(
+            (counts.phase1, counts.phase2, counts.null, counts.model_limit_exclusions),
+            (0, 1, 1, 1),
+        )
+        planned = {row.source_relative_path: row for row in iter_split_rows(counts.plan_dir, 0)}
+        empty = planned["000000/a.mp3"]
+        self.assertEqual((empty.text, empty.text_token_count, empty.model_limit_exclusion), ("", 0, "text_token_length=0"))
+        self.assertIsNone(empty.phase)
+
     def test_canonical_rover_rejects_legacy_agreement_field(self) -> None:
         # Legacy agreement must not be mistaken for canonical ROVER evidence.
         rover = self._rover_path()

@@ -32,6 +32,10 @@ training can begin.
 | Metrics | micro `utt-cer`, `utt-wer`, `num-cer`, `num-wer` in W&B |
 
 Rows with null agreement are excluded. Agreement `0.95` belongs to phase 2.
+The verified combined release contains 168 explicitly classified missing-text
+rows; these remain in the split audit with `text_token_length=0` and are
+excluded from training and prompt reservation. Texts above the model's 200-token
+limit are excluded through the same audited mechanism.
 Stress marks and the already normalized sidecar text are preserved; this recipe
 does not substitute raw transcripts.
 

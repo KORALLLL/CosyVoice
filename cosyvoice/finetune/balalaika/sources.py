@@ -238,7 +238,7 @@ def iter_split_rows(plan_dir: Path, shard: int) -> Iterator[JoinedRow]:
             data = _json_mapping(line, path, number)
             yield JoinedRow(
                 source_relative_path=_source_relative_path(data, path, number),
-                text=_string_field(data, "text", path, number),
+                text=_text_field(data, "text", path, number),
                 instruct=_string_field(data, "instruct", path, number),
                 agreement=_agreement(data, path, number),
                 phase=_phase(data, path, number),
@@ -338,7 +338,7 @@ def _iter_joined_rows(inventory: SourceInventory, audit: _JoinAudit) -> Iterator
             combined_row = combined.pop(source_relative_path, None)
             if combined_row is None:
                 raise SourceIntegrityError("combined and ROVER join keys differ")
-            text = _string_field(combined_row, "rover_punctuated_accented", inventory.combined_sidecar, audit.combined_rows)
+            text = _text_field(combined_row, "rover_punctuated_accented", inventory.combined_sidecar, audit.combined_rows)
             agreement = _agreement(rover, inventory.rover_archive, audit.rover_rows, canonical_rover=True)
             yield JoinedRow(source_relative_path=source_relative_path, text=text, agreement=agreement)
             rover = next(rover_rows, None)
@@ -493,6 +493,13 @@ def _string_field(row: Mapping[str, object], field: str, path: Path, number: int
     value = row.get(field)
     if not isinstance(value, str) or not value:
         raise SourceIntegrityError(f"missing non-empty {field} in {path}:{number}")
+    return value
+
+
+def _text_field(row: Mapping[str, object], field: str, path: Path, number: int) -> str:
+    value = row.get(field)
+    if not isinstance(value, str):
+        raise SourceIntegrityError(f"missing string {field} in {path}:{number}")
     return value
 
 
