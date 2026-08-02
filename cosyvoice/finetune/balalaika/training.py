@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import functools
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
+import types
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
@@ -570,10 +574,144 @@ def _scheduler_identity(scheduler: Any) -> dict[str, object]:
         "class": f"{scheduler.__class__.__module__}.{scheduler.__class__.__qualname__}",
         "initial_state": scheduler.state_dict(),
     }
+    lr_lambdas = getattr(scheduler, "lr_lambdas", None)
+    if lr_lambdas is not None:
+        if not isinstance(lr_lambdas, (list, tuple)) or not lr_lambdas:
+            raise ValueError("scheduler lr_lambdas must be a nonempty sequence")
+        identity["lr_lambda_fingerprints"] = [
+            _callable_fingerprint(value) for value in lr_lambdas
+        ]
     try:
         return json.loads(json.dumps(identity, allow_nan=False, sort_keys=True))
     except (TypeError, ValueError) as exc:
         raise ValueError("scheduler identity must be JSON-serializable") from exc
+
+
+def _callable_fingerprint(value: Callable[..., object]) -> str:
+    """Hash inspectable callable semantics without source paths or line numbers."""
+
+    payload = _callable_semantics(value, set())
+    encoded = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _callable_semantics(value: Callable[..., object], active: set[int]) -> dict[str, object]:
+    identity = id(value)
+    if identity in active:
+        raise ValueError("scheduler callable configuration is recursive")
+    active.add(identity)
+    try:
+        if isinstance(value, functools.partial):
+            return {
+                "kind": "partial",
+                "function": _callable_semantics(value.func, active),
+                "args": _stable_semantic_value(value.args, active),
+                "keywords": _stable_semantic_value(value.keywords or {}, active),
+            }
+        if isinstance(value, types.MethodType):
+            return {
+                "kind": "bound_method",
+                "function": _function_semantics(value.__func__, active),
+                "owner": _stable_semantic_value(value.__self__, active),
+            }
+        if isinstance(value, types.FunctionType):
+            return _function_semantics(value, active)
+        if isinstance(value, types.BuiltinFunctionType):
+            return {
+                "kind": "builtin",
+                "module": value.__module__,
+                "qualname": value.__qualname__,
+            }
+        call = getattr(type(value), "__call__", None)
+        if not isinstance(call, types.FunctionType):
+            raise ValueError("scheduler callable cannot be stably inspected")
+        return {
+            "kind": "callable_object",
+            "class": f"{type(value).__module__}.{type(value).__qualname__}",
+            "call": _function_semantics(call, active),
+            "configuration": _stable_semantic_value(vars(value), active),
+        }
+    finally:
+        active.remove(identity)
+
+
+def _function_semantics(value: types.FunctionType, active: set[int]) -> dict[str, object]:
+    closure: list[object] = []
+    for cell in value.__closure__ or ():
+        try:
+            cell_value = cell.cell_contents
+        except ValueError as exc:
+            raise ValueError("scheduler callable has an empty closure cell") from exc
+        closure.append(_stable_semantic_value(cell_value, active))
+    referenced_globals = {
+        name: _stable_semantic_value(value.__globals__[name], active)
+        for name in value.__code__.co_names
+        if name in value.__globals__
+    }
+    return {
+        "kind": "python_function",
+        "module": value.__module__,
+        "code": _code_semantics(value.__code__, active),
+        "defaults": _stable_semantic_value(value.__defaults__, active),
+        "kwdefaults": _stable_semantic_value(value.__kwdefaults__, active),
+        "closure": closure,
+        "globals": referenced_globals,
+    }
+
+
+def _code_semantics(value: types.CodeType, active: set[int]) -> dict[str, object]:
+    return {
+        "bytecode": value.co_code.hex(),
+        "constants": [_stable_semantic_value(item, active) for item in value.co_consts],
+        "names": list(value.co_names),
+        "varnames": list(value.co_varnames),
+        "freevars": list(value.co_freevars),
+        "cellvars": list(value.co_cellvars),
+        "argcount": value.co_argcount,
+        "posonlyargcount": value.co_posonlyargcount,
+        "kwonlyargcount": value.co_kwonlyargcount,
+        "flags": value.co_flags,
+    }
+
+
+def _stable_semantic_value(value: object, active: set[int]) -> object:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("scheduler callable contains a non-finite float")
+        return value
+    if isinstance(value, bytes):
+        return {"bytes": value.hex()}
+    if isinstance(value, types.CodeType):
+        return {"code": _code_semantics(value, active)}
+    if isinstance(value, tuple):
+        return {"tuple": [_stable_semantic_value(item, active) for item in value]}
+    if isinstance(value, frozenset):
+        items = [_stable_semantic_value(item, active) for item in value]
+        return {"frozenset": sorted(items, key=lambda item: json.dumps(item, sort_keys=True))}
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("scheduler callable mappings require string keys")
+        return {
+            "mapping": {
+                key: _stable_semantic_value(item, active)
+                for key, item in sorted(value.items())
+            }
+        }
+    if isinstance(value, types.ModuleType):
+        return {"module": value.__name__}
+    if callable(value):
+        return {"callable": _callable_semantics(value, active)}
+    raise ValueError(
+        f"scheduler callable configuration cannot be stably serialized: {type(value).__qualname__}"
+    )
 
 
 def _state_checksums(root: Path) -> dict[str, str]:

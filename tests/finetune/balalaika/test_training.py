@@ -173,7 +173,66 @@ def _save_adapter(model, path):
     )
 
 
+def _half_after_two_steps(step: int) -> float:
+    return 1.0 if step < 2 else 0.5
+
+
+def _quarter_after_two_steps(step: int) -> float:
+    return 1.0 if step < 2 else 0.25
+
+
 class AccelerateTrainingTests(unittest.TestCase):
+    def test_lambda_scheduler_identity_includes_future_callable_semantics(self) -> None:
+        api = _api()
+        first_parameter = torch.nn.Parameter(torch.tensor(0.0))
+        second_parameter = torch.nn.Parameter(torch.tensor(0.0))
+        first = torch.optim.lr_scheduler.LambdaLR(
+            torch.optim.AdamW([first_parameter], lr=1e-4), _half_after_two_steps
+        )
+        second = torch.optim.lr_scheduler.LambdaLR(
+            torch.optim.AdamW([second_parameter], lr=1e-4), _quarter_after_two_steps
+        )
+
+        self.assertEqual(first.state_dict(), second.state_dict())
+        self.assertNotEqual(api._scheduler_identity(first), api._scheduler_identity(second))
+
+    def test_resume_rejects_changed_lambda_scheduler_semantics(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            request = api.TrainRequest(
+                model=model,
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=1,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: [
+                    {"utts": ["only"], "target": torch.tensor([1.0])}
+                ],
+                accelerator_factory=FakeAccelerator,
+                scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.LambdaLR(
+                    optimizer, _half_after_two_steps
+                ),
+            )
+            first = api.train_phase(
+                request, api.TrainingCallbacks(validate=lambda _event: False)
+            )
+
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                api.train_phase(
+                    replace(
+                        request,
+                        resume_from=first.checkpoint,
+                        scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.LambdaLR(
+                            optimizer, _quarter_after_two_steps
+                        ),
+                    ),
+                    api.TrainingCallbacks(validate=lambda _event: None),
+                )
+
     def test_train_request_rejects_modified_phase_schedules(self) -> None:
         api = _api()
         model = ToyAdapterModel([])
