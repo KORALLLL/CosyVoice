@@ -323,6 +323,7 @@ class EvaluationTests(unittest.TestCase):
                 "benchmark_snapshot_sha256",
                 "benchmark_revision",
                 "semantic_assignment_sha256",
+                "asr_batch_size",
                 "asr_config",
                 "synthesis_config",
                 "code_version",
@@ -349,6 +350,33 @@ class EvaluationTests(unittest.TestCase):
         self.assertNotEqual(identity.sha256, api.build_evaluation_identity(0, semantic_change, provenance).sha256)
         with self.assertRaises(TypeError):
             identity.payload["asr_config"]["max_batch_size"] = 4
+
+    def test_evaluation_identity_rejects_changed_asr_batch_size(self) -> None:
+        api = _api()
+        items = api.build_voice_assignment(self.rows_2000, self.prompts_20)
+        provenance = _provenance(api)
+
+        default = api.build_evaluation_identity(0, items, provenance)
+
+        self.assertEqual(default.payload.get("asr_batch_size"), 8)
+        self.assertNotEqual(
+            default.sha256,
+            api.build_evaluation_identity(0, items, provenance, asr_batch_size=4).sha256,
+        )
+
+    def test_evaluation_identity_rejects_changed_number_span_category(self) -> None:
+        api = _api()
+        items = api.build_voice_assignment(self.rows_2000, self.prompts_20)
+        changed = list(items)
+        changed[0] = replace(
+            items[0],
+            number_span=replace(items[0].number_span, category="changed-span-category"),
+        )
+
+        self.assertNotEqual(
+            api.build_evaluation_identity(0, items, _provenance(api)).sha256,
+            api.build_evaluation_identity(0, changed, _provenance(api)).sha256,
+        )
 
     def test_wandb_remote_history_uses_api_run_not_active_run(self) -> None:
         api = _api()
@@ -697,6 +725,164 @@ class EvaluationTests(unittest.TestCase):
 
         self.assertEqual(loaded, {})
         self.assertFalse(wav.exists())
+
+    def test_duplicate_sealed_journal_id_invalidates_first_record_and_wav(self) -> None:
+        api = _api()
+        item = api.build_voice_assignment(self.rows_2000, self.prompts_20)[0]
+        identity = api.build_evaluation_identity(
+            0,
+            api.build_voice_assignment(self.rows_2000, self.prompts_20),
+            _provenance(api),
+        )
+        journal = self.root / "audio/rank-00/records.jsonl"
+        wav = journal.parent / "benchmark-0001.wav"
+        _write_wav(wav)
+        record = {
+            "benchmark_id": 1,
+            "evaluation_identity_sha256": identity.sha256,
+            "item_sha256": api._item_sha256(item),
+            "hypothesis": "код семь готов",
+            "audio_path": str(wav),
+            "audio_sha256": __import__("hashlib").sha256(wav.read_bytes()).hexdigest(),
+            "generation_latency_seconds": 0.0,
+            "asr_latency_seconds": 0.0,
+        }
+        record["record_sha256"] = api._journal_record_sha256(record)
+        api._atomic_write_jsonl(journal, [record, dict(record)])
+
+        loaded = api._load_rank_journal(journal, [item], identity)
+
+        self.assertEqual(loaded, {})
+        self.assertFalse(wav.exists())
+
+    def test_collective_wandb_preflight_allows_nonmain_without_tracker(self) -> None:
+        api = _api()
+
+        class BarrierReached(RuntimeError):
+            pass
+
+        bus: dict[str, object] = {}
+
+        class RankAccelerator(_FakeAccelerator):
+            def __init__(self, *, main: bool) -> None:
+                super().__init__()
+                self.is_main_process = main
+                self.process_index = 0 if main else 1
+                self.barriers = 0
+                self.tracker_queries = 0
+
+            def broadcast_object_list(self, values, from_process=0) -> None:
+                if self.is_main_process:
+                    bus["payload"] = values[0]
+                else:
+                    values[0] = bus["payload"]
+
+            def get_tracker(self, name, unwrap=False):
+                self.tracker_queries += 1
+                if not self.is_main_process:
+                    raise AssertionError("non-main rank must not query W&B")
+                return super().get_tracker(name, unwrap)
+
+            def wait_for_everyone(self) -> None:
+                self.barriers += 1
+                raise BarrierReached("first generation barrier reached")
+
+        def request(accelerator, logger):
+            return api.EvaluationRequest(
+                rows=self.rows_2000,
+                prompts=self.prompts_20,
+                accelerator=accelerator,
+                synthesizer=_FakeSynthesizer(),
+                recognizer=_FakeRecognizer(),
+                provenance=_provenance(api),
+                validation_index=0,
+                output_jsonl=self.root / "results.jsonl",
+                summary_json=self.root / "summary.json",
+                panel_dir=self.root / "panel",
+                temporary_audio_dir=self.root / "audio",
+                assignment_manifest=self.root / "mapping.json",
+                memorization_path=self.root / "memorization",
+                wandb_logger=logger,
+            )
+
+        main = RankAccelerator(main=True)
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            with self.assertRaisesRegex(BarrierReached, "generation barrier"):
+                api.evaluate_checkpoint(request(main, _logger(api, main, self.root)))
+        self.assertEqual(
+            bus.get("payload"),
+            {"format_version": 1, "phase": "wandb-preflight", "ok": True, "error": None},
+        )
+
+        nonmain = RankAccelerator(main=False)
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            with self.assertRaisesRegex(BarrierReached, "generation barrier"):
+                api.evaluate_checkpoint(request(nonmain, None))
+        self.assertEqual(nonmain.tracker_queries, 0)
+        self.assertEqual(nonmain.barriers, 1)
+
+    def test_collective_wandb_preflight_broadcasts_same_main_error(self) -> None:
+        api = _api()
+        bus: dict[str, object] = {}
+
+        class RankAccelerator(_FakeAccelerator):
+            def __init__(self, *, main: bool) -> None:
+                super().__init__()
+                self.is_main_process = main
+                self.process_index = 0 if main else 1
+                self.barriers = 0
+
+            def broadcast_object_list(self, values, from_process=0) -> None:
+                if self.is_main_process:
+                    bus["payload"] = values[0]
+                else:
+                    values[0] = bus["payload"]
+
+            def wait_for_everyone(self) -> None:
+                self.barriers += 1
+
+            def get_tracker(self, name, unwrap=False):
+                if not self.is_main_process:
+                    raise AssertionError("non-main rank must not query W&B")
+                return super().get_tracker(name, unwrap)
+
+        def request(accelerator):
+            return api.EvaluationRequest(
+                rows=self.rows_2000,
+                prompts=self.prompts_20,
+                accelerator=accelerator,
+                synthesizer=_FakeSynthesizer(),
+                recognizer=_FakeRecognizer(),
+                provenance=_provenance(api),
+                validation_index=0,
+                output_jsonl=self.root / "results.jsonl",
+                summary_json=self.root / "summary.json",
+                panel_dir=self.root / "panel",
+                temporary_audio_dir=self.root / "audio",
+                assignment_manifest=self.root / "mapping.json",
+                memorization_path=self.root / "memorization",
+                wandb_logger=None,
+            )
+
+        errors = []
+        with mock.patch.object(api, "require_memorization_gate", return_value=object()):
+            for main in (True, False):
+                accelerator = RankAccelerator(main=main)
+                with self.assertRaises(api.WandbSyncError) as caught:
+                    api.evaluate_checkpoint(request(accelerator))
+                errors.append(str(caught.exception))
+                self.assertEqual(accelerator.barriers, 0)
+
+        self.assertEqual(errors[0], errors[1])
+        self.assertEqual(
+            bus.get("payload"),
+            {
+                "format_version": 1,
+                "phase": "wandb-preflight",
+                "ok": False,
+                "error": errors[0],
+            },
+        )
 
     def test_main_rank_rejects_missing_or_checksum_changed_remote_audio(self) -> None:
         api = _api()

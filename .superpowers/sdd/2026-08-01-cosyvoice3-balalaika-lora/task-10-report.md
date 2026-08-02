@@ -59,3 +59,26 @@
 - `rtk python -m unittest tests.finetune.balalaika.test_evaluation tests.finetune.balalaika.test_metrics -v` — 30/30 passed.
 - `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -q` — 152/152 passed (exit 0).
 - Verification remained fake/local only: no private benchmark, GPU/model run, W&B network call, credential use, or upload occurred.
+
+## Fix Round 2: complete identity, fail-closed journals, and collective W&B gates
+
+### Root cause and changes
+
+- The evaluation identity did not receive `EvaluationRequest.asr_batch_size`, and the semantic assignment recorded only the benchmark category, not `NumberSpan.category`. The canonical payload now contains the positive ASR batch size and the semantic span category, so either change produces a new identity and invalidates prior evidence.
+- Duplicate journal detection removed the duplicate row's WAV but retained the first sealed row in memory, leaving a reusable record that pointed at deleted audio. Journal loading now tracks every seen expected ID, removes the first record as soon as any duplicate appears, keeps that ID invalid, and performs a final seal/WAV/checksum validation over every returned record.
+- W&B preflight previously ran independently on every rank before collective communication. Only the main process now validates/owns the real `WandbValidationLogger` and tracker. It broadcasts a structured success/error payload through the Accelerator-compatible object-broadcast path before the first barrier; every rank either continues or raises the same error. Post-log media/scalar commit status uses the same collective structure, so main still must finish both remote markers and the local ledger before validation succeeds.
+
+### Strict TDD evidence
+
+1. RED: two identity tests reported the missing `asr_batch_size` payload and an unchanged checksum after mutating `NumberSpan.category`. GREEN: all identity-focused tests passed after canonicalizing both values and threading the request batch size into evaluation.
+2. RED: a journal containing two independently valid sealed rows for benchmark 1 returned the first row after deleting its WAV. GREEN: the duplicate regression returns no reusable record and confirms the WAV is removed.
+3. RED: the simulated main rank reached the first barrier without broadcasting preflight success, while a main preflight failure produced no collective error payload. GREEN: the faithful two-rank broadcast tests show a non-main rank with no logger/tracker reaches the generation barrier on success, and both ranks receive the same `WandbSyncError` on main failure.
+4. Mutation review covers omitting either new identity field, retaining the first duplicate, returning a record with missing/changed WAV bytes, querying W&B from non-main, skipping the preflight broadcast, and accepting a malformed phase/status payload.
+
+### Verification
+
+- `rtk python -m py_compile cosyvoice/finetune/balalaika/evaluation.py tests/finetune/balalaika/test_evaluation.py` — passed.
+- `rtk git diff --check` — passed.
+- `rtk python -m unittest tests.finetune.balalaika.test_evaluation tests.finetune.balalaika.test_metrics -v` — 35/35 passed.
+- `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -q` — 157/157 passed (exit 0).
+- Testing remains fake/local, including the faithful distributed object-broadcast simulation; no private benchmark, GPU/model execution, W&B network call, credential use, or upload occurred.

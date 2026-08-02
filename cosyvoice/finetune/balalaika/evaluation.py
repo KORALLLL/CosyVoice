@@ -112,6 +112,8 @@ def build_evaluation_identity(
     validation_index: int,
     items: Sequence[EvaluationItem],
     provenance: EvaluationProvenance,
+    *,
+    asr_batch_size: int = 8,
 ) -> EvaluationIdentity:
     """Bind one checkpoint/index to every benchmark, voice, ASR, and inference input."""
 
@@ -119,6 +121,8 @@ def build_evaluation_identity(
         raise ValueError("validation_index must be in 0 through 40")
     if not isinstance(provenance, EvaluationProvenance):
         raise TypeError("provenance must be EvaluationProvenance")
+    if isinstance(asr_batch_size, bool) or not isinstance(asr_batch_size, int) or asr_batch_size < 1:
+        raise ValueError("asr_batch_size must be a positive integer")
     semantic = _semantic_assignment(items)
     payload = {
         "format_version": 1,
@@ -130,6 +134,7 @@ def build_evaluation_identity(
         "benchmark_snapshot_sha256": provenance.benchmark_snapshot_sha256,
         "benchmark_revision": provenance.benchmark_revision,
         "semantic_assignment_sha256": _canonical_sha256(semantic),
+        "asr_batch_size": asr_batch_size,
         "asr_config": _thaw_json(provenance.asr_config),
         "synthesis_config": _thaw_json(provenance.synthesis_config),
         "code_version": provenance.code_version,
@@ -509,18 +514,19 @@ def evaluate_checkpoint(request: EvaluationRequest) -> EvaluationReport:
     accelerator = request.accelerator
     if getattr(accelerator, "num_processes", None) != _EXPECTED_WORLD_SIZE:
         raise EvaluationIntegrityError("production evaluation requires exactly eight Accelerate ranks")
-    if not isinstance(request.wandb_logger, WandbValidationLogger):
-        raise WandbSyncError("WandbValidationLogger is mandatory for every validation")
-    if request.wandb_logger.accelerator is not accelerator:
-        raise WandbSyncError("W&B logger must use the evaluation Accelerator")
-    request.wandb_logger.preflight(request.validation_index)
+    _collective_wandb_preflight(request)
     local_process_index = getattr(accelerator, "local_process_index", None)
     if getattr(request.recognizer, "local_rank", None) != local_process_index:
         raise EvaluationIntegrityError("GigaAM local rank must match Accelerator local_process_index")
     _require_component_provenance(request)
     items = build_voice_assignment(request.rows, request.prompts)
     assignment_checksum = _ensure_assignment_manifest(request, items)
-    identity = build_evaluation_identity(request.validation_index, items, request.provenance)
+    identity = build_evaluation_identity(
+        request.validation_index,
+        items,
+        request.provenance,
+        asr_batch_size=request.asr_batch_size,
+    )
     accelerator.wait_for_everyone()
 
     report = _load_published_report(request, items, identity, assignment_checksum)
@@ -531,14 +537,16 @@ def evaluate_checkpoint(request: EvaluationRequest) -> EvaluationReport:
         report = _require_published_report(request, items, identity, assignment_checksum)
 
     logging_error: str | None = None
-    if getattr(accelerator, "is_main_process", False) and request.wandb_logger is not None:
+    if getattr(accelerator, "is_main_process", False):
         try:
+            if not isinstance(request.wandb_logger, WandbValidationLogger):
+                raise WandbSyncError("main process lost its W&B validation logger")
             request.wandb_logger.log(report, request.validation_index)
         except Exception as exc:
             logging_error = str(exc)
-    logging_error = _broadcast_main_value(accelerator, logging_error)
-    if logging_error is not None:
-        raise WandbSyncError(logging_error)
+    logging_status = _broadcast_main_status(accelerator, "wandb-log", logging_error)
+    if not logging_status["ok"]:
+        raise WandbSyncError(logging_status["error"])
     return report
 
 
@@ -836,6 +844,8 @@ def _load_rank_journal(
     if not path.is_file():
         return {}
     records: dict[int, dict[str, object]] = {}
+    seen_ids: set[int] = set()
+    duplicate_ids: set[int] = set()
     invalid = False
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -844,9 +854,17 @@ def _load_rank_journal(
             identifier = value.get("benchmark_id") if isinstance(value, Mapping) else None
             item = expected.get(identifier) if isinstance(identifier, int) and not isinstance(identifier, bool) else None
             destination = path.parent / f"benchmark-{identifier:04d}.wav" if item is not None else None
+            if item is not None and identifier in seen_ids:
+                invalid = True
+                duplicate_ids.add(identifier)
+                records.pop(identifier, None)
+                if destination is not None and (destination.exists() or destination.is_symlink()):
+                    destination.unlink()
+                continue
+            if item is not None:
+                seen_ids.add(identifier)
             if (
                 item is None
-                or identifier in records
                 or not _valid_journal_record(value, item, identity, destination)
             ):
                 invalid = True
@@ -859,6 +877,14 @@ def _load_rank_journal(
         records.clear()
         for item in expected_items:
             destination = path.parent / f"benchmark-{item.benchmark_id:04d}.wav"
+            if destination.exists() or destination.is_symlink():
+                destination.unlink()
+    for identifier, record in list(records.items()):
+        item = expected[identifier]
+        destination = path.parent / f"benchmark-{identifier:04d}.wav"
+        if identifier in duplicate_ids or not _valid_journal_record(record, item, identity, destination):
+            invalid = True
+            records.pop(identifier)
             if destination.exists() or destination.is_symlink():
                 destination.unlink()
     if invalid:
@@ -1186,8 +1212,37 @@ def _remove_evaluation_audio(path: Path) -> None:
     shutil.rmtree(path)
 
 
-def _broadcast_main_value(accelerator: Any, value: str | None) -> str | None:
-    values = [value]
+def _collective_wandb_preflight(request: EvaluationRequest) -> None:
+    accelerator = request.accelerator
+    error: str | None = None
+    if getattr(accelerator, "is_main_process", False):
+        try:
+            if not isinstance(request.wandb_logger, WandbValidationLogger):
+                raise WandbSyncError("WandbValidationLogger is mandatory on the main process")
+            if request.wandb_logger.accelerator is not accelerator:
+                raise WandbSyncError("W&B logger must use the evaluation Accelerator")
+            request.wandb_logger.preflight(request.validation_index)
+        except Exception as exc:
+            error = str(exc)
+    status = _broadcast_main_status(accelerator, "wandb-preflight", error)
+    if not status["ok"]:
+        raise WandbSyncError(status["error"])
+
+
+def _broadcast_main_status(
+    accelerator: Any,
+    phase: str,
+    error: str | None,
+) -> dict[str, object]:
+    payload: dict[str, object] | None = None
+    if getattr(accelerator, "is_main_process", False):
+        payload = {
+            "format_version": 1,
+            "phase": phase,
+            "ok": error is None,
+            "error": error,
+        }
+    values = [payload]
     broadcaster = getattr(accelerator, "broadcast_object_list", None)
     if callable(broadcaster):
         broadcaster(values, from_process=0)
@@ -1195,7 +1250,20 @@ def _broadcast_main_value(accelerator: Any, value: str | None) -> str | None:
         from accelerate.utils import broadcast_object_list
 
         broadcast_object_list(values, from_process=0)
-    return values[0]
+    result = values[0]
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"format_version", "phase", "ok", "error"}
+        or result.get("format_version") != 1
+        or result.get("phase") != phase
+        or type(result.get("ok")) is not bool
+        or not (
+            (result["ok"] is True and result.get("error") is None)
+            or (result["ok"] is False and isinstance(result.get("error"), str) and bool(result["error"]))
+        )
+    ):
+        raise WandbSyncError(f"collective {phase} status is invalid")
+    return result
 
 
 def _read_wandb_manifest(path: Path) -> dict[str, str | int]:
@@ -1370,6 +1438,7 @@ def _semantic_assignment(items: Sequence[EvaluationItem]) -> list[dict[str, obje
             "number_span": {
                 "reference_start": item.number_span.reference_start,
                 "reference_end": item.number_span.reference_end,
+                "category": item.number_span.category,
             },
             "voice_id": item.voice_id,
             "prompt_text": item.prompt_text,
