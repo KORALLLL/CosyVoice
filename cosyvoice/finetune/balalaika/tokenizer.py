@@ -1,0 +1,552 @@
+"""CUDA-only CosyVoice3 speech tokens, listening pilots, and cache-worker gate."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+from importlib import import_module
+import json
+import multiprocessing as mp
+import os
+from pathlib import Path
+import queue
+import tempfile
+from typing import Any, Callable, Mapping, Sequence
+import wave
+
+import numpy as np
+
+from .artifacts import StageRequirementError, StageStore, atomic_write_json, sha256_file
+from .cache import (
+    TOKEN_MAX,
+    TOKEN_MIN,
+    AudioInput,
+    CacheManifest,
+    CacheShardRequest,
+    CacheShardResult,
+    TarAudioSample,
+    build_cache_shard,
+    iter_tar_audio,
+    verify_cache,
+)
+from .config import RunPaths
+from .sources import inventory_sources
+
+
+class TokenizerError(RuntimeError):
+    """Raised for any unsafe or invalid CUDA speech-token extraction."""
+
+
+class PilotApprovalError(RuntimeError):
+    """Raised when a cache run lacks approval for the current pilot manifest."""
+
+
+class PilotReviewRequired(RuntimeError):
+    """Intentional stop after publishing a listening bundle for a human review."""
+
+    def __init__(self, manifest: "PilotManifest") -> None:
+        self.manifest = manifest
+        super().__init__(f"pilot review required; approve manifest sha256 {manifest.manifest_sha256}")
+
+
+@dataclass(frozen=True)
+class PilotManifest:
+    """Published listening bundle identity, including its StageStore checksum."""
+
+    root: Path
+    index_path: Path
+    stage_path: Path
+    manifest_sha256: str
+    clips: tuple[Mapping[str, object], ...]
+
+
+FeatureBuilder = Callable[[AudioInput], np.ndarray]
+
+
+class OnnxSpeechTokenizer:
+    """A persistent, single-CUDA-device ONNX Runtime speech-token session."""
+
+    def __init__(
+        self,
+        model_path: Path | None = None,
+        *,
+        session: Any | None = None,
+        max_batch_size: int = 8,
+        local_rank: int | None = None,
+        feature_builder: FeatureBuilder | None = None,
+    ) -> None:
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0")) if local_rank is None else local_rank
+        if self.local_rank < 0:
+            raise ValueError("local_rank must be non-negative")
+        self.max_batch_size = max_batch_size
+        self._feature_builder = feature_builder or _whisper_features
+        if session is None:
+            if model_path is None or not model_path.is_file():
+                raise TokenizerError(f"missing batch speech-tokenizer model: {model_path}")
+            session = _create_cuda_session(model_path, self.local_rank)
+        self.session = session
+        _require_cuda_provider(session)
+
+    @classmethod
+    def for_paths(cls, paths: RunPaths, *, local_rank: int | None = None, max_batch_size: int = 8) -> "OnnxSpeechTokenizer":
+        return cls(
+            paths.base_model_dir / "speech_tokenizer_v3.batch.onnx",
+            local_rank=local_rank,
+            max_batch_size=max_batch_size,
+        )
+
+    def extract(self, audio: list[AudioInput]) -> list[list[int]]:
+        """Extract validated tokens, bisecting only the exact CUDA-OOM batch."""
+
+        if not audio:
+            return []
+        for item in audio:
+            _validate_audio(item)
+        extracted: list[list[int]] = []
+        for offset in range(0, len(audio), self.max_batch_size):
+            extracted.extend(self._extract_with_oom_bisection(audio[offset : offset + self.max_batch_size]))
+        return extracted
+
+    def feature_lengths(self, audio: Sequence[AudioInput]) -> list[int]:
+        """Expose CPU-side feature lengths for qualification records."""
+
+        return [int(_feature_array(self._feature_builder(item)).shape[1]) for item in audio]
+
+    def _extract_with_oom_bisection(self, audio: list[AudioInput]) -> list[list[int]]:
+        try:
+            return self._run_batch(audio)
+        except Exception as exc:
+            if not _is_cuda_oom(exc):
+                if isinstance(exc, TokenizerError):
+                    raise
+                raise TokenizerError("CUDA ONNX speech-token inference failed") from exc
+            if len(audio) == 1:
+                raise TokenizerError(f"CUDA OOM for one audio item: {audio[0].source_relative_path}") from exc
+            middle = len(audio) // 2
+            return self._extract_with_oom_bisection(audio[:middle]) + self._extract_with_oom_bisection(audio[middle:])
+
+    def _run_batch(self, audio: list[AudioInput]) -> list[list[int]]:
+        features = [_feature_array(self._feature_builder(item)) for item in audio]
+        lengths = np.asarray([feature.shape[1] for feature in features], dtype=np.int32)
+        max_frames = int(lengths.max())
+        batched = np.zeros((len(features), max_frames, 128), dtype=np.float32)
+        for index, feature in enumerate(features):
+            batched[index, : feature.shape[1], :] = feature.T
+        inputs = self.session.get_inputs()
+        if len(inputs) < 2:
+            raise TokenizerError("speech-tokenizer ONNX model must expose features and lengths inputs")
+        outputs = self.session.run(None, {inputs[0].name: batched, inputs[1].name: lengths})
+        return _decode_onnx_outputs(outputs, len(audio), lengths)
+
+
+def run_tokenizer_qualification(paths: RunPaths) -> dict[str, object]:
+    """Qualify deterministic CUDA token extraction independently on all eight GPUs."""
+
+    _require_eight_devices(paths)
+    fixed = AudioInput("qualification/silence.wav", np.zeros(24_000, dtype=np.float32), 24_000, 24_000)
+    devices: list[dict[str, object]] = []
+    torch = import_module("torch")
+    for device in paths.visible_devices:
+        torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        tokenizer = OnnxSpeechTokenizer.for_paths(paths, local_rank=device)
+        first = tokenizer.extract([fixed])[0]
+        second = tokenizer.extract([fixed])[0]
+        if first != second:
+            raise TokenizerError(f"non-deterministic speech tokens on CUDA device {device}")
+        _validate_tokens(first, fixed.source_relative_path)
+        rate = len(first) / (fixed.frames / fixed.sample_rate)
+        if not 20.0 <= rate <= 30.0:
+            raise TokenizerError(f"speech token rate is not approximately 25 Hz on CUDA device {device}: {rate:.3f}")
+        feature_length = tokenizer.feature_lengths([fixed])[0]
+        expected_tokens = max(1, (feature_length + 3) // 4)
+        if len(first) != expected_tokens:
+            raise TokenizerError(
+                f"speech-token length does not match CPU feature length on CUDA device {device}: "
+                f"{len(first)} != {expected_tokens}"
+            )
+        providers = _session_providers(tokenizer.session)
+        devices.append(
+            {
+                "device": device,
+                "providers": providers,
+                "feature_frames": feature_length,
+                "token_count": len(first),
+                "token_rate_hz": rate,
+                "peak_vram_bytes": int(torch.cuda.max_memory_allocated(device)),
+            }
+        )
+    payload: dict[str, object] = {
+        "model": str(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
+        "model_sha256": sha256_file(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
+        "devices": devices,
+    }
+    StageStore(paths.stages_dir).publish("tokenizer_qualification", payload)
+    return payload
+
+
+def build_pilot(paths: RunPaths) -> PilotManifest:
+    """Build a three-clip, checksum-audited A/B reconstruction listening bundle."""
+
+    qualification = StageStore(paths.stages_dir).require("tokenizer_qualification")
+    clips = _select_duration_stratified_clips(paths)
+    pilot_root = paths.run_root / "pilot"
+    pilot_root.mkdir(parents=True, exist_ok=True)
+    tokenizer = OnnxSpeechTokenizer.for_paths(paths, local_rank=0)
+    reconstructor = _load_frozen_reconstructor(paths)
+    records: list[dict[str, object]] = []
+    labels = ("short", "median", "long")
+    for label, audio in zip(labels, clips, strict=True):
+        original = pilot_root / f"{label}.original.wav"
+        tokens_path = pilot_root / f"{label}.tokens.npy"
+        reconstructed = pilot_root / f"{label}.reconstructed.wav"
+        _write_wav(audio, original)
+        tokens = tokenizer.extract([audio])[0]
+        np.save(tokens_path, np.asarray(tokens, dtype=np.int32), allow_pickle=False)
+        _reconstruct_to_wav(reconstructor, original, reconstructed)
+        duration = audio.frames / audio.sample_rate
+        records.append(
+            {
+                "label": label,
+                "source_relative_path": audio.source_relative_path,
+                "duration_seconds": duration,
+                "token_count": len(tokens),
+                "token_rate_hz": len(tokens) / duration,
+                "token_min": min(tokens),
+                "token_max": max(tokens),
+                "original": original.name,
+                "original_sha256": sha256_file(original),
+                "tokens": tokens_path.name,
+                "tokens_sha256": sha256_file(tokens_path),
+                "reconstructed": reconstructed.name,
+                "reconstructed_sha256": sha256_file(reconstructed),
+            }
+        )
+    index = pilot_root / "index.md"
+    _atomic_write_text(index, _pilot_index(records))
+    payload = {
+        "qualification_manifest_sha256": qualification.manifest_sha256,
+        "base_model": str(paths.base_model_dir),
+        "base_model_tokenizer_sha256": sha256_file(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
+        "index": str(index),
+        "index_sha256": sha256_file(index),
+        "clips": records,
+    }
+    record = StageStore(paths.stages_dir).publish("pilot", payload)
+    manifest = PilotManifest(pilot_root, index, record.path, record.manifest_sha256, tuple(records))
+    raise PilotReviewRequired(manifest)
+
+
+def approve_pilot(paths: RunPaths, checksum: str) -> Path:
+    """Atomically record a human approval only for the current pilot checksum."""
+
+    if not isinstance(checksum, str) or len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        raise PilotApprovalError("pilot approval checksum must be a lowercase 64-hex SHA-256")
+    try:
+        pilot = StageStore(paths.stages_dir).require("pilot")
+    except StageRequirementError as exc:
+        raise PilotApprovalError("current pilot manifest is unavailable") from exc
+    if checksum != pilot.manifest_sha256:
+        raise PilotApprovalError("provided approval checksum does not match the current pilot manifest")
+    approval = StageStore(paths.stages_dir).publish(
+        "pilot_approval", {"pilot_manifest_sha256": pilot.manifest_sha256}
+    )
+    return approval.path
+
+
+def run_cache_workers(paths: RunPaths) -> CacheManifest:
+    """Run approved cache work through exactly eight persistent spawned CUDA workers."""
+
+    _require_current_pilot_approval(paths)
+    _require_eight_devices(paths)
+    inventory = inventory_sources(paths)
+    cache_root = paths.run_root / "cache"
+    plan_dir = paths.run_root / "split_plan"
+    existing: set[int] = set()
+    manifests = list((cache_root / "shard_manifests").glob("shard_*.json"))
+    if manifests:
+        existing = set(verify_cache(cache_root).shards)
+    requests = [
+        CacheShardRequest(
+            source_tar=archive,
+            plan_dir=plan_dir,
+            cache_root=cache_root,
+            shard=int(archive.stem.split("_")[1]),
+            expected_source_sha256=inventory.source_archive_sha256[archive.name],
+            expected_plan_sha256=sha256_file(plan_dir / f"{archive.stem}.jsonl"),
+        )
+        for archive in inventory.source_archives
+        if int(archive.stem.split("_")[1]) not in existing
+    ]
+    if not requests:
+        return verify_cache(cache_root)
+    context = mp.get_context("spawn")
+    work: mp.Queue[Mapping[str, object] | None] = context.Queue()
+    results: mp.Queue[Mapping[str, object]] = context.Queue()
+    for request in requests:
+        work.put(request.to_dict())
+    for _ in paths.visible_devices:
+        work.put(None)
+    workers = [
+        context.Process(
+            target=_cache_worker,
+            args=(device, str(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"), work, results),
+            daemon=False,
+        )
+        for device in paths.visible_devices
+    ]
+    for worker in workers:
+        worker.start()
+    remaining_shards = {request.shard for request in requests}
+    try:
+        while remaining_shards:
+            try:
+                message = results.get(timeout=1)
+            except queue.Empty:
+                failed = next((worker for worker in workers if worker.exitcode not in (None, 0)), None)
+                if failed is not None:
+                    raise TokenizerError(f"cache worker exited unsuccessfully: {failed.pid} ({failed.exitcode})")
+                continue
+            if message.get("error") is not None:
+                raise TokenizerError(f"cache worker failed: {message['error']}")
+            result = CacheShardResult.from_dict(_mapping(message.get("result"), "cache worker result"))
+            if result.shard not in remaining_shards:
+                raise TokenizerError(f"cache worker returned a duplicate or unleased shard: {result.shard}")
+            remaining_shards.remove(result.shard)
+        for worker in workers:
+            worker.join()
+            if worker.exitcode != 0:
+                raise TokenizerError(f"cache worker exited unsuccessfully: {worker.pid} ({worker.exitcode})")
+    except BaseException:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers:
+            worker.join()
+        raise
+    return verify_cache(cache_root)
+
+
+def _create_cuda_session(model_path: Path, local_rank: int) -> Any:
+    try:
+        onnxruntime = import_module("onnxruntime")
+        available = list(onnxruntime.get_available_providers())
+        if "CUDAExecutionProvider" not in available:
+            raise TokenizerError("ONNX Runtime CUDAExecutionProvider is unavailable")
+        options = onnxruntime.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return onnxruntime.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=[("CUDAExecutionProvider", {"device_id": local_rank})],
+        )
+    except TokenizerError:
+        raise
+    except Exception as exc:
+        raise TokenizerError(f"failed to create CUDA ONNX speech-tokenizer session on device {local_rank}") from exc
+
+
+def _require_cuda_provider(session: Any) -> None:
+    providers = _session_providers(session)
+    if providers and providers != ["CUDAExecutionProvider"]:
+        raise TokenizerError(f"speech-tokenizer session did not bind CUDAExecutionProvider exclusively: {providers}")
+
+
+def _session_providers(session: Any) -> list[str]:
+    getter = getattr(session, "get_providers", None)
+    if not callable(getter):
+        return []
+    try:
+        return [str(provider) for provider in getter()]
+    except Exception as exc:
+        raise TokenizerError("cannot verify CUDA ONNX session providers") from exc
+
+
+def _validate_audio(audio: AudioInput) -> None:
+    if audio.sample_rate != 24_000 or audio.frames < 1:
+        raise TokenizerError(f"tokenizer requires non-empty 24 kHz audio: {audio.source_relative_path}")
+
+
+def _whisper_features(audio: AudioInput) -> np.ndarray:
+    _validate_audio(audio)
+    try:
+        torch = import_module("torch")
+        torchaudio = import_module("torchaudio")
+        whisper = import_module("whisper")
+        samples = torch.as_tensor(audio.samples, dtype=torch.float32).squeeze()
+        if samples.ndim != 1 or samples.numel() != audio.frames or not bool(torch.isfinite(samples).all()):
+            raise TokenizerError(f"invalid mono samples for {audio.source_relative_path}")
+        resampled = torchaudio.functional.resample(samples.unsqueeze(0), 24_000, 16_000).squeeze(0)
+        return _feature_array(whisper.log_mel_spectrogram(resampled, n_mels=128).detach().cpu().numpy())
+    except TokenizerError:
+        raise
+    except Exception as exc:
+        raise TokenizerError(f"cannot build Whisper features for {audio.source_relative_path}") from exc
+
+
+def _feature_array(value: Any) -> np.ndarray:
+    feature = np.asarray(value, dtype=np.float32)
+    if feature.ndim != 2 or feature.shape[0] != 128 or feature.shape[1] < 1 or not np.isfinite(feature).all():
+        raise TokenizerError("Whisper feature builder must return finite [128, frames] features")
+    return feature
+
+
+def _decode_onnx_outputs(outputs: Any, batch_size: int, feature_lengths: np.ndarray) -> list[list[int]]:
+    if not isinstance(outputs, Sequence) or not outputs:
+        raise TokenizerError("speech-tokenizer ONNX session returned no outputs")
+    values = np.asarray(outputs[0])
+    if values.ndim == 1:
+        if batch_size != 1:
+            raise TokenizerError("speech-tokenizer ONNX output omitted batch dimension")
+        values = values.reshape(1, -1)
+    if values.ndim != 2 or values.shape[0] != batch_size:
+        raise TokenizerError("speech-tokenizer ONNX output has invalid batch shape")
+    lengths = np.full(batch_size, -1, dtype=np.int64)
+    if len(outputs) > 1:
+        candidate = np.asarray(outputs[1]).reshape(-1)
+        if candidate.size == batch_size:
+            lengths = candidate.astype(np.int64, copy=False)
+    result: list[list[int]] = []
+    for index, row in enumerate(values):
+        length = int(lengths[index]) if lengths[index] >= 0 else max(1, (int(feature_lengths[index]) + 3) // 4)
+        if length < 1 or length > row.size:
+            raise TokenizerError("speech-tokenizer ONNX output has invalid token length")
+        tokens = [int(token) for token in row[:length]]
+        _validate_tokens(tokens, f"batch item {index}")
+        result.append(tokens)
+    return result
+
+
+def _validate_tokens(tokens: Sequence[int], identifier: str) -> None:
+    if not tokens:
+        raise TokenizerError(f"speech-tokenizer returned no tokens for {identifier}")
+    for token in tokens:
+        if isinstance(token, bool) or not isinstance(token, (int, np.integer)) or token < TOKEN_MIN or token > TOKEN_MAX:
+            raise TokenizerError(f"speech token outside [0, 6560] for {identifier}: {token!r}")
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "out of memory" in message or "cuda error 2" in message or "cuda malloc" in message
+
+
+def _require_eight_devices(paths: RunPaths) -> None:
+    if tuple(paths.visible_devices) != tuple(range(8)):
+        raise TokenizerError("tokenizer qualification/cache requires exactly CUDA devices 0 through 7")
+
+
+def _select_duration_stratified_clips(paths: RunPaths) -> list[AudioInput]:
+    """Choose short/median/long from a deterministic bounded candidate reservoir."""
+
+    candidates: list[tuple[bytes, TarAudioSample]] = []
+    for archive in inventory_sources(paths).source_archives:
+        for sample in iter_tar_audio(archive):
+            score = hashlib.sha256(f"{paths.seed}\0{sample.source_relative_path}".encode("utf-8")).digest()
+            candidates.append((score, sample))
+            candidates.sort(key=lambda value: value[0])
+            del candidates[33:]
+    if len(candidates) < 3:
+        raise TokenizerError("pilot needs at least three deterministic source clips")
+    from .cache import _decode_audio
+
+    decoded = [_decode_audio(sample) for _, sample in candidates]
+    decoded.sort(key=lambda item: (item.frames, item.source_relative_path))
+    return [decoded[0], decoded[len(decoded) // 2], decoded[-1]]
+
+
+def _load_frozen_reconstructor(paths: RunPaths) -> Any:
+    if not paths.base_model_dir.is_dir():
+        raise TokenizerError(f"missing frozen base CosyVoice3 model: {paths.base_model_dir}")
+    cosyvoice = import_module("cosyvoice.cli.cosyvoice")
+    return cosyvoice.CosyVoice3(str(paths.base_model_dir), load_trt=False, load_vllm=False, fp16=False)
+
+
+def _write_wav(audio: AudioInput, path: Path) -> None:
+    samples = np.asarray(audio.samples, dtype=np.float32).reshape(-1)
+    if samples.size != audio.frames:
+        raise TokenizerError(f"audio frame count disagrees for {audio.source_relative_path}")
+    pcm = np.clip(samples, -1.0, 1.0)
+    pcm = (pcm * np.iinfo(np.int16).max).astype("<i2", copy=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(24_000)
+        output.writeframes(pcm.tobytes())
+
+
+def _reconstruct_to_wav(reconstructor: Any, original: Path, destination: Path) -> None:
+    try:
+        output = next(reconstructor.inference_vc(str(original), str(original), stream=False))
+        samples = np.asarray(output["tts_speech"].squeeze().detach().cpu(), dtype=np.float32)
+        _write_wav(AudioInput(original.name, samples, 24_000, int(samples.size)), destination)
+    except Exception as exc:
+        raise TokenizerError(f"frozen flow/HiFT reconstruction failed for {original}") from exc
+
+
+def _pilot_index(records: Sequence[Mapping[str, object]]) -> str:
+    lines = ["# Speech-token reconstruction pilot", "", "Listen to each original/reconstruction pair before approving this exact manifest.", ""]
+    for record in records:
+        lines.extend(
+            [
+                f"## {record['label']}: `{record['source_relative_path']}`",
+                "",
+                f"- Original: [{record['original']}]({record['original']})",
+                f"- Reconstruction: [{record['reconstructed']}]({record['reconstructed']})",
+                f"- Tokens: [{record['tokens']}]({record['tokens']}); count={record['token_count']}, rate={record['token_rate_hz']:.2f} Hz, IDs={record['token_min']}..{record['token_max']}",
+                "",
+                "Listening decision: [ ] intelligible  [ ] speaker/prompt conditioning acceptable  [ ] approve",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as temporary:
+            temporary_name = temporary.name
+            temporary.write(value)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if temporary_name is not None and os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def _require_current_pilot_approval(paths: RunPaths) -> None:
+    store = StageStore(paths.stages_dir)
+    try:
+        pilot = store.require("pilot")
+        approval = store.require("pilot_approval")
+    except StageRequirementError as exc:
+        raise PilotApprovalError("cache tokenization requires a current checksum-bound pilot approval") from exc
+    if approval.payload.get("pilot_manifest_sha256") != pilot.manifest_sha256:
+        raise PilotApprovalError("pilot approval does not match the current pilot manifest")
+
+
+def _cache_worker(device: int, model_path: str, work: Any, results: Any) -> None:
+    os.environ["LOCAL_RANK"] = str(device)
+    try:
+        tokenizer = OnnxSpeechTokenizer(Path(model_path), local_rank=device)
+        while True:
+            value = work.get()
+            if value is None:
+                return
+            request = CacheShardRequest.from_dict(_mapping(value, "cache worker request"))
+            result = build_cache_shard(request, tokenizer)
+            results.put({"result": result.to_dict()})
+    except BaseException as exc:
+        results.put({"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TokenizerError(f"invalid {name}")
+    return value
