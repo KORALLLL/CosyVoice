@@ -1,5 +1,16 @@
 # Implementation Notes
 
+## 2026-08-02 - Distinguish combined-sidecar and ROVER schemas
+
+- The real canonical ROVER archive and its repair manifest use integer
+  `schema_version: 1`; the combined normalized/stress-marked transcription
+  sidecar independently uses `"rover-punctuation-stress-v1"`.
+- Fixture-derived code incorrectly applied the combined-sidecar schema to both
+  sources. The two contracts are now validated separately and recorded in the
+  split manifest provenance. Cross-use is rejected in both directions.
+- The production launch stopped during preflight before publishing artifacts;
+  no pilot, memorization, cache, validation, or training work ran.
+
 ## 2026-08-02 - Qualify Whisper before corpus hashing
 
 - The first post-timeout production pilot attempt completed both 373 GB source

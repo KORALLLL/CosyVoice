@@ -138,6 +138,10 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(counts.total, 3)
         manifest = json.loads((counts.plan_dir / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["phase1"] + manifest["phase2"] + manifest["null"] + manifest["reserved"] + manifest["model_limit_exclusions"], 3)
+        self.assertEqual(
+            manifest["source_schema_versions"],
+            {"combined_sidecar": "rover-punctuation-stress-v1", "rover_archive": 1},
+        )
         rows = list(iter_split_rows(counts.plan_dir, 0))
         self.assertEqual([row.instruct for row in rows], [INSTRUCT, INSTRUCT, INSTRUCT])
         self.assertEqual(sum(row.reserved for row in rows), 1)
@@ -156,6 +160,25 @@ class SourceTests(unittest.TestCase):
         rows[0]["schema_version"] = "unknown-v2"
         rover.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         with self.assertRaisesRegex(SourceIntegrityError, "schema version"):
+            self._build_fixture_plan()
+
+    def test_combined_and_rover_schema_contracts_are_not_interchangeable(self) -> None:
+        combined = self._combined_path()
+        combined_rows = [json.loads(line) for line in combined.read_text(encoding="utf-8").splitlines()]
+        combined_rows[0]["schema_version"] = 1
+        combined.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in combined_rows),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(SourceIntegrityError, "combined schema version"):
+            self._build_fixture_plan()
+
+        shutil.copyfile(FIXTURES / "combined.jsonl", combined)
+        rover = self._rover_path()
+        rover_rows = [json.loads(line) for line in rover.read_text(encoding="utf-8").splitlines()]
+        rover_rows[0]["schema_version"] = "rover-punctuation-stress-v1"
+        rover.write_text("".join(json.dumps(row) + "\n" for row in rover_rows), encoding="utf-8")
+        with self.assertRaisesRegex(SourceIntegrityError, "ROVER schema version"):
             self._build_fixture_plan()
 
     def test_rover_archive_is_streamed_and_requires_agreement_field(self) -> None:

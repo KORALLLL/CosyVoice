@@ -18,7 +18,9 @@ from .config import RunPaths
 
 COMBINED_SIDECAR_RELATIVE = Path("combined_sidecars/rover-punctuation-stress-v1/rover-punctuation-stress.jsonl")
 ROVER_ARCHIVE_RELATIVE = Path("punctuation_artifacts/20260729T135419Z/balalaika-rover-results-20260729T135419Z.tar.zst")
-SCHEMA_VERSION = "rover-punctuation-stress-v1"
+COMBINED_SCHEMA_VERSION = "rover-punctuation-stress-v1"
+ROVER_SCHEMA_VERSION = 1
+SPLIT_PLAN_SCHEMA_VERSION = "rover-punctuation-stress-v1"
 INSTRUCT = "You are a helpful assistant.<|endofprompt|>"
 EXPECTED_SOURCE_TARS = 519
 EXPECTED_SOURCE_ROWS = 4_075_032
@@ -190,7 +192,11 @@ def build_split_plan(
     atomic_write_json(
         manifest_path,
         {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": SPLIT_PLAN_SCHEMA_VERSION,
+            "source_schema_versions": {
+                "combined_sidecar": COMBINED_SCHEMA_VERSION,
+                "rover_archive": ROVER_SCHEMA_VERSION,
+            },
             "seed": seed,
             "phase1": counts.phase1,
             "phase2": counts.phase2,
@@ -336,7 +342,7 @@ def _iter_combined_groups(path: Path, audit: _JoinAudit) -> Iterator[tuple[int, 
     with path.open(encoding="utf-8") as handle:
         for number, line in enumerate(handle, start=1):
             row = _json_mapping(line, path, number)
-            _schema(row, path, number)
+            _combined_schema(row, path, number)
             source_relative_path = _source_relative_path(row, path, number)
             shard = _shard_number(source_relative_path)
             if current_shard is not None and shard < current_shard:
@@ -360,7 +366,7 @@ def _iter_rover_rows(path: Path) -> Iterator[Mapping[str, object]]:
         with path.open(encoding="utf-8") as handle:
             for number, line in enumerate(handle, start=1):
                 row = _json_mapping(line, path, number)
-                _schema(row, path, number)
+                _rover_schema(row, path, number)
                 yield row
         return
 
@@ -379,7 +385,7 @@ def _iter_rover_rows(path: Path) -> Iterator[Mapping[str, object]]:
                 raise SourceIntegrityError(f"cannot read ROVER archive member: {member.name}")
             for number, raw in enumerate(extracted, start=1):
                 row = _json_mapping(raw.decode("utf-8"), path, number)
-                _schema(row, path, number)
+                _rover_schema(row, path, number)
                 yield row
         archive.close()
         archive = None
@@ -400,9 +406,14 @@ def _iter_rover_rows(path: Path) -> Iterator[Mapping[str, object]]:
             process.wait()
 
 
-def _schema(row: Mapping[str, object], path: Path, number: int) -> None:
-    if row.get("schema_version") != SCHEMA_VERSION:
-        raise SourceIntegrityError(f"unexpected schema version in {path}:{number}")
+def _combined_schema(row: Mapping[str, object], path: Path, number: int) -> None:
+    if row.get("schema_version") != COMBINED_SCHEMA_VERSION:
+        raise SourceIntegrityError(f"unexpected combined schema version in {path}:{number}")
+
+
+def _rover_schema(row: Mapping[str, object], path: Path, number: int) -> None:
+    if row.get("schema_version") != ROVER_SCHEMA_VERSION:
+        raise SourceIntegrityError(f"unexpected ROVER schema version in {path}:{number}")
 
 
 def _json_mapping(line: str, path: Path, number: int) -> Mapping[str, object]:
