@@ -460,12 +460,23 @@ class WorkflowTests(unittest.TestCase):
             "HF_TOKEN": "hugging-face-secret",
             "nested": {"WANDB_API_KEY": "wandb-secret", "safe": "ok"},
             "items": [{"client_secret": "oauth-secret"}],
+            "access_token": {"raw": "structured-secret"},
+            "token_limit": 6_000,
+            "TOKENIZER": {"qualified": True},
         }
-        rendered = json.dumps(redact_secrets(value))
+        redacted = redact_secrets(value)
+        rendered = json.dumps(redacted)
         self.assertNotIn("hugging-face-secret", rendered)
         self.assertNotIn("wandb-secret", rendered)
         self.assertNotIn("oauth-secret", rendered)
+        self.assertNotIn("structured-secret", rendered)
         self.assertIn("[REDACTED]", rendered)
+        self.assertEqual(redacted["HF_TOKEN"], "[REDACTED]")
+        self.assertEqual(redacted["nested"]["WANDB_API_KEY"], "[REDACTED]")
+        self.assertEqual(redacted["items"][0]["client_secret"], "[REDACTED]")
+        self.assertEqual(redacted["access_token"], "[REDACTED]")
+        self.assertEqual(redacted["token_limit"], 6_000)
+        self.assertEqual(redacted["TOKENIZER"], {"qualified": True})
 
     def test_production_backend_reuses_one_wandb_validation_logger_per_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -529,10 +540,13 @@ class WorkflowTests(unittest.TestCase):
             with contextlib.redirect_stdout(stdout), mock.patch.dict(
                 os.environ, {"HF_TOKEN": "should-not-leak"}, clear=False
             ):
-                code = main(["status", "--run-root", str(root)])
+                code = main(["status", "--run-root", str(root), "--token-limit", "6000"])
             self.assertEqual(code, ExitCode.SUCCESS)
             self.assertFalse(root.exists())
             self.assertNotIn("should-not-leak", stdout.getvalue())
+            status = json.loads(stdout.getvalue())
+            self.assertEqual(status["workflow"]["token_limit"], 6_000)
+            self.assertIsInstance(status["stages"]["tokenizer_qualified"], dict)
 
     def test_recipe_has_exactly_two_accelerate_launchers(self) -> None:
         recipe = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora"

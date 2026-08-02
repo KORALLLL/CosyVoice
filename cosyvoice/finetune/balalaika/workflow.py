@@ -1370,15 +1370,28 @@ def _resolve(args: argparse.Namespace) -> tuple[WorkflowOptions, WorkflowBackend
 
 
 def redact_secrets(value: object, key: str = "") -> object:
-    """Recursively replace values under secret-looking keys."""
+    """Recursively replace string or structured values under semantic secret keys."""
 
-    if any(word in key.upper() for word in _SECRET_WORDS):
+    if _has_secret_identifier_segment(key) and _is_secret_value(value):
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {str(name): redact_secrets(item, str(name)) for name, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [redact_secrets(item) for item in value]
     return value
+
+
+def _has_secret_identifier_segment(key: str) -> bool:
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    segments = re.findall(r"[A-Za-z0-9]+", camel_split.upper())
+    return any(segment in _SECRET_WORDS for segment in segments)
+
+
+def _is_secret_value(value: object) -> bool:
+    return (
+        isinstance(value, (str, bytes, Mapping))
+        or isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+    )
 
 
 def _status(args: argparse.Namespace) -> int:

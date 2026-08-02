@@ -160,3 +160,9 @@
 - Changed: The tiny fixture patches the workflow's validation-generation constant to its eight-row benchmark only for the fixture invocation. Its backend rejects any different count and publishes the actual `EvaluationReport.row_count`, preventing scaled reports from claiming the production 2,000-generation contract.
 - Decision: Read the committed validation-0, phase-1, and phase-2 stage evidence back from the authenticated workflow store and independently require both all 41 report row counts and all 41 persisted evidence counts to equal eight.
 - Validation: The strengthened integration test passes 1/1 in 78.039 seconds, the unchanged production workflow contract passes 20/20 with 2,000 generations at all 41 points, and all Balalaika tests pass 227/227 in 255.710 seconds.
+
+### Fix round 2
+
+- Changed: Status redaction matches `TOKEN`, `KEY`, and `SECRET` only as complete snake-, hyphen-, dot-, or camel-case identifier segments. `TOKENIZER` is no longer mistaken for a credential field.
+- Decision: Redact string and structured values under semantic secret keys while preserving non-secret scalar configuration such as numeric `token_limit`. Recursive tests retain explicit coverage for HF, W&B, OAuth, and structured token values.
+- Validation: Focused workflow tests pass 20/20, including parsed status assertions for `workflow.token_limit == 6000` and mapping-shaped `stages.tokenizer_qualified`; all Balalaika tests pass 227/227 in 246.823 seconds.
