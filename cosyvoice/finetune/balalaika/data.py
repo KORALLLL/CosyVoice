@@ -10,6 +10,7 @@ from typing import Any, Iterator, Protocol, Sequence
 
 import pyarrow as pa
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -47,6 +48,8 @@ class _RowGroup:
     """One Arrow row group and its exclusive global dataset range."""
 
     fragment: Any
+    path: Path
+    row_group: int
     stop: int
 
 
@@ -75,7 +78,7 @@ class CachedSpeechDataset(Dataset[CachedRow]):
                 if count < 1:
                     continue
                 total += count
-                self._groups.append(_RowGroup(group, total))
+                self._groups.append(_RowGroup(group, Path(group.path), group.row_groups[0].id, total))
         expected = cache.phase_rows.get(self.phase)
         if expected is None or total != expected:
             raise ValueError(f"verified phase {self.phase} row count does not match cache manifest")
@@ -93,11 +96,22 @@ class CachedSpeechDataset(Dataset[CachedRow]):
         group_index = bisect_right(self._stops, index)
         group = self._groups[group_index]
         start = 0 if group_index == 0 else self._groups[group_index - 1].stop
-        table = group.fragment.to_table(columns=list(_PHASE_COLUMNS))
-        values = table.slice(index - start, 1).to_pylist()
-        if len(values) != 1:
-            raise ValueError(f"cached phase row {index} could not be materialized")
-        return _cached_row(values[0], self._tokenizer)
+        return _cached_row(_read_one_row(group, index - start), self._tokenizer)
+
+
+def _read_one_row(group: _RowGroup, offset: int) -> dict[str, Any]:
+    """Read one row from a memory-mapped Parquet row group without a table scan."""
+
+    reader = pq.ParquetFile(group.path, memory_map=True)
+    for position, batch in enumerate(
+        reader.iter_batches(batch_size=1, row_groups=[group.row_group], columns=list(_PHASE_COLUMNS))
+    ):
+        if position == offset:
+            values = batch.to_pylist()
+            if len(values) == 1:
+                return values[0]
+            break
+    raise ValueError(f"cached row-group offset {offset} could not be materialized")
 
 
 class TokenBatchSampler(Sampler[list[int]]):
@@ -155,16 +169,20 @@ class TokenBatchSampler(Sampler[list[int]]):
     def _pack(self, indices: Sequence[int]) -> list[list[int]]:
         batches: list[list[int]] = []
         current: list[int] = []
-        longest = 0
+        max_text = 0
+        max_speech = 0
         for index in indices:
-            length = self._combined_length(index)
-            candidate_longest = max(longest, length)
-            if current and candidate_longest * (len(current) + 1) > self.max_tokens_per_gpu:
+            row = self.dataset[index]
+            candidate_text = max(max_text, row.text_token_len)
+            candidate_speech = max(max_speech, row.speech_token_len)
+            if current and (len(current) + 1) * (candidate_text + candidate_speech) > self.max_tokens_per_gpu:
                 batches.append(current)
                 current = []
-                longest = 0
+                max_text = 0
+                max_speech = 0
             current.append(index)
-            longest = max(longest, length)
+            max_text = max(max_text, row.text_token_len)
+            max_speech = max(max_speech, row.speech_token_len)
         if current:
             batches.append(current)
         return batches

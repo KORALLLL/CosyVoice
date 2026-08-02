@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 import tempfile
@@ -71,6 +72,21 @@ class CachedDataTests(unittest.TestCase):
         self.assertEqual(row.source_relative_path, "000000/clip-07.mp3")
         self.assertEqual(row.text_token_len, 2)
         self.assertEqual(row.speech_token, (7, 8, 9))
+
+    def test_dataset_reads_one_row_from_a_multi_row_group_without_fragment_table(self) -> None:
+        api = _api()
+        cache = self._write_cache(6, row_group_size=6)
+        dataset = api.CachedSpeechDataset(cache, PhaseSpec.for_phase(1), self.tokenizer)
+
+        class WholeGroupRead:
+            def to_table(self, **_):
+                raise AssertionError("__getitem__ must not materialize a whole row group")
+
+        dataset._groups[0] = replace(dataset._groups[0], fragment=WholeGroupRead())
+        row = dataset[4]
+
+        self.assertEqual(row.source_relative_path, "000000/clip-04.mp3")
+        self.assertEqual(row.speech_token, (4, 5, 6))
 
     def test_dataset_rejects_cached_speech_length_mismatch_on_access(self) -> None:
         api = _api()
@@ -156,6 +172,16 @@ class CachedDataTests(unittest.TestCase):
             [list(api.TokenBatchSampler(dataset, rank=rank, seed=1986, epoch=4, max_tokens_per_gpu=12, window_size=5)) for rank in range(8)],
         )
 
+    def test_packing_charges_independently_padded_text_and_speech(self) -> None:
+        api = _api()
+        rows = [
+            api.CachedRow("text-long", "text", "You are a helpful assistant.<|endofprompt|>", (1,), 1, 100),
+            api.CachedRow("speech-long", "text", "You are a helpful assistant.<|endofprompt|>", tuple(range(100)), 100, 1),
+        ]
+        sampler = api.TokenBatchSampler(rows, rank=0, max_tokens_per_gpu=202, window_size=2)
+
+        self.assertEqual(sampler._pack([0, 1]), [[0], [1]])
+
     def test_even_accelerate_steps_use_explicit_empty_sync_batches(self) -> None:
         api = _api()
         dataset = api.CachedSpeechDataset(self.cache, PhaseSpec.for_phase(1), self.tokenizer)
@@ -177,7 +203,13 @@ class CachedDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly eight"):
             api.build_phase_dataloader(self.cache, PhaseSpec.for_phase(1), accelerator, 0, tokenizer=self.tokenizer)
 
-    def _write_cache(self, count: int, *, token_length: int | None = None) -> CacheManifest:
+    def _write_cache(
+        self,
+        count: int,
+        *,
+        token_length: int | None = None,
+        row_group_size: int = 1,
+    ) -> CacheManifest:
         phase_dir = self.root / "phase1"
         phase_dir.mkdir(exist_ok=True)
         rows = [
@@ -201,7 +233,7 @@ class CachedDataTests(unittest.TestCase):
                 "speech_token_len": pa.array([row["speech_token_len"] for row in rows], type=pa.int32()),
             }
         )
-        pq.write_table(table, phase_dir / "shard_000000.parquet", row_group_size=1)
+        pq.write_table(table, phase_dir / "shard_000000.parquet", row_group_size=row_group_size)
         return CacheManifest(self.root, {0: self.root / "shard_manifests/shard_000000.json"}, {1: count, 2: 0}, 20)
 
 
