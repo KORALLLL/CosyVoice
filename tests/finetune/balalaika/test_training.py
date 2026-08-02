@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from importlib import import_module
 from itertools import islice
 import json
 from pathlib import Path
 import tempfile
-import types
 import unittest
 from unittest import mock
 
@@ -174,332 +173,47 @@ def _save_adapter(model, path):
     )
 
 
-def _half_after_two_steps(step: int) -> float:
-    return 1.0 if step < 2 else 0.5
-
-
-def _quarter_after_two_steps(step: int) -> float:
-    return 1.0 if step < 2 else 0.25
-
-
-_MUTABLE_SCHEDULER_CONFIG = types.ModuleType("mutable_scheduler_config")
-setattr(_MUTABLE_SCHEDULER_CONFIG, "multiplier", 0.5)
-
-
-def _module_backed_schedule(step: int) -> float:
-    return 1.0 if step < 2 else _MUTABLE_SCHEDULER_CONFIG.multiplier
-
-
-_NESTED_GLOBAL_MULTIPLIER = 0.5
-_DYNAMIC_SCHEDULER_GLOBAL_NAME = "_NESTED_GLOBAL_MULTIPLIER"
-_DYNAMIC_SCHEDULER_ATTRIBUTE = "multiplier"
-_DYNAMIC_SCHEDULER_LOCAL_NAME = "step"
-
-
-def _nested_global_schedule(step: int) -> float:
-    return 1.0 if step < 2 else (lambda: _NESTED_GLOBAL_MULTIPLIER)()
-
-
-def _globals_backed_schedule(step: int) -> float:
-    return 1.0 if step < 2 else globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-
-
-def _aliased_globals_schedule(step: int, namespace=globals) -> float:
-    return 1.0 if step < 2 else namespace()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-
-
-def _locals_backed_schedule(step: int) -> float:
-    return 1.0 if step < 2 else locals()[_DYNAMIC_SCHEDULER_LOCAL_NAME]
-
-
-def _dynamic_scheduler_holder() -> None:
-    return None
-
-
-setattr(_dynamic_scheduler_holder, _DYNAMIC_SCHEDULER_ATTRIBUTE, 0.5)
-
-
-def _vars_backed_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else vars(_dynamic_scheduler_holder)[_DYNAMIC_SCHEDULER_ATTRIBUTE]
-    )
-
-
-def _getattr_backed_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else getattr(_dynamic_scheduler_holder, _DYNAMIC_SCHEDULER_ATTRIBUTE)
-    )
-
-
-def _dunder_dict_backed_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else _dynamic_scheduler_holder.__dict__[_DYNAMIC_SCHEDULER_ATTRIBUTE]
-    )
-
-
-def _runtime_import_builtins_schedule(step: int) -> float:
-    import builtins
-
-    return 1.0 if step < 2 else builtins.globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-
-
-def _runtime_from_import_schedule(step: int) -> float:
-    from builtins import globals as namespace
-
-    return 1.0 if step < 2 else namespace()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-
-
-def _nested_runtime_import_schedule(step: int) -> float:
-    def lookup() -> float:
-        import builtins
-
-        return builtins.globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-
-    return 1.0 if step < 2 else lookup()
-
-
-def _dunder_import_builtins_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else __import__("builtins").globals()[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-    )
-
-
-def _eval_backed_schedule(step: int) -> float:
-    return 1.0 if step < 2 else eval("0.5")
-
-
-def _exec_backed_schedule(step: int) -> float:
-    if step < 2:
-        return 1.0
-    namespace: dict[str, float] = {}
-    exec("result = 0.5", {}, namespace)
-    return namespace["result"]
-
-
-def _compile_backed_schedule(step: int) -> float:
-    if step < 2:
-        return 1.0
-    return 0.5 if compile("0.5", "<scheduler>", "eval") else 1.0
-
-
-def _function_globals_backed_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else _dynamic_scheduler_holder.__globals__[_DYNAMIC_SCHEDULER_GLOBAL_NAME]
-    )
-
-
-def _function_builtins_backed_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else _dynamic_scheduler_holder.__builtins__["globals"]()[
-            _DYNAMIC_SCHEDULER_GLOBAL_NAME
-        ]
-    )
-
-
-def _dunder_getattribute_backed_schedule(step: int) -> float:
-    return (
-        1.0
-        if step < 2
-        else _dynamic_scheduler_holder.__getattribute__("__globals__")[
-            _DYNAMIC_SCHEDULER_GLOBAL_NAME
-        ]
-    )
-
-
-def _constant_lambda_scheduler(parameter: torch.nn.Parameter):
-    return torch.optim.lr_scheduler.LambdaLR(
-        torch.optim.AdamW([parameter], lr=1e-4), lambda _: 1.0
-    )
-
-
 class AccelerateTrainingTests(unittest.TestCase):
-    def test_scheduler_identity_rejects_runtime_imports_in_nested_code(self) -> None:
+    def test_constant_scheduler_spec_is_json_serializable_and_keeps_exact_lr(self) -> None:
         api = _api()
-
-        for schedule in (
-            _runtime_import_builtins_schedule,
-            _runtime_from_import_schedule,
-            _nested_runtime_import_schedule,
-        ):
-            with self.subTest(schedule=schedule.__name__):
-                parameter = torch.nn.Parameter(torch.tensor(0.0))
-                scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    torch.optim.AdamW([parameter], lr=1e-4), schedule
-                )
-
-                with self.assertRaises(ValueError):
-                    api._scheduler_identity(scheduler)
-
-        import_star = types.FunctionType(
-            compile("from builtins import *", "<scheduler>", "exec"), {}
-        )
-        with self.subTest(schedule="runtime_import_star"):
-            with self.assertRaises(ValueError):
-                api._callable_fingerprint(import_star)
-
-    def test_scheduler_identity_rejects_dynamic_import_and_evaluation(self) -> None:
-        api = _api()
-
-        for schedule in (
-            _dunder_import_builtins_schedule,
-            _eval_backed_schedule,
-            _exec_backed_schedule,
-            _compile_backed_schedule,
-        ):
-            with self.subTest(schedule=schedule.__name__):
-                parameter = torch.nn.Parameter(torch.tensor(0.0))
-                scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    torch.optim.AdamW([parameter], lr=1e-4), schedule
-                )
-
-                with self.assertRaises(ValueError):
-                    api._scheduler_identity(scheduler)
-
-    def test_scheduler_identity_rejects_unresolved_namespace_attributes(self) -> None:
-        api = _api()
-
-        for schedule in (
-            _function_globals_backed_schedule,
-            _function_builtins_backed_schedule,
-            _dunder_getattribute_backed_schedule,
-        ):
-            with self.subTest(schedule=schedule.__name__):
-                parameter = torch.nn.Parameter(torch.tensor(0.0))
-                scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    torch.optim.AdamW([parameter], lr=1e-4), schedule
-                )
-
-                with self.assertRaises(ValueError):
-                    api._scheduler_identity(scheduler)
-
-    def test_scheduler_identity_rejects_globals_dynamic_name_lookup(self) -> None:
-        api = _api()
+        spec = api.SchedulerSpec(kind="constant-v1")
         parameter = torch.nn.Parameter(torch.tensor(0.0))
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            torch.optim.AdamW([parameter], lr=1e-4), _globals_backed_schedule
-        )
+        optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+        scheduler = api._build_scheduler(optimizer, spec)
+        learning_rates = [optimizer.param_groups[0]["lr"]]
 
-        with self.assertRaisesRegex(ValueError, "dynamic name resolution"):
-            api._scheduler_identity(scheduler)
+        for _ in range(4):
+            parameter.grad = torch.ones_like(parameter)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            learning_rates.append(optimizer.param_groups[0]["lr"])
 
-    def test_scheduler_identity_rejects_equivalent_dynamic_name_lookups(self) -> None:
+        self.assertEqual(json.loads(json.dumps(asdict(spec))), {"kind": "constant-v1"})
+        self.assertEqual(learning_rates, [1e-4] * 5)
+
+    def test_scheduler_spec_rejects_unknown_kind(self) -> None:
         api = _api()
 
-        for schedule in (
-            _aliased_globals_schedule,
-            _locals_backed_schedule,
-            _vars_backed_schedule,
-            _getattr_backed_schedule,
-            _dunder_dict_backed_schedule,
-        ):
-            with self.subTest(schedule=schedule.__name__):
-                parameter = torch.nn.Parameter(torch.tensor(0.0))
-                scheduler = torch.optim.lr_scheduler.LambdaLR(
-                    torch.optim.AdamW([parameter], lr=1e-4), schedule
-                )
+        with self.assertRaisesRegex(ValueError, "unknown scheduler kind"):
+            api.SchedulerSpec(kind="cosine")
 
-                with self.assertRaisesRegex(ValueError, "dynamic name resolution"):
-                    api._scheduler_identity(scheduler)
-
-    def test_scheduler_identity_fingerprints_globals_in_nested_code(self) -> None:
+    def test_train_request_rejects_non_scheduler_spec(self) -> None:
         api = _api()
-        first_parameter = torch.nn.Parameter(torch.tensor(0.0))
-        first = torch.optim.lr_scheduler.LambdaLR(
-            torch.optim.AdamW([first_parameter], lr=1e-4), _nested_global_schedule
-        )
-        first_identity = api._scheduler_identity(first)
 
-        with mock.patch(f"{__name__}._NESTED_GLOBAL_MULTIPLIER", 0.25):
-            second_parameter = torch.nn.Parameter(torch.tensor(0.0))
-            second = torch.optim.lr_scheduler.LambdaLR(
-                torch.optim.AdamW([second_parameter], lr=1e-4), _nested_global_schedule
-            )
-            second_identity = api._scheduler_identity(second)
-
-        self.assertEqual(first.state_dict(), second.state_dict())
-        self.assertNotEqual(first_identity, second_identity)
-
-    def test_scheduler_identity_rejects_module_backed_mutable_attribute(self) -> None:
-        api = _api()
-        parameter = torch.nn.Parameter(torch.tensor(0.0))
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            torch.optim.AdamW([parameter], lr=1e-4), _module_backed_schedule
-        )
-
-        with self.assertRaisesRegex(
-            ValueError, "scheduler callable configuration cannot be stably serialized: module"
-        ):
-            api._scheduler_identity(scheduler)
-
-    def test_default_lambda_scheduler_identity_is_stable_across_instances(self) -> None:
-        api = _api()
-        first = _constant_lambda_scheduler(torch.nn.Parameter(torch.tensor(0.0)))
-        second = _constant_lambda_scheduler(torch.nn.Parameter(torch.tensor(0.0)))
-
-        self.assertEqual(api._scheduler_identity(first), api._scheduler_identity(second))
-
-    def test_lambda_scheduler_identity_includes_future_callable_semantics(self) -> None:
-        api = _api()
-        first_parameter = torch.nn.Parameter(torch.tensor(0.0))
-        second_parameter = torch.nn.Parameter(torch.tensor(0.0))
-        first = torch.optim.lr_scheduler.LambdaLR(
-            torch.optim.AdamW([first_parameter], lr=1e-4), _half_after_two_steps
-        )
-        second = torch.optim.lr_scheduler.LambdaLR(
-            torch.optim.AdamW([second_parameter], lr=1e-4), _quarter_after_two_steps
-        )
-
-        self.assertEqual(first.state_dict(), second.state_dict())
-        self.assertNotEqual(api._scheduler_identity(first), api._scheduler_identity(second))
-
-    def test_resume_rejects_changed_lambda_scheduler_semantics(self) -> None:
-        api = _api()
-        model = ToyAdapterModel([])
-
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
-            request = api.TrainRequest(
-                model=model,
+        with self.assertRaisesRegex(ValueError, "SchedulerSpec"):
+            api.TrainRequest(
+                model=ToyAdapterModel([]),
                 phase=PhaseSpec.for_phase(1),
                 eligible_samples=1,
                 cache_checksum="c" * 64,
-                checkpoint_root=Path(tmp),
+                checkpoint_root=Path("unused"),
                 token_limit=2000,
                 accumulation_steps=1,
-                dataloader_factory=lambda _epoch, _accelerator: [
-                    {"utts": ["only"], "target": torch.tensor([1.0])}
-                ],
+                dataloader_factory=lambda _epoch, _accelerator: (),
                 accelerator_factory=FakeAccelerator,
-                scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.LambdaLR(
-                    optimizer, _half_after_two_steps
-                ),
+                scheduler_spec={"kind": "constant-v1"},
             )
-            first = api.train_phase(
-                request, api.TrainingCallbacks(validate=lambda _event: False)
-            )
-
-            with self.assertRaisesRegex(ValueError, "identity changed"):
-                api.train_phase(
-                    replace(
-                        request,
-                        resume_from=first.checkpoint,
-                        scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.LambdaLR(
-                            optimizer, _quarter_after_two_steps
-                        ),
-                    ),
-                    api.TrainingCallbacks(validate=lambda _event: None),
-                )
 
     def test_train_request_rejects_modified_phase_schedules(self) -> None:
         api = _api()
@@ -793,6 +507,7 @@ class AccelerateTrainingTests(unittest.TestCase):
                 "world_size",
             },
         )
+        self.assertEqual(manifest["identity"]["scheduler"], {"kind": "constant-v1"})
         self.assertIn("fake_accelerate_state.pt", manifest["state_files"])
         self.assertIn("adapter/adapter_model.safetensors", manifest["state_files"])
         self.assertEqual(manifest["rng_files"], ["random_states_0.pkl"])
@@ -827,14 +542,24 @@ class AccelerateTrainingTests(unittest.TestCase):
                 replace(request, resume_from=first.checkpoint, sampler_seed=1987),
                 replace(request, resume_from=first.checkpoint, sampler_window_size=256),
                 replace(request, resume_from=first.checkpoint, dataloader_identity="alternate-loader:v1"),
-                replace(
-                    request,
-                    resume_from=first.checkpoint,
-                    scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
-                ),
             ):
                 with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "identity changed"):
                     api.train_phase(changed, api.TrainingCallbacks(validate=lambda event: None))
+
+            manifest_path = first.checkpoint / api.CHECKPOINT_MANIFEST
+            original_manifest = manifest_path.read_bytes()
+            manifest = json.loads(original_manifest)
+            manifest["identity"]["scheduler"] = {
+                "kind": "constant-v1",
+                "unrecognized": True,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                api.train_phase(
+                    replace(request, resume_from=first.checkpoint),
+                    api.TrainingCallbacks(validate=lambda event: None),
+                )
+            manifest_path.write_bytes(original_manifest)
 
             state_path = first.checkpoint / "fake_accelerate_state.pt"
             state_path.write_bytes(state_path.read_bytes() + b"tampered")

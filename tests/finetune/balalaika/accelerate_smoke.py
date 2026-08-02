@@ -99,6 +99,7 @@ def _worker() -> None:
         checkpoint_root=root,
         token_limit=2000,
         accumulation_steps=3,
+        scheduler_spec=training.SchedulerSpec(kind="constant-v1"),
         dataloader_factory=lambda _epoch, accelerator: _loader(accelerator.process_index),
         accelerator_factory=accelerator_factory,
     )

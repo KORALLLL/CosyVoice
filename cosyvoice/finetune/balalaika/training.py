@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-import dis
-import functools
-import hashlib
+from enum import Enum
 import json
-import math
 import os
 from pathlib import Path
 import shutil
-import types
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
@@ -21,6 +17,7 @@ from .artifacts import atomic_write_json, sha256_file
 from .config import DEFAULT_SEED, PhaseSpec
 from .data import DEFAULT_LENGTH_WINDOW
 from .model import LoraSettings, audit_trainable_parameters, save_adapter
+from cosyvoice.utils.scheduler import ConstantLR
 
 
 CHECKPOINT_MANIFEST = "checkpoint_manifest.json"
@@ -29,6 +26,26 @@ _FRACTIONS_PER_EPOCH = 8
 
 class TrainingCapacityError(RuntimeError):
     """Raised when a fixed production batch limit exceeds available memory."""
+
+
+class SchedulerKind(str, Enum):
+    """Closed scheduler algorithms supported by the Balalaika recipe."""
+
+    CONSTANT = "constant-v1"
+
+
+@dataclass(frozen=True)
+class SchedulerSpec:
+    """Immutable, JSON-serializable scheduler configuration."""
+
+    kind: SchedulerKind | str = SchedulerKind.CONSTANT
+
+    def __post_init__(self) -> None:
+        try:
+            kind = SchedulerKind(self.kind)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unknown scheduler kind: {self.kind!r}") from exc
+        object.__setattr__(self, "kind", kind)
 
 
 @dataclass(frozen=True)
@@ -122,7 +139,7 @@ class TrainRequest:
     dataloader_factory: Callable[[int, Any], Iterable[Mapping[str, Any]]]
     resume_from: Path | None = None
     accelerator_factory: Callable[..., Any] | None = None
-    scheduler_factory: Callable[[torch.optim.Optimizer], Any] | None = None
+    scheduler_spec: SchedulerSpec = SchedulerSpec()
     max_grad_norm: float = 1.0
     sampler_seed: int = DEFAULT_SEED
     sampler_window_size: int = DEFAULT_LENGTH_WINDOW
@@ -135,6 +152,8 @@ class TrainRequest:
             raise ValueError("phase must be an exact approved phase schedule") from exc
         if self.phase != approved_phase:
             raise ValueError("phase must be an exact approved phase schedule")
+        if type(self.scheduler_spec) is not SchedulerSpec:
+            raise ValueError("scheduler_spec must be a SchedulerSpec")
         if isinstance(self.eligible_samples, bool) or self.eligible_samples < 1:
             raise ValueError("eligible_samples must be positive")
         if len(self.cache_checksum) != 64:
@@ -182,12 +201,8 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
     }
     if optimizer_ids != {id(parameter) for parameter in audited}:
         raise RuntimeError("optimizer parameter IDs do not equal audited adapter parameter IDs")
-    scheduler = (
-        request.scheduler_factory(optimizer)
-        if request.scheduler_factory is not None
-        else torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-    )
-    run_identity = _identity(request, accelerator, scheduler=scheduler)
+    scheduler = _build_scheduler(optimizer, request.scheduler_spec)
+    run_identity = _identity(request, accelerator)
 
     initial_validation = 0 if request.phase.number == 1 else 16
     progress = ProgressState(phase=request.phase.number, validation_index=initial_validation)
@@ -348,6 +363,17 @@ def _accelerator(request: TrainRequest) -> Any:
         gradient_accumulation_steps=request.accumulation_steps,
         log_with="wandb",
     )
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    spec: SchedulerSpec,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    if type(spec) is not SchedulerSpec:
+        raise ValueError("scheduler spec must be a SchedulerSpec")
+    if spec.kind is SchedulerKind.CONSTANT:
+        return ConstantLR(optimizer)
+    raise AssertionError(f"unhandled scheduler kind: {spec.kind!r}")
 
 
 def _real_sample_count(batch: Mapping[str, Any]) -> int:
@@ -544,7 +570,7 @@ def _mark_validation_succeeded(accelerator: Any, checkpoint: Path) -> None:
     atomic_write_json(manifest_path, payload)
 
 
-def _identity(request: TrainRequest, accelerator: Any, *, scheduler: Any) -> dict[str, object]:
+def _identity(request: TrainRequest, accelerator: Any) -> dict[str, object]:
     unwrapped = accelerator.unwrap_model(request.model)
     settings = getattr(unwrapped, "_balalaika_lora_settings", None)
     base_checksum = getattr(
@@ -565,217 +591,9 @@ def _identity(request: TrainRequest, accelerator: Any, *, scheduler: Any) -> dic
         "sampler_seed": request.sampler_seed,
         "sampler_window_size": request.sampler_window_size,
         "dataloader_identity": request.dataloader_identity,
-        "scheduler": _scheduler_identity(scheduler),
+        "scheduler": asdict(request.scheduler_spec),
         "world_size": accelerator.num_processes,
     }
-
-
-def _scheduler_identity(scheduler: Any) -> dict[str, object]:
-    identity = {
-        "class": f"{scheduler.__class__.__module__}.{scheduler.__class__.__qualname__}",
-        "initial_state": scheduler.state_dict(),
-    }
-    lr_lambdas = getattr(scheduler, "lr_lambdas", None)
-    if lr_lambdas is not None:
-        if not isinstance(lr_lambdas, (list, tuple)) or not lr_lambdas:
-            raise ValueError("scheduler lr_lambdas must be a nonempty sequence")
-        identity["lr_lambda_fingerprints"] = [
-            _callable_fingerprint(value) for value in lr_lambdas
-        ]
-    try:
-        return json.loads(json.dumps(identity, allow_nan=False, sort_keys=True))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("scheduler identity must be JSON-serializable") from exc
-
-
-def _callable_fingerprint(value: Callable[..., object]) -> str:
-    """Hash inspectable callable semantics without source paths or line numbers."""
-
-    payload = _callable_semantics(value, set())
-    encoded = json.dumps(
-        payload,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-_DYNAMIC_NAME_BUILTINS = frozenset(
-    {
-        "__import__",
-        "compile",
-        "delattr",
-        "dir",
-        "eval",
-        "exec",
-        "getattr",
-        "globals",
-        "hasattr",
-        "locals",
-        "setattr",
-        "vars",
-    }
-)
-
-_RUNTIME_IMPORT_OPCODES = frozenset({"IMPORT_NAME", "IMPORT_FROM", "IMPORT_STAR"})
-_DYNAMIC_NAMESPACE_ATTRIBUTES = frozenset(
-    {"__builtins__", "__dict__", "__getattribute__", "__globals__"}
-)
-
-
-def _callable_semantics(value: Callable[..., object], active: set[int]) -> dict[str, object]:
-    identity = id(value)
-    if identity in active:
-        raise ValueError("scheduler callable configuration is recursive")
-    active.add(identity)
-    try:
-        if isinstance(value, functools.partial):
-            return {
-                "kind": "partial",
-                "function": _callable_semantics(value.func, active),
-                "args": _stable_semantic_value(value.args, active),
-                "keywords": _stable_semantic_value(value.keywords or {}, active),
-            }
-        if isinstance(value, types.MethodType):
-            return {
-                "kind": "bound_method",
-                "function": _function_semantics(value.__func__, active),
-                "owner": _stable_semantic_value(value.__self__, active),
-            }
-        if isinstance(value, types.FunctionType):
-            return _function_semantics(value, active)
-        if isinstance(value, types.BuiltinFunctionType):
-            if (
-                value.__module__ == "builtins"
-                and value.__qualname__ in _DYNAMIC_NAME_BUILTINS
-            ):
-                raise ValueError("scheduler callable uses dynamic name resolution")
-            return {
-                "kind": "builtin",
-                "module": value.__module__,
-                "qualname": value.__qualname__,
-            }
-        call = getattr(type(value), "__call__", None)
-        if not isinstance(call, types.FunctionType):
-            raise ValueError("scheduler callable cannot be stably inspected")
-        return {
-            "kind": "callable_object",
-            "class": f"{type(value).__module__}.{type(value).__qualname__}",
-            "call": _function_semantics(call, active),
-            "configuration": _stable_semantic_value(vars(value), active),
-        }
-    finally:
-        active.remove(identity)
-
-
-def _function_semantics(value: types.FunctionType, active: set[int]) -> dict[str, object]:
-    closure: list[object] = []
-    for cell in value.__closure__ or ():
-        try:
-            cell_value = cell.cell_contents
-        except ValueError as exc:
-            raise ValueError("scheduler callable has an empty closure cell") from exc
-        closure.append(_stable_semantic_value(cell_value, active))
-    builtins = value.__builtins__
-    if isinstance(builtins, types.ModuleType):
-        builtin_namespace: Mapping[str, object] = vars(builtins)
-    elif isinstance(builtins, Mapping):
-        builtin_namespace = builtins
-    else:
-        raise ValueError("scheduler callable has an unsupported builtins namespace")
-    referenced_globals: dict[str, object] = {}
-    for name in sorted(_referenced_global_names(value.__code__)):
-        if name in value.__globals__:
-            referenced = value.__globals__[name]
-        elif name in builtin_namespace:
-            referenced = builtin_namespace[name]
-        else:
-            raise ValueError(f"scheduler callable global {name!r} cannot be resolved")
-        referenced_globals[name] = _stable_semantic_value(referenced, active)
-    return {
-        "kind": "python_function",
-        "module": value.__module__,
-        "code": _code_semantics(value.__code__, active),
-        "defaults": _stable_semantic_value(value.__defaults__, active),
-        "kwdefaults": _stable_semantic_value(value.__kwdefaults__, active),
-        "closure": closure,
-        "globals": referenced_globals,
-    }
-
-
-def _referenced_global_names(value: types.CodeType) -> set[str]:
-    names: set[str] = set()
-    for instruction in dis.get_instructions(value):
-        if instruction.opname in _RUNTIME_IMPORT_OPCODES:
-            raise ValueError("scheduler callable uses runtime imports")
-        if instruction.opname == "LOAD_GLOBAL":
-            if not isinstance(instruction.argval, str):
-                raise ValueError("scheduler callable has an invalid global reference")
-            names.add(instruction.argval)
-        elif instruction.opname in {"LOAD_NAME", "LOAD_FROM_DICT_OR_GLOBALS"}:
-            raise ValueError("scheduler callable uses dynamic name resolution")
-        elif (
-            instruction.opname in {"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"}
-            and instruction.argval in _DYNAMIC_NAMESPACE_ATTRIBUTES
-        ):
-            raise ValueError("scheduler callable uses dynamic name resolution")
-    for constant in value.co_consts:
-        if isinstance(constant, types.CodeType):
-            names.update(_referenced_global_names(constant))
-    return names
-
-
-def _code_semantics(value: types.CodeType, active: set[int]) -> dict[str, object]:
-    return {
-        "bytecode": value.co_code.hex(),
-        "constants": [_stable_semantic_value(item, active) for item in value.co_consts],
-        "names": list(value.co_names),
-        "varnames": list(value.co_varnames),
-        "freevars": list(value.co_freevars),
-        "cellvars": list(value.co_cellvars),
-        "argcount": value.co_argcount,
-        "posonlyargcount": value.co_posonlyargcount,
-        "kwonlyargcount": value.co_kwonlyargcount,
-        "flags": value.co_flags,
-    }
-
-
-def _stable_semantic_value(value: object, active: set[int]) -> object:
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("scheduler callable contains a non-finite float")
-        return value
-    if isinstance(value, bytes):
-        return {"bytes": value.hex()}
-    if isinstance(value, types.CodeType):
-        return {"code": _code_semantics(value, active)}
-    if isinstance(value, tuple):
-        return {"tuple": [_stable_semantic_value(item, active) for item in value]}
-    if isinstance(value, frozenset):
-        items = [_stable_semantic_value(item, active) for item in value]
-        return {"frozenset": sorted(items, key=lambda item: json.dumps(item, sort_keys=True))}
-    if isinstance(value, Mapping):
-        if not all(isinstance(key, str) for key in value):
-            raise ValueError("scheduler callable mappings require string keys")
-        return {
-            "mapping": {
-                key: _stable_semantic_value(item, active)
-                for key, item in sorted(value.items())
-            }
-        }
-    if isinstance(value, types.ModuleType):
-        raise ValueError(
-            "scheduler callable configuration cannot be stably serialized: module"
-        )
-    if callable(value):
-        return {"callable": _callable_semantics(value, active)}
-    raise ValueError(
-        f"scheduler callable configuration cannot be stably serialized: {type(value).__qualname__}"
-    )
 
 
 def _state_checksums(root: Path) -> dict[str, str]:
