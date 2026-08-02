@@ -269,10 +269,14 @@ def run_cache_workers(paths: RunPaths) -> CacheManifest:
     inventory = inventory_sources(paths)
     cache_root = paths.run_root / "cache"
     plan_dir = paths.run_root / "split_plan"
+    expected_shards = {int(archive.stem.split("_")[1]) for archive in inventory.source_archives}
     existing: set[int] = set()
     manifests = list((cache_root / "shard_manifests").glob("shard_*.json"))
     if manifests:
         existing = set(verify_cache(cache_root).shards)
+        unexpected = existing - expected_shards
+        if unexpected:
+            raise TokenizerError(f"verified cache contains shards outside canonical inventory: {sorted(unexpected)}")
     requests = [
         CacheShardRequest(
             source_tar=archive,
@@ -283,10 +287,10 @@ def run_cache_workers(paths: RunPaths) -> CacheManifest:
             expected_plan_sha256=sha256_file(plan_dir / f"{archive.stem}.jsonl"),
         )
         for archive in inventory.source_archives
-        if int(archive.stem.split("_")[1]) not in existing
+        if int(archive.stem.split("_")[1]) in expected_shards - existing
     ]
     if not requests:
-        return verify_cache(cache_root)
+        return _verify_requested_cache_set(cache_root, expected_shards)
     context = mp.get_context("spawn")
     work: mp.Queue[Mapping[str, object] | None] = context.Queue()
     results: mp.Queue[Mapping[str, object]] = context.Queue()
@@ -333,7 +337,7 @@ def run_cache_workers(paths: RunPaths) -> CacheManifest:
         for worker in workers:
             worker.join()
         raise
-    return _verify_requested_cache_set(cache_root, existing | {request.shard for request in requests})
+    return _verify_requested_cache_set(cache_root, expected_shards)
 
 
 def _create_cuda_session(model_path: Path, local_rank: int) -> Any:

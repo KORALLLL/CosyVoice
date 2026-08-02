@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from cosyvoice.finetune.balalaika.tokenizer import (
     _verify_requested_cache_set,
     approve_pilot,
     require_pilot_approval,
+    run_cache_workers,
 )
 
 
@@ -204,6 +206,51 @@ class TokenizerTests(unittest.TestCase):
         with patch("cosyvoice.finetune.balalaika.tokenizer.verify_cache", return_value=verified):
             with self.assertRaisesRegex(TokenizerError, "shard set"):
                 _verify_requested_cache_set(cache_root, {0, 1})
+
+    def test_cache_gate_rejects_extra_preexisting_shard_outside_inventory(self) -> None:
+        # A valid cache manifest cannot smuggle shard 7 into the canonical 0-only fixture inventory.
+        cache_root = self.paths.run_root / "cache"
+        (cache_root / "shard_manifests").mkdir(parents=True)
+        (cache_root / "shard_manifests" / "shard_000000.json").write_text("{}", encoding="utf-8")
+        inventory = types.SimpleNamespace(
+            source_archives=(self.paths.dataset_root / "train/shard_000000.tar",),
+            source_archive_sha256={"shard_000000.tar": "a" * 64},
+        )
+        verified = CacheManifest(
+            cache_root,
+            {0: cache_root / "shard_manifests/shard_000000.json", 7: cache_root / "shard_manifests/shard_000007.json"},
+            {1: 0, 2: 0},
+            20,
+        )
+        with (
+            patch("cosyvoice.finetune.balalaika.tokenizer.require_pilot_approval"),
+            patch("cosyvoice.finetune.balalaika.tokenizer.inventory_sources", return_value=inventory),
+            patch("cosyvoice.finetune.balalaika.tokenizer.verify_cache", return_value=verified),
+        ):
+            with self.assertRaisesRegex(TokenizerError, "outside canonical inventory"):
+                run_cache_workers(self.paths)
+
+    def test_cache_gate_noop_rechecks_exact_canonical_shard_set(self) -> None:
+        # No missing leases does not excuse a final cache verification that lost shard 1.
+        cache_root = self.paths.run_root / "cache"
+        (cache_root / "shard_manifests").mkdir(parents=True)
+        (cache_root / "shard_manifests" / "shard_000000.json").write_text("{}", encoding="utf-8")
+        inventory = types.SimpleNamespace(
+            source_archives=(
+                self.paths.dataset_root / "train/shard_000000.tar",
+                self.paths.dataset_root / "train/shard_000001.tar",
+            ),
+            source_archive_sha256={"shard_000000.tar": "a" * 64, "shard_000001.tar": "b" * 64},
+        )
+        complete = CacheManifest(cache_root, {0: cache_root / "shard_manifests/shard_000000.json", 1: cache_root / "shard_manifests/shard_000001.json"}, {1: 0, 2: 0}, 20)
+        missing = CacheManifest(cache_root, {0: cache_root / "shard_manifests/shard_000000.json"}, {1: 0, 2: 0}, 20)
+        with (
+            patch("cosyvoice.finetune.balalaika.tokenizer.require_pilot_approval"),
+            patch("cosyvoice.finetune.balalaika.tokenizer.inventory_sources", return_value=inventory),
+            patch("cosyvoice.finetune.balalaika.tokenizer.verify_cache", side_effect=(complete, missing)),
+        ):
+            with self.assertRaisesRegex(TokenizerError, "shard set"):
+                run_cache_workers(self.paths)
 
     @staticmethod
     def _features(audio: AudioInput) -> np.ndarray:
