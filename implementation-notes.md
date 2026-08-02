@@ -166,3 +166,10 @@
 - Changed: Status redaction matches `TOKEN`, `KEY`, and `SECRET` only as complete snake-, hyphen-, dot-, or camel-case identifier segments. `TOKENIZER` is no longer mistaken for a credential field.
 - Decision: Redact string and structured values under semantic secret keys while preserving non-secret scalar configuration such as numeric `token_limit`. Recursive tests retain explicit coverage for HF, W&B, OAuth, and structured token values.
 - Validation: Focused workflow tests pass 20/20, including parsed status assertions for `workflow.token_limit == 6000` and mapping-shaped `stages.tokenizer_qualified`; all Balalaika tests pass 227/227 in 246.823 seconds.
+
+### Fix round 3
+
+- Root cause: Accelerate's default 600-second process-group timeout expired while rank zero checksummed the 373 GB source corpus and ranks 1–7 waited in the next broadcast, aborting before preflight could publish.
+- Decision: Construct production Accelerate with an `InitProcessGroupKwargs` handler set to 24 hours. This covers intentionally long main-only preflight and cache operations while retaining a finite watchdog for genuine hangs; the operator guide documents how to diagnose an actual 24-hour timeout.
+- Security: The production-only test-export guard remains before any Accelerate import or construction, so the internal test-mode capability cannot initialize a production process group.
+- Validation: The regression first failed because Accelerator received no `kwargs_handlers`; focused workflow tests now pass 21/21 with the exact handler type and timeout, and all Balalaika tests pass 228/228 in 98.619 seconds.

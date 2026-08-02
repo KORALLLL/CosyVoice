@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from enum import IntEnum
 import json
 import os
@@ -34,6 +35,7 @@ WORKFLOW_VERSION = "cosyvoice3-balalaika-two-phase-v1"
 VALIDATION_GENERATIONS = 2_000
 PHASE1_VALIDATION_INDICES = tuple(range(1, 17))
 PHASE2_VALIDATION_INDICES = tuple(range(17, 41))
+PROCESS_GROUP_TIMEOUT = timedelta(hours=24)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _SECRET_WORDS = ("TOKEN", "KEY", "SECRET")
 
@@ -162,11 +164,16 @@ class ProductionBackend:
         if options.allow_test_export:
             raise StageRequirementError("ProductionBackend cannot enable test export")
         from accelerate import Accelerator
+        from accelerate.utils import InitProcessGroupKwargs
 
+        # Rank zero can hash hundreds of gigabytes during main-only preflight
+        # and cache work while peer ranks wait at the next collective.
+        process_group = InitProcessGroupKwargs(timeout=PROCESS_GROUP_TIMEOUT)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=options.accumulation_steps,
             mixed_precision="bf16",
             log_with="wandb",
+            kwargs_handlers=[process_group],
         )
         self.coordinator = _AccelerateCoordinator(self.accelerator)
         self._evaluation_model: Any | None = None

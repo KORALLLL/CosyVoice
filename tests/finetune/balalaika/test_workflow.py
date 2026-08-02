@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import replace
+from datetime import timedelta
 import io
 import json
 import os
@@ -574,12 +575,26 @@ class WorkflowTests(unittest.TestCase):
             options = _args(Path(directory), FakeBackend()).options
             self.assertFalse(options.allow_test_export)
             test_options = replace(options, allow_test_export=True)
-            with self.assertRaisesRegex(StageRequirementError, "test export"):
-                ProductionBackend(test_options)
+            with mock.patch("accelerate.Accelerator") as accelerator:
+                with self.assertRaisesRegex(StageRequirementError, "test export"):
+                    ProductionBackend(test_options)
+                accelerator.assert_not_called()
 
         parser_output = io.StringIO()
         with self.assertRaises(SystemExit), contextlib.redirect_stdout(parser_output):
             main(["phase2", "--allow-test-export"])
+
+    def test_production_backend_uses_24_hour_process_group_timeout(self) -> None:
+        from accelerate.utils import InitProcessGroupKwargs
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch("accelerate.Accelerator") as accelerator:
+            accelerator.return_value.num_processes = 8
+            ProductionBackend(_args(Path(directory), FakeBackend()).options)
+
+        handlers = accelerator.call_args.kwargs["kwargs_handlers"]
+        self.assertEqual(len(handlers), 1)
+        self.assertIsInstance(handlers[0], InitProcessGroupKwargs)
+        self.assertEqual(handlers[0].timeout, timedelta(hours=24))
 
 
 if __name__ == "__main__":

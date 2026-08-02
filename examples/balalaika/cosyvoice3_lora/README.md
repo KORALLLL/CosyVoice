@@ -325,6 +325,12 @@ model directory.
   checksum printed in that review-required response.
 - **Preflight rejects GPUs/BF16:** confirm exactly eight RTX 5090 devices are
   visible, capability is at least 12.0, and no scheduler/container remaps them.
+- **NCCL timeout during preflight or cache preparation:** rank zero may spend
+  hours checksumming the roughly 373 GB corpus while the other ranks wait at a
+  collective. The workflow configures a 24-hour process-group timeout for these
+  main-only operations. If that timeout is still reached, treat it as a storage
+  or process hang and inspect all rank logs; do not mask it with launcher-only
+  timeout environment variables.
 - **ONNX CUDA provider missing:** reinstall the recipe requirements in the CUDA
   12.8 environment and verify `CUDAExecutionProvider`; do not proceed on CPU.
 - **GigaAM or private benchmark access fails:** confirm the rotated `HF_TOKEN`,
