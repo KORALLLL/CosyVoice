@@ -143,3 +143,12 @@
 - Decision: Resume evidence verification is a rank-zero operation wrapped in the workflow's synchronized main-rank call. Rank zero alone accesses the live W&B tracker; the complete prior-validation evidence list or structured failure is broadcast and unwrapped identically on every rank.
 - Decision: The hook itself performs that synchronized broadcast while phase training is already inside the workflow's collective operation. Its barrier completes before a shared exception is raised, after which every rank enters the outer collective error gather without leaving peers behind.
 - Validation: New regressions cover main/non-main evidence and error broadcast, post-state-load/pre-forward/pre-save ordering, pending-current revalidation order, fresh-run exclusion, and final succeeded resume behavior.
+
+## 2026-08-02 - Task 13 end-to-end fixture and operator documentation
+
+- Decision: The CPU integration harness scales only corpus and prompt counts. It retains the literal production phase specifications (2/3 epochs), all eight boundaries per epoch, and global validation indices 0 through 40.
+- Decision: Exercise real phase assignment/reservation, atomic cache transactions, cache verification, mmap cache reads, deterministic four-row memorization selection, restart-safe trainer checkpoints, PEFT adapter merge, and strict tiny-model state loading. Only speech/text tokenization, synthesis, ASR, W&B, Accelerate collectives, and the scalar training model are bounded CPU fakes.
+- Decision: Inject a cache rename failure and stop phase 1 after validation 3, then require clean cache retry and authenticated checkpoint resume without duplicated validation indices.
+- Security: The operator guide contains placeholders only, requires rotation of the credential exposed during design, keeps HF/W&B secrets environment-only, and explicitly defers every upload.
+- Validation: The new integration test passes 1/1; all Balalaika tests pass 226/226; shell syntax, Python compilation, exact two-script inventory, and whitespace checks pass. Top-level discovery remains at the approved baseline 23/24 because `asset/qwen_ref_4.wav` is absent. `flake8` is not installed in the current environment, so its requested check could not run.
+- Follow-up: No network, real tokenization, CUDA/GPU training, validation generation, W&B logging, export, or upload was run. Task 14 must stop after generating the real pilot and wait for explicit user listening approval.
