@@ -103,12 +103,21 @@ class FinalMergeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.voices = []
+        for index in range(20):
+            path = self.root / f"voice_{index:02d}.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1); stream.setsampwidth(2); stream.setframerate(24_000); stream.writeframes(b"\0\0" * 4)
+            self.voices.append({"voice_id": f"voice_{index:02d}", "prompt_text": "проверка", "prompt_wav": path, "prompt_sha256": sha256_file(path)})
         self.export_request = api.ExportRequest(
             base_model_dir=self.base_dir,
             phase2_checkpoint=self.phase2,
             validation_summary=self.validation_summary,
             output_dir=self.root / "final",
             test_mode=True,
+            verification_voices=tuple(self.voices),
+            recognizer=_Recognizer(),
+            pipeline_factory=_Pipeline,
         )
 
     def tearDown(self) -> None:
@@ -152,6 +161,11 @@ class FinalMergeTests(unittest.TestCase):
         self.assertFalse(any("lora_" in key for key in state))
         torch.testing.assert_close(_logits(strict), self.adapter_active_logits, rtol=2e-2, atol=2e-2)
         self.assertTrue((self.adapter_dir / "adapter_model.safetensors").is_file())
+        final = json.loads(manifest.path.read_text(encoding="utf-8"))
+        self.assertFalse(final["production_ready"])
+        self.assertEqual(final["mode"], "test")
+        self.assertTrue((manifest.path.parent / "final-success.json").is_file())
+        self.assertTrue((manifest.path.parent / "strict-verification/strict-verification.json").is_file())
 
     def test_export_rejects_fabricated_validation_seal(self):
         seal = self.root / "validation-success.json"

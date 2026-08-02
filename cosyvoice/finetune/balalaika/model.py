@@ -90,6 +90,9 @@ class ExportRequest:
     wandb_run_manifest: Path | None = None
     test_mode: bool = False
     expected_training_identity: Mapping[str, object] | None = None
+    verification_voices: Sequence[Mapping[str, object]] | None = None
+    recognizer: object | None = None
+    pipeline_factory: object | None = None
 
     def __post_init__(self) -> None:
         for name in ("base_model_dir", "phase2_checkpoint", "validation_summary", "output_dir"):
@@ -99,6 +102,10 @@ class ExportRequest:
             raise ValueError("production export requires Task 10 evidence request and W&B run manifest")
         if self.test_mode is not True and not isinstance(self.expected_training_identity, Mapping):
             raise ValueError("production export requires the complete immutable training identity")
+        if self.test_mode and (self.verification_voices is None or self.recognizer is None):
+            raise ValueError("test export requires explicit verification voices and recognizer")
+        if not self.test_mode and (self.pipeline_factory is not None or self.recognizer is not None):
+            raise ValueError("production export constructs its own pipeline and recognizer")
 
 
 @dataclass(frozen=True)
@@ -559,13 +566,42 @@ def export_final_llm(request: ExportRequest) -> FinalModelManifest:
             "phase2_model_state_sha256": lineage["model_state_sha256"],
             "validation_summary": str(request.validation_summary),
             "validation_summary_sha256": lineage["validation_sha256"],
-            "production_ready": not request.test_mode,
+            "mode": "test" if request.test_mode else "production",
+            "production_ready": False,
             "base_assets": base_assets,
             "base_assets_sha256": _canonical_mapping_sha256(base_assets),
             "code_revision": _code_revision(),
         }
         manifest_path = temporary / "final_model_manifest.json"
         atomic_write_json(manifest_path, payload)
+        staged_manifest = FinalModelManifest(
+            path=manifest_path, llm_path=merged_path, adapter_dir=copied_adapter,
+            llm_sha256=merge.output_sha256, base_checkpoint_sha256=merge.base_checkpoint_sha256,
+            adapter_weights_sha256=merge.adapter_weights_sha256, target_modules=merge.target_modules,
+            phase2_checkpoint_sha256=lineage["checkpoint_sha256"], validation_summary_sha256=lineage["validation_sha256"],
+            production_ready=False, base_assets_sha256=_canonical_mapping_sha256(base_assets),
+        )
+        if request.test_mode:
+            report = strict_verify_final_model(VerifyRequest(
+                base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=request.recognizer,
+                voices=request.verification_voices, output_dir=temporary / "strict-verification",
+                pipeline_factory=request.pipeline_factory, test_mode=True,
+            ))
+        else:
+            from cosyvoice.finetune.balalaika.evaluation import GigaAmRecognizer
+            report = strict_verify_final_model(VerifyRequest(
+                base_model_dir=request.base_model_dir, final_manifest=staged_manifest, recognizer=GigaAmRecognizer(),
+                voices=request.validation_request.prompts, output_dir=temporary / "strict-verification",
+            ))
+        payload["strict_verification"] = {
+            "report": "strict-verification/strict-verification.json",
+            "report_sha256": sha256_file(report.path),
+            "audio": [str(path.relative_to(temporary)) for path in report.audio_paths],
+        }
+        payload["production_ready"] = not request.test_mode
+        atomic_write_json(manifest_path, payload)
+        artifact_checksums = {str(path.relative_to(temporary)): sha256_file(path) for path in sorted(temporary.rglob("*")) if path.is_file()}
+        atomic_write_json(temporary / "final-success.json", {"format_version": 1, "mode": payload["mode"], "production_ready": payload["production_ready"], "artifacts": artifact_checksums})
         _publish_directory(temporary, output_dir)
     except Exception:
         if temporary.exists() and not temporary.is_symlink():
@@ -877,7 +913,7 @@ def _require_final_manifest(manifest: FinalModelManifest) -> None:
         "production_ready",
         "base_assets", "base_assets_sha256",
     }
-    if not isinstance(payload, Mapping) or set(payload) != required or payload.get("format_version") != 1:
+    if not isinstance(payload, Mapping) or not required.issubset(payload) or payload.get("format_version") != 1:
         raise ValueError("final model manifest schema is invalid")
     if payload["llm"] != manifest.llm_path.name or payload["adapter"] != manifest.adapter_dir.name:
         raise ValueError("final model manifest paths changed")
