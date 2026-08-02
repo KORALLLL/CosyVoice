@@ -30,10 +30,12 @@ class ToyAdapterModel(torch.nn.Module):
         super().__init__()
         self.lora_weight = torch.nn.Parameter(torch.tensor(0.0))
         self._seen_sample_ids = seen_sample_ids
+        self.forward_calls = 0
         self._balalaika_base_checkpoint_sha256 = "b" * 64
         self._balalaika_lora_settings = LoraSettings()
 
     def forward(self, batch, _device):
+        self.forward_calls += 1
         self._seen_sample_ids.extend(batch["utts"])
         target = batch["target"].float()
         return {"loss": ((self.lora_weight - target) ** 2).mean()}
@@ -42,8 +44,9 @@ class ToyAdapterModel(torch.nn.Module):
 class FakeAccelerator:
     """Stateful CPU fixture for the subset of Accelerate owned by the trainer."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, *, global_sample_counts=None, remote_batch=None, **kwargs) -> None:
         self.kwargs = kwargs
+        self.gradient_accumulation_steps = kwargs.get("gradient_accumulation_steps", 1)
         self.num_processes = 8
         self.process_index = 0
         self.is_main_process = True
@@ -51,6 +54,11 @@ class FakeAccelerator:
         self.sync_gradients = True
         self._checkpointables = []
         self._prepared = ()
+        self._last_batch = False
+        self._accumulated_batches = 0
+        self._global_sample_counts = iter(global_sample_counts) if global_sample_counts is not None else None
+        self._last_global_samples = 0
+        self._remote_batch = remote_batch
 
     def prepare(self, *values):
         self._prepared = values
@@ -61,7 +69,34 @@ class FakeAccelerator:
 
     @contextmanager
     def accumulate(self, _model):
+        self._accumulated_batches += 1
+        self.sync_gradients = (
+            self._accumulated_batches % self.gradient_accumulation_steps == 0 or self._last_batch
+        )
+        if self.sync_gradients:
+            self._accumulated_batches = 0
         yield
+
+    def prepare_rank_dataloader(self, dataloader):
+        def prepared():
+            iterator = iter(dataloader)
+            try:
+                current = next(iterator)
+            except StopIteration:
+                return
+            while True:
+                try:
+                    following = next(iterator)
+                except StopIteration:
+                    self._last_batch = True
+                    yield current
+                    self._last_batch = False
+                    return
+                self._last_batch = False
+                yield current
+                current = following
+
+        return prepared()
 
     def backward(self, loss) -> None:
         loss.backward()
@@ -72,7 +107,17 @@ class FakeAccelerator:
     def reduce(self, value, reduction="sum"):
         if reduction != "sum":
             raise AssertionError(reduction)
-        return value
+        result = int(value.item()) if self._global_sample_counts is None else next(self._global_sample_counts)
+        self._last_global_samples = result
+        return torch.tensor(result, dtype=value.dtype, device=value.device)
+
+    def gather_sample_counts(self, local_samples):
+        remote = max(self._last_global_samples - local_samples, 0)
+        return (local_samples, remote, 0, 0, 0, 0, 0, 0)
+
+    def gather_object(self, value):
+        local = value[0]
+        return [local, self._remote_batch] + [None] * 6
 
     def wait_for_everyone(self) -> None:
         return None
@@ -129,6 +174,31 @@ def _save_adapter(model, path):
 
 
 class AccelerateTrainingTests(unittest.TestCase):
+    def test_train_request_rejects_modified_phase_schedules(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+        base = PhaseSpec.for_phase(1)
+        values = (
+            replace(base, epochs=1),
+            replace(base, learning_rate=2e-4),
+            replace(base, predicate="asr_agreement_mean <= 0.95"),
+            replace(base, agreement_max=0.96),
+        )
+
+        for phase in values:
+            with self.subTest(phase=phase), self.assertRaisesRegex(ValueError, "exact approved phase"):
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=1,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path("unused"),
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: (),
+                    accelerator_factory=FakeAccelerator,
+                )
+
     def test_fraction_boundaries_are_exact(self) -> None:
         boundaries = _api().FractionBoundary.for_epoch(eligible_samples=80)
 
@@ -158,7 +228,7 @@ class AccelerateTrainingTests(unittest.TestCase):
             {"utts": [f"sample-{index}"], "target": torch.tensor([float(index + 1)])}
             for index in range(8)
         ]
-        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+        phase = PhaseSpec.for_phase(1)
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
             root = Path(tmp)
@@ -196,9 +266,9 @@ class AccelerateTrainingTests(unittest.TestCase):
                 api.TrainingCallbacks(validate=lambda event: resumed_indices.append(event.validation_index)),
             )
 
-        self.assertEqual(seen, [f"sample-{index}" for index in range(8)])
-        self.assertEqual(first_indices + resumed_indices, list(range(1, 9)))
-        self.assertEqual(resumed.progress.optimizer_steps, 8)
+        self.assertEqual(seen, [f"sample-{index}" for index in range(8)] * 2)
+        self.assertEqual(first_indices + resumed_indices, list(range(1, 17)))
+        self.assertEqual(resumed.progress.optimizer_steps, 16)
         self.assertTrue(resumed.completed)
 
     def test_one_optimizer_boundary_can_release_all_due_small_epoch_events(self) -> None:
@@ -206,7 +276,7 @@ class AccelerateTrainingTests(unittest.TestCase):
         seen: list[str] = []
         model = ToyAdapterModel(seen)
         events = []
-        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+        phase = PhaseSpec.for_phase(1)
         batch = {"utts": ["a", "b", "c"], "target": torch.tensor([1.0, 2.0, 3.0])}
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
@@ -226,13 +296,109 @@ class AccelerateTrainingTests(unittest.TestCase):
             )
 
         self.assertTrue(result.completed)
-        self.assertEqual([event.boundary.ordinal for event in events], list(range(1, 9)))
-        self.assertEqual({event.global_samples for event in events}, {3})
+        self.assertEqual([event.boundary.ordinal for event in events], list(range(1, 9)) * 2)
+        self.assertEqual({event.global_samples for event in events}, {3, 6})
+
+    def test_non_divisible_accumulation_commits_final_window_once(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+        phase = PhaseSpec.for_phase(1)
+        batches = [
+            {"utts": [f"sample-{index}"], "target": torch.tensor([float(index + 1)])}
+            for index in range(3)
+        ]
+        events = []
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            result = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=phase,
+                    eligible_samples=3,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path(tmp),
+                    token_limit=2000,
+                    accumulation_steps=2,
+                    dataloader_factory=lambda _epoch, _accelerator: batches,
+                    accelerator_factory=FakeAccelerator,
+                ),
+                api.TrainingCallbacks(validate=lambda event: events.append(event)),
+            )
+            state = torch.load(
+                result.checkpoint / "fake_accelerate_state.pt", weights_only=False
+            )
+
+        self.assertEqual(result.progress.optimizer_steps, 4)
+        self.assertEqual(state["scheduler"]["last_epoch"], 4)
+        self.assertEqual([event.global_samples for event in events[:5]], [2] * 5)
+        self.assertEqual([event.global_samples for event in events[5:8]], [3] * 3)
+        self.assertEqual([event.global_samples for event in events[8:13]], [5] * 5)
+        self.assertEqual([event.global_samples for event in events[13:]], [6] * 3)
+
+    def test_global_zero_batch_skips_the_entire_training_step(self) -> None:
+        api = _api()
+        seen: list[str] = []
+        model = ToyAdapterModel(seen)
+        empty = {"utts": [], "target": torch.empty(0)}
+        real = {"utts": ["real"], "target": torch.tensor([1.0])}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            result = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=PhaseSpec.for_phase(1),
+                    eligible_samples=1,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path(tmp),
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: [empty, real],
+                    accelerator_factory=lambda **kwargs: FakeAccelerator(
+                        global_sample_counts=[0, 1, 0, 1], **kwargs
+                    ),
+                ),
+                api.TrainingCallbacks(validate=lambda _event: None),
+            )
+            state = torch.load(result.checkpoint / "fake_accelerate_state.pt", weights_only=False)
+
+        self.assertEqual(seen, ["real", "real"])
+        self.assertEqual(result.progress.optimizer_steps, 2)
+        self.assertEqual(state["scheduler"]["last_epoch"], 2)
+
+    def test_empty_local_rank_uses_shared_dummy_forward_with_zero_contribution(self) -> None:
+        api = _api()
+        seen: list[str] = []
+        model = ToyAdapterModel(seen)
+        empty = {"utts": [], "target": torch.empty(0)}
+        remote = {"utts": ["remote"], "target": torch.tensor([2.0])}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            result = api.train_phase(
+                api.TrainRequest(
+                    model=model,
+                    phase=PhaseSpec.for_phase(1),
+                    eligible_samples=1,
+                    cache_checksum="c" * 64,
+                    checkpoint_root=Path(tmp),
+                    token_limit=2000,
+                    accumulation_steps=1,
+                    dataloader_factory=lambda _epoch, _accelerator: [empty],
+                    accelerator_factory=lambda **kwargs: FakeAccelerator(
+                        global_sample_counts=[1, 1], remote_batch=remote, **kwargs
+                    ),
+                ),
+                api.TrainingCallbacks(validate=lambda _event: None),
+            )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(model.forward_calls, 2)
+        self.assertEqual(seen, [])
+        self.assertEqual(model.lora_weight.item(), 0.0)
 
     def test_phase_two_continues_global_validation_indices_at_seventeen(self) -> None:
         api = _api()
         model = ToyAdapterModel([])
-        phase = replace(PhaseSpec.for_phase(2), epochs=1)
+        phase = PhaseSpec.for_phase(2)
         indices: list[int] = []
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
@@ -254,12 +420,12 @@ class AccelerateTrainingTests(unittest.TestCase):
             )
 
         self.assertTrue(result.completed)
-        self.assertEqual(indices, list(range(17, 25)))
+        self.assertEqual(indices, list(range(17, 41)))
 
     def test_checkpoint_records_complete_identity_rng_and_state_checksums(self) -> None:
         api = _api()
         model = ToyAdapterModel([])
-        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+        phase = PhaseSpec.for_phase(1)
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
             result = api.train_phase(
@@ -283,7 +449,22 @@ class AccelerateTrainingTests(unittest.TestCase):
         self.assertEqual(manifest["validation_status"], "succeeded")
         self.assertEqual(
             set(manifest["identity"]),
-            {"cache_checksum", "phase", "phase_spec", "base_checkpoint_sha256", "lora", "token_limit", "accumulation_steps", "world_size"},
+            {
+                "accumulation_steps",
+                "base_checkpoint_sha256",
+                "cache_manifest_sha256",
+                "dataloader_identity",
+                "eligible_samples",
+                "lora",
+                "max_grad_norm",
+                "phase",
+                "phase_spec",
+                "sampler_seed",
+                "sampler_window_size",
+                "scheduler",
+                "token_limit",
+                "world_size",
+            },
         )
         self.assertIn("fake_accelerate_state.pt", manifest["state_files"])
         self.assertIn("adapter/adapter_model.safetensors", manifest["state_files"])
@@ -291,7 +472,7 @@ class AccelerateTrainingTests(unittest.TestCase):
 
     def test_resume_refuses_changed_identity_and_tampered_state(self) -> None:
         api = _api()
-        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+        phase = PhaseSpec.for_phase(1)
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
             model = ToyAdapterModel([])
@@ -311,10 +492,19 @@ class AccelerateTrainingTests(unittest.TestCase):
             first = api.train_phase(request, api.TrainingCallbacks(validate=lambda event: False))
             for changed in (
                 replace(request, resume_from=first.checkpoint, cache_checksum="d" * 64),
-                replace(request, resume_from=first.checkpoint, phase=replace(PhaseSpec.for_phase(2), epochs=1)),
-                replace(request, resume_from=first.checkpoint, phase=replace(phase, learning_rate=2e-4)),
+                replace(request, resume_from=first.checkpoint, phase=PhaseSpec.for_phase(2)),
+                replace(request, resume_from=first.checkpoint, eligible_samples=2),
+                replace(request, resume_from=first.checkpoint, max_grad_norm=2.0),
                 replace(request, resume_from=first.checkpoint, token_limit=3000),
                 replace(request, resume_from=first.checkpoint, accumulation_steps=2),
+                replace(request, resume_from=first.checkpoint, sampler_seed=1987),
+                replace(request, resume_from=first.checkpoint, sampler_window_size=256),
+                replace(request, resume_from=first.checkpoint, dataloader_identity="alternate-loader:v1"),
+                replace(
+                    request,
+                    resume_from=first.checkpoint,
+                    scheduler_factory=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=1),
+                ),
             ):
                 with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "identity changed"):
                     api.train_phase(changed, api.TrainingCallbacks(validate=lambda event: None))
@@ -335,7 +525,7 @@ class AccelerateTrainingTests(unittest.TestCase):
             {"utts": [f"sample-{index}"], "target": torch.tensor([float(index + 1)])}
             for index in range(8)
         ]
-        phase = replace(PhaseSpec.for_phase(1), epochs=1)
+        phase = PhaseSpec.for_phase(1)
 
         def fail_validation(_event):
             raise RuntimeError("validation unavailable")
@@ -374,6 +564,60 @@ class AccelerateTrainingTests(unittest.TestCase):
         self.assertFalse(recovered.completed)
         self.assertEqual(recovered_status, "succeeded")
 
+    def test_interrupted_checkpoint_staging_is_discarded_without_harming_previous_checkpoint(self) -> None:
+        api = _api()
+        model = ToyAdapterModel([])
+        batches = [
+            {"utts": [f"sample-{index}"], "target": torch.tensor([float(index + 1)])}
+            for index in range(8)
+        ]
+
+        class InterruptedStagingAccelerator(FakeAccelerator):
+            def save_state(self, output_dir) -> None:
+                super().save_state(output_dir)
+                if "validation-02" in str(output_dir):
+                    raise RuntimeError("staging interrupted")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(api, "audit_trainable_parameters", _audit), mock.patch.object(api, "save_adapter", _save_adapter):
+            request = api.TrainRequest(
+                model=model,
+                phase=PhaseSpec.for_phase(1),
+                eligible_samples=8,
+                cache_checksum="c" * 64,
+                checkpoint_root=Path(tmp),
+                token_limit=2000,
+                accumulation_steps=1,
+                dataloader_factory=lambda _epoch, _accelerator: batches,
+                accelerator_factory=FakeAccelerator,
+            )
+            first = api.train_phase(
+                request,
+                api.TrainingCallbacks(validate=lambda event: event.validation_index < 1),
+            )
+            previous_manifest = (first.checkpoint / api.CHECKPOINT_MANIFEST).read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "staging interrupted"):
+                api.train_phase(
+                    replace(
+                        request,
+                        resume_from=first.checkpoint,
+                        accelerator_factory=InterruptedStagingAccelerator,
+                    ),
+                    api.TrainingCallbacks(validate=lambda _event: None),
+                )
+            stale = Path(tmp) / ".phase-1-validation-02.incomplete"
+            self.assertTrue(stale.is_dir())
+
+            resumed = api.train_phase(
+                replace(request, resume_from=first.checkpoint),
+                api.TrainingCallbacks(validate=lambda event: event.validation_index < 2),
+            )
+            previous_after = (first.checkpoint / api.CHECKPOINT_MANIFEST).read_bytes()
+            stale_exists = stale.exists()
+
+        self.assertEqual(previous_after, previous_manifest)
+        self.assertEqual(resumed.progress.validation_index, 2)
+        self.assertFalse(stale_exists)
+
     def test_production_oom_raises_without_changing_the_token_limit(self) -> None:
         api = _api()
 
@@ -383,7 +627,7 @@ class AccelerateTrainingTests(unittest.TestCase):
 
         request = api.TrainRequest(
             model=OOMModel([]),
-            phase=replace(PhaseSpec.for_phase(1), epochs=1),
+            phase=PhaseSpec.for_phase(1),
             eligible_samples=1,
             cache_checksum="c" * 64,
             checkpoint_root=Path("unused"),

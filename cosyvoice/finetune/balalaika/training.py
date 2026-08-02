@@ -6,13 +6,15 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
 from torch import nn
 
 from .artifacts import atomic_write_json, sha256_file
-from .config import PhaseSpec
+from .config import DEFAULT_SEED, PhaseSpec
+from .data import DEFAULT_LENGTH_WINDOW
 from .model import LoraSettings, audit_trainable_parameters, save_adapter
 
 
@@ -117,10 +119,17 @@ class TrainRequest:
     accelerator_factory: Callable[..., Any] | None = None
     scheduler_factory: Callable[[torch.optim.Optimizer], Any] | None = None
     max_grad_norm: float = 1.0
+    sampler_seed: int = DEFAULT_SEED
+    sampler_window_size: int = DEFAULT_LENGTH_WINDOW
+    dataloader_identity: str = "cosyvoice.balalaika.cached-rank-loader:v1"
 
     def __post_init__(self) -> None:
-        if self.phase.number not in (1, 2):
-            raise ValueError("phase must be 1 or 2")
+        try:
+            approved_phase = PhaseSpec.for_phase(self.phase.number)
+        except ValueError as exc:
+            raise ValueError("phase must be an exact approved phase schedule") from exc
+        if self.phase != approved_phase:
+            raise ValueError("phase must be an exact approved phase schedule")
         if isinstance(self.eligible_samples, bool) or self.eligible_samples < 1:
             raise ValueError("eligible_samples must be positive")
         if len(self.cache_checksum) != 64:
@@ -129,6 +138,12 @@ class TrainRequest:
             raise ValueError("token_limit and accumulation_steps must be positive")
         if self.max_grad_norm <= 0:
             raise ValueError("max_grad_norm must be positive")
+        if isinstance(self.sampler_seed, bool) or not isinstance(self.sampler_seed, int):
+            raise ValueError("sampler_seed must be an integer")
+        if isinstance(self.sampler_window_size, bool) or self.sampler_window_size < 1:
+            raise ValueError("sampler_window_size must be positive")
+        if not isinstance(self.dataloader_identity, str) or not self.dataloader_identity:
+            raise ValueError("dataloader_identity must be a nonempty string")
 
 
 @dataclass(frozen=True)
@@ -167,12 +182,13 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
         if request.scheduler_factory is not None
         else torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     )
+    run_identity = _identity(request, accelerator, scheduler=scheduler)
 
     initial_validation = 0 if request.phase.number == 1 else 16
     progress = ProgressState(phase=request.phase.number, validation_index=initial_validation)
     resume_manifest: Mapping[str, object] | None = None
     if request.resume_from is not None:
-        resume_manifest = _require_resume_manifest(Path(request.resume_from), request, accelerator)
+        resume_manifest = _require_resume_manifest(Path(request.resume_from), run_identity, request.phase.number)
         progress.load_state_dict(_mapping(resume_manifest, "progress"))
 
     accelerator.register_for_checkpointing(progress)
@@ -184,6 +200,43 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
     reached: list[ValidationEvent] = []
     latest_checkpoint = Path(request.resume_from) if request.resume_from is not None else None
     boundaries = FractionBoundary.for_epoch(request.eligible_samples)
+
+    def release_due_boundaries() -> bool:
+        nonlocal latest_checkpoint
+        while progress.next_boundary_ordinal <= _FRACTIONS_PER_EPOCH:
+            boundary = boundaries[progress.next_boundary_ordinal - 1]
+            if progress.epoch_samples < boundary.sample_target:
+                break
+            progress.next_boundary_ordinal += 1
+            progress.validation_index += 1
+            target = _checkpoint_path(request, progress.validation_index)
+            event = ValidationEvent(
+                phase=request.phase.number,
+                epoch=progress.epoch,
+                boundary=boundary,
+                validation_index=progress.validation_index,
+                global_samples=progress.global_samples,
+                checkpoint=target,
+                model=model,
+                accelerator=accelerator,
+            )
+            should_continue = _save_validate_publish(
+                request,
+                accelerator,
+                model,
+                optimizer,
+                scheduler,
+                progress,
+                event,
+                callbacks,
+                run_identity,
+            )
+            latest_checkpoint = target
+            reached.append(event)
+            if not should_continue:
+                return False
+        return True
+
     if resume_manifest is not None and resume_manifest.get("validation_status") == "pending":
         fraction = _mapping(resume_manifest, "fraction")
         ordinal = fraction.get("numerator")
@@ -213,23 +266,36 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
         reached.append(event)
         if callback_result is False:
             return PhaseResult(progress, latest_checkpoint, tuple(reached), False)
+    if not release_due_boundaries():
+        return PhaseResult(progress, latest_checkpoint, tuple(reached), False)
 
     while progress.epoch < request.phase.epochs:
-        dataloader = request.dataloader_factory(progress.epoch, accelerator)
+        dataloader = _prepare_rank_dataloader(
+            request.dataloader_factory(progress.epoch, accelerator), accelerator
+        )
         if progress.batch_offset:
             dataloader = accelerator.skip_first_batches(dataloader, progress.batch_offset)
+        pending_samples = 0
+        pending_batches = 0
         for batch in dataloader:
             local_samples = _real_sample_count(batch)
             global_samples = _global_sample_count(accelerator, local_samples)
+            pending_batches += 1
+            if global_samples == 0:
+                continue
+            rank_samples = _rank_sample_counts(accelerator, local_samples, global_samples)
+            forward_batch, zero_contribution = _collective_forward_batch(
+                accelerator, batch, local_samples, rank_samples
+            )
             try:
                 with accelerator.accumulate(model):
-                    loss = _batch_loss(model, batch, accelerator, trainable)
+                    loss = _batch_loss(model, forward_batch, accelerator, zero_contribution)
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(trainable, request.max_grad_norm)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
             except torch.cuda.OutOfMemoryError as exc:
                 raise TrainingCapacityError(
                     f"production token limit {request.token_limit} exhausted GPU memory; rerun qualification"
@@ -241,36 +307,17 @@ def train_phase(request: TrainRequest, callbacks: TrainingCallbacks) -> PhaseRes
                     f"production token limit {request.token_limit} exhausted GPU memory; rerun qualification"
                 ) from exc
 
-            progress.batch_offset += 1
-            progress.epoch_samples += global_samples
-            progress.global_samples += global_samples
+            pending_samples += global_samples
             if not accelerator.sync_gradients:
                 continue
+            progress.batch_offset += pending_batches
+            progress.epoch_samples += pending_samples
+            progress.global_samples += pending_samples
             progress.optimizer_steps += 1
-            while progress.next_boundary_ordinal <= _FRACTIONS_PER_EPOCH:
-                boundary = boundaries[progress.next_boundary_ordinal - 1]
-                if progress.epoch_samples < boundary.sample_target:
-                    break
-                progress.next_boundary_ordinal += 1
-                progress.validation_index += 1
-                target = _checkpoint_path(request, progress.validation_index)
-                event = ValidationEvent(
-                    phase=request.phase.number,
-                    epoch=progress.epoch,
-                    boundary=boundary,
-                    validation_index=progress.validation_index,
-                    global_samples=progress.global_samples,
-                    checkpoint=target,
-                    model=model,
-                    accelerator=accelerator,
-                )
-                should_continue = _save_validate_publish(
-                    request, accelerator, model, optimizer, scheduler, progress, event, callbacks
-                )
-                latest_checkpoint = target
-                reached.append(event)
-                if not should_continue:
-                    return PhaseResult(progress, latest_checkpoint, tuple(reached), False)
+            pending_samples = 0
+            pending_batches = 0
+            if not release_due_boundaries():
+                return PhaseResult(progress, latest_checkpoint, tuple(reached), False)
 
         if progress.epoch_samples != request.eligible_samples:
             raise RuntimeError(
@@ -314,18 +361,94 @@ def _global_sample_count(accelerator: Any, local_samples: int) -> int:
     return result
 
 
+def _rank_sample_counts(accelerator: Any, local_samples: int, global_samples: int) -> tuple[int, ...]:
+    fixture_gather = getattr(accelerator, "gather_sample_counts", None)
+    if fixture_gather is not None:
+        gathered = tuple(int(value) for value in fixture_gather(local_samples))
+    else:
+        value = torch.tensor([local_samples], dtype=torch.int64, device=accelerator.device)
+        gathered = tuple(int(item) for item in accelerator.gather(value).reshape(-1).cpu().tolist())
+    if len(gathered) != accelerator.num_processes or any(value < 0 for value in gathered):
+        raise RuntimeError("real-sample counts were not gathered from every rank")
+    if sum(gathered) != global_samples:
+        raise RuntimeError("gathered rank sample counts disagree with the global reduction")
+    return gathered
+
+
+def _collective_forward_batch(
+    accelerator: Any,
+    batch: Mapping[str, Any],
+    local_samples: int,
+    rank_samples: Sequence[int],
+) -> tuple[Mapping[str, Any], bool]:
+    if all(value > 0 for value in rank_samples):
+        return batch, False
+    template = _one_sample_template(batch) if local_samples else None
+    fixture_gather = getattr(accelerator, "gather_object", None)
+    if fixture_gather is not None:
+        gathered = fixture_gather([template])
+    else:
+        from accelerate.utils import gather_object
+
+        gathered = gather_object([template])
+    shared = next((value for value in gathered if value is not None), None)
+    if not isinstance(shared, Mapping):
+        raise RuntimeError("no real-shaped batch was available for an empty rank")
+    if local_samples:
+        return batch, False
+    dummy = dict(shared)
+    dummy["utts"] = []
+    if "text" in dummy:
+        dummy["text"] = []
+    return dummy, True
+
+
+def _one_sample_template(batch: Mapping[str, Any]) -> dict[str, Any]:
+    template: dict[str, Any] = {}
+    for name, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            template[name] = value.detach().cpu() if value.ndim == 0 else value[:1].detach().cpu()
+        elif isinstance(value, list):
+            template[name] = value[:1]
+        elif isinstance(value, tuple):
+            template[name] = value[:1]
+        else:
+            template[name] = value
+    return template
+
+
 def _batch_loss(
     model: nn.Module,
     batch: Mapping[str, Any],
     accelerator: Any,
-    trainable: Sequence[nn.Parameter],
+    zero_contribution: bool,
 ) -> torch.Tensor:
-    if _real_sample_count(batch) == 0:
-        return sum((parameter.sum() * 0 for parameter in trainable), torch.zeros((), device=accelerator.device))
     result = model(batch, accelerator.device)
     if not isinstance(result, Mapping) or not isinstance(result.get("loss"), torch.Tensor):
         raise RuntimeError("adapted model must return a tensor loss")
-    return result["loss"]
+    return result["loss"] * 0 if zero_contribution else result["loss"]
+
+
+def _prepare_rank_dataloader(dataloader: Iterable[Mapping[str, Any]], accelerator: Any) -> Iterable[Mapping[str, Any]]:
+    fixture_prepare = getattr(accelerator, "prepare_rank_dataloader", None)
+    if fixture_prepare is not None:
+        return fixture_prepare(dataloader)
+
+    from torch.utils.data import DataLoader
+
+    if not isinstance(dataloader, DataLoader):
+        raise TypeError("production dataloader_factory must return a torch DataLoader")
+    from accelerate.data_loader import prepare_data_loader
+
+    return prepare_data_loader(
+        dataloader,
+        accelerator.device,
+        num_processes=1,
+        process_index=0,
+        split_batches=False,
+        put_on_device=True,
+        even_batches=False,
+    )
 
 
 def _checkpoint_path(request: TrainRequest, validation_index: int) -> Path:
@@ -341,13 +464,16 @@ def _save_validate_publish(
     progress: ProgressState,
     event: ValidationEvent,
     callbacks: TrainingCallbacks,
+    run_identity: Mapping[str, object],
 ) -> bool:
     target = event.checkpoint
     temporary = target.with_name(f".{target.name}.incomplete")
     if accelerator.is_main_process:
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or temporary.exists():
+        if target.exists():
             raise FileExistsError(f"checkpoint publication target already exists: {target}")
+        if temporary.exists() or temporary.is_symlink():
+            _discard_stale_staging(temporary, target)
         temporary.mkdir()
     accelerator.wait_for_everyone()
     accelerator.save_state(str(temporary))
@@ -360,7 +486,7 @@ def _save_validate_publish(
         payload = {
             "format_version": 1,
             "validation_status": "pending",
-            "identity": _identity(request, accelerator, model),
+            "identity": dict(run_identity),
             "progress": progress.state_dict(),
             "fraction": {
                 "numerator": event.boundary.numerator,
@@ -387,6 +513,18 @@ def _save_validate_publish(
     return callback_result is not False
 
 
+def _discard_stale_staging(temporary: Path, target: Path) -> None:
+    expected_name = f".{target.name}.incomplete"
+    if temporary.parent.resolve() != target.parent.resolve() or temporary.name != expected_name:
+        raise RuntimeError(f"refusing to remove unexpected checkpoint staging path: {temporary}")
+    if temporary.is_symlink() or temporary.is_file():
+        temporary.unlink()
+    elif temporary.is_dir():
+        shutil.rmtree(temporary)
+    else:
+        raise RuntimeError(f"unsupported checkpoint staging entry: {temporary}")
+
+
 def _mark_validation_succeeded(accelerator: Any, checkpoint: Path) -> None:
     if not accelerator.is_main_process:
         return
@@ -401,8 +539,8 @@ def _mark_validation_succeeded(accelerator: Any, checkpoint: Path) -> None:
     atomic_write_json(manifest_path, payload)
 
 
-def _identity(request: TrainRequest, accelerator: Any, model: nn.Module | None = None) -> dict[str, object]:
-    unwrapped = accelerator.unwrap_model(request.model if model is None else model)
+def _identity(request: TrainRequest, accelerator: Any, *, scheduler: Any) -> dict[str, object]:
+    unwrapped = accelerator.unwrap_model(request.model)
     settings = getattr(unwrapped, "_balalaika_lora_settings", None)
     base_checksum = getattr(
         unwrapped, "_balalaika_base_checkpoint_sha256", None
@@ -410,15 +548,32 @@ def _identity(request: TrainRequest, accelerator: Any, model: nn.Module | None =
     if not isinstance(settings, LoraSettings) or not isinstance(base_checksum, str) or len(base_checksum) != 64:
         raise ValueError("adapted model lacks complete base-checksum/LoRA provenance")
     return {
-        "cache_checksum": request.cache_checksum,
+        "cache_manifest_sha256": request.cache_checksum,
         "phase": request.phase.number,
         "phase_spec": asdict(request.phase),
+        "eligible_samples": request.eligible_samples,
         "base_checkpoint_sha256": base_checksum,
         "lora": asdict(settings),
         "token_limit": request.token_limit,
         "accumulation_steps": request.accumulation_steps,
+        "max_grad_norm": request.max_grad_norm,
+        "sampler_seed": request.sampler_seed,
+        "sampler_window_size": request.sampler_window_size,
+        "dataloader_identity": request.dataloader_identity,
+        "scheduler": _scheduler_identity(scheduler),
         "world_size": accelerator.num_processes,
     }
+
+
+def _scheduler_identity(scheduler: Any) -> dict[str, object]:
+    identity = {
+        "class": f"{scheduler.__class__.__module__}.{scheduler.__class__.__qualname__}",
+        "initial_state": scheduler.state_dict(),
+    }
+    try:
+        return json.loads(json.dumps(identity, allow_nan=False, sort_keys=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scheduler identity must be JSON-serializable") from exc
 
 
 def _state_checksums(root: Path) -> dict[str, str]:
@@ -429,7 +584,11 @@ def _state_checksums(root: Path) -> dict[str, str]:
     }
 
 
-def _require_resume_manifest(path: Path, request: TrainRequest, accelerator: Any) -> Mapping[str, object]:
+def _require_resume_manifest(
+    path: Path,
+    expected_identity: Mapping[str, object],
+    phase_number: int,
+) -> Mapping[str, object]:
     manifest_path = path / CHECKPOINT_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -439,14 +598,14 @@ def _require_resume_manifest(path: Path, request: TrainRequest, accelerator: Any
         raise ValueError(f"invalid resume checkpoint: {path}")
     if manifest.get("validation_status") not in ("pending", "succeeded"):
         raise ValueError("resume checkpoint validation status is invalid")
-    if manifest.get("identity") != _identity(request, accelerator):
+    if manifest.get("identity") != expected_identity:
         raise ValueError("resume checkpoint identity changed")
     checksums = _mapping(manifest, "state_files")
     actual = _state_checksums(path)
     if checksums != actual:
         raise ValueError("resume checkpoint state checksum changed")
     progress = _mapping(manifest, "progress")
-    if progress.get("phase") != request.phase.number:
+    if progress.get("phase") != phase_number:
         raise ValueError("resume checkpoint phase changed")
     return manifest
 
