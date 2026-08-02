@@ -153,5 +153,6 @@ def collect_environment() -> dict[str, object]:
         "wandb": _distribution_version("wandb"),
         "onnxruntime": onnxruntime_version,
         "onnx_asr": _distribution_version("onnx-asr"),
+        "openai_whisper": _distribution_version("openai-whisper"),
         "onnxruntime_providers": providers,
     }

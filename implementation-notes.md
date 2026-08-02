@@ -1,5 +1,17 @@
 # Implementation Notes
 
+## 2026-08-02 - Qualify Whisper before corpus hashing
+
+- The first post-timeout production pilot attempt completed both 373 GB source
+  verification passes, then failed before pilot generation because the runtime
+  did not have the `whisper` module supplied by `openai-whisper`.
+- The upstream root requirements already pin this package, but the Blackwell
+  environment manifest did not qualify or record it. The recipe-specific CUDA
+  requirements now repeat the pin, and `collect_environment()` validates its
+  installed distribution version before any source inventory begins.
+- No pilot, memorization, cache, validation, or training artifact was produced
+  by the failed launch.
+
 ## 2026-08-02 - Execution setup
 
 - Decision: Implement the approved two-phase CosyVoice3 LoRA plan on the isolated `feature/cosyvoice3-balalaika-lora` worktree.

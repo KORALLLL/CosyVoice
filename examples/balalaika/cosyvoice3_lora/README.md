@@ -54,7 +54,10 @@ python -m pip install --upgrade \
 ```
 
 Do not downgrade Torch after this step. Confirm the qualified versions and
-providers before any run:
+providers before any run. The recipe requirements repeat the upstream
+`openai-whisper` pin deliberately because audio tokenization imports its
+`whisper` module directly; preflight records this version and fails before
+corpus hashing if it is absent.
 
 ```bash
 python - <<'PY'

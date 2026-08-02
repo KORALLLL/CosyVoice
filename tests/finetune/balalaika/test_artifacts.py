@@ -131,6 +131,7 @@ class ArtifactTests(unittest.TestCase):
             "pyarrow": "25.0.0",
             "wandb": "0.28.1",
             "onnx-asr": "0.12.0",
+            "openai-whisper": "20231117",
         }
 
         with (
@@ -145,6 +146,30 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(environment["gpus"][0], {"name": "NVIDIA GeForce RTX 5090", "capability": [12, 0]})
         self.assertEqual(environment["onnxruntime"], "1.26.0")
         self.assertEqual(environment["onnx_asr"], "0.12.0")
+        self.assertEqual(environment["openai_whisper"], "20231117")
+
+    def test_collect_environment_rejects_missing_openai_whisper(self):
+        cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 8,
+            get_device_name=lambda index: "NVIDIA GeForce RTX 5090",
+            get_device_capability=lambda index: (12, 0),
+            is_bf16_supported=lambda: True,
+        )
+        torch = types.SimpleNamespace(__version__="2.8.0+cu128", version=types.SimpleNamespace(cuda="12.8"), cuda=cuda)
+        onnxruntime = types.SimpleNamespace(__version__="1.26.0", get_available_providers=lambda: ["CUDAExecutionProvider"])
+
+        def distribution_version(name: str) -> str:
+            if name == "openai-whisper":
+                raise RuntimeError("missing required dependency: openai-whisper")
+            return "1.0.0"
+
+        with (
+            patch("cosyvoice.finetune.balalaika.config.import_module", side_effect=lambda name: {"torch": torch, "onnxruntime": onnxruntime}[name]),
+            patch("cosyvoice.finetune.balalaika.config._distribution_version", side_effect=distribution_version),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing required dependency: openai-whisper"):
+                collect_environment()
 
     def test_collect_environment_rejects_unsupported_onnx_runtime(self):
         cuda = types.SimpleNamespace(
