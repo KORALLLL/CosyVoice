@@ -90,3 +90,24 @@ No real model, GPU, corpus, training run, install, upload, or credential access 
 - `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -q` — 32 passed.
 - `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -q` — 127 passed.
 - `rtk python -m compileall -q cosyvoice/finetune/balalaika/memorization.py cosyvoice/finetune/balalaika/model.py cosyvoice/llm/llm.py` and `rtk git diff --check` passed.
+
+## Fix Round 4: internal Qwen lm_head subtree exclusion
+
+### Root cause
+
+- Active discovery, the live trainable audit, and the persisted `TrainableAudit` validator used `endswith("llm.model.lm_head")`. That excluded only the internal head module itself; a linear descendant such as `llm.model.lm_head.child` remained an active LoRA target.
+- The same exact-only predicate let a prefixed descendant target and its complete LoRA A/B tensor pair pass persisted-audit and memorization self-validation. Adapter manifest parsing had no direct forbidden-subtree check, so merge rejected a tampered descendant inventory only later as a generic fresh-base mismatch.
+
+### TDD evidence
+
+1. RED: four focused regressions failed. Active discovery included `llm.model.lm_head.child`; strict audit validation accepted `base_model.model.llm.model.lm_head.child` with complete trainable A/B names; merge did not identify the forbidden subtree; and a coherently duplicated/resealed memorization audit accepted the descendant pair.
+2. GREEN: `_is_internal_qwen_lm_head_path` now matches the canonical `llm.model.lm_head` segment sequence at any wrapper-prefix depth and therefore covers both the head and every descendant. It does not match the outer CosyVoice `llm_decoder`.
+3. GREEN: active target discovery, stored target inventory checks, live wrapper and trainable-name checks, strict persisted audit validation, and adapter manifest parsing all use the canonical helper. Memorization self-validation inherits the same rejection through `validate_trainable_audit_payload`.
+4. GREEN: the focused RED set passed all four regressions after the minimal production change.
+
+### Verification
+
+- `rtk python -m unittest tests.finetune.balalaika.test_memorization tests.finetune.balalaika.test_model -v` — 35 passed.
+- `rtk python -m unittest discover -s tests/finetune/balalaika -p 'test_*.py' -v` — 130 passed.
+- `rtk python -m compileall -q cosyvoice/finetune/balalaika/memorization.py cosyvoice/finetune/balalaika/model.py cosyvoice/llm/llm.py tests/finetune/balalaika/test_memorization.py tests/finetune/balalaika/test_model.py` and `rtk git diff --check` passed.
+- Code/tests commit: `4bfb3bb` (`fix: reject internal lm head descendants`).
