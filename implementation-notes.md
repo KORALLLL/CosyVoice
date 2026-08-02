@@ -67,3 +67,13 @@
 - Decision: Keep all eight fractional event identities even when a small epoch maps several exact fractions to the same completed-sample threshold; release every due event once at the next accumulation boundary.
 - Validation: Training tests pass 13/13, all Balalaika tests pass 106/106, the two-process Accelerate CPU smoke writes eight ordered boundary records, and compilation/whitespace checks pass.
 - Follow-up: Real eight-GPU BF16 execution, production model loading, and DDP behavior of explicit empty synchronization batches remain hardware qualification work.
+
+### Fix round 1
+
+- Decision: Preserve the pre-sharded Task 7 sampler by wrapping each rank loader through Accelerate with `num_processes=1`; this supplies end-of-dataloader accumulation synchronization without a second distributed shard.
+- Decision: When any rank is empty, gather one CPU single-sample template and run the prepared model on a zero-contribution dummy at empty ranks, keeping DDP forward/backward collectives aligned. A globally empty step performs no training or sample-progress operation.
+- Decision: Advance sample and sampler cursors only when an optimizer accumulation window commits; the sampler cursor also covers earlier globally empty physical batches so resume skips the exact consumed prefix.
+- Decision: Resume identity now includes the complete approved phase, eligible count, cache manifest checksum, token budget, clipping, accumulation, world size, sampler seed/window, dataloader identity, base/LoRA provenance, and scheduler class plus initial configuration; Accelerate state checksums bind the evolving scheduler state.
+- Changed: Stale checkpoint staging at the exact derived `.incomplete` path is removed before a retry; neighboring completed checkpoints are never touched.
+- Validation: Focused training tests pass 18/18, all Balalaika tests pass 111/111, and the two-process DDP smoke passes uneven empty-rank work, a 2-of-3 final accumulation, validation crash/resume, exact boundaries, no replay, and equal rank weights.
+- Follow-up: The smoke is intentionally two-process CPU validation; real eight-GPU BF16 capacity and performance qualification remains outside fixture scope.
