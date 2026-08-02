@@ -210,6 +210,18 @@ class FinalValidationEvidence:
     artifact_checksums: Mapping[str, str]
     checkpoint_sha256: str
     model_state_sha256: str
+    wandb: "WandbCommitEvidence"
+
+
+@dataclass(frozen=True)
+class WandbCommitEvidence:
+    run_id: str
+    context: Mapping[str, object]
+    marker: str
+    run_manifest_sha256: str
+    ledger_path: Path
+    ledger_sha256: str
+    remote_markers: Mapping[str, object]
 
 
 def verify_final_validation_evidence(
@@ -219,7 +231,7 @@ def verify_final_validation_evidence(
     expected_model_state_sha256: str,
     expected_base_checkpoint_sha256: str,
     expected_adapter_sha256: str,
-    wandb_run_manifest: Path,
+    wandb_logger: "WandbValidationLogger",
 ) -> FinalValidationEvidence:
     """Fail closed on any changed Task 10 validation-40 publication or ledger."""
 
@@ -236,19 +248,10 @@ def verify_final_validation_evidence(
     if any(identity.payload.get(name) != value for name, value in expected.items()):
         raise EvaluationIntegrityError("Task 10 evaluation identity differs from final export lineage")
     report = _require_published_report(request, items, identity, _canonical_sha256(_semantic_assignment(items)))
-    run = _read_wandb_manifest(Path(wandb_run_manifest))
-    context = _wandb_commit_context(report)
-    marker = _canonical_sha256(context)
-    ledger = _read_wandb_commit(
-        Path(wandb_run_manifest).parent / "wandb-validation-commits" / "validation-40.json",
-        40,
-        str(run["run_id"]),
-        context,
-        marker,
-    )
-    if (ledger["media_logged"], ledger["scalars_logged"], ledger["committed"]) != (True, True, True):
-        raise WandbSyncError("Task 10 validation-40 W&B ledger is incomplete")
-    return FinalValidationEvidence(identity.sha256, report.artifact_checksums, expected_checkpoint_sha256, expected_model_state_sha256)
+    if not isinstance(wandb_logger, WandbValidationLogger):
+        raise TypeError("final validation evidence requires WandbValidationLogger")
+    wandb = wandb_logger.verify_committed(report, 40)
+    return FinalValidationEvidence(identity.sha256, report.artifact_checksums, expected_checkpoint_sha256, expected_model_state_sha256, wandb)
 
 
 class WandbValidationLogger:
@@ -345,6 +348,29 @@ class WandbValidationLogger:
             raise WandbSyncError(
                 f"W&B validation {validation_index} is incomplete; syncable local run preserved at {sync_dir}"
             ) from exc
+
+    def verify_committed(self, report: EvaluationReport, validation_index: int) -> WandbCommitEvidence:
+        """Re-authenticate local and remote W&B completion evidence."""
+
+        run = self.preflight(validation_index)
+        if getattr(report, "validation_index", None) != validation_index:
+            raise WandbSyncError("W&B validation index disagrees with the evaluation report")
+        context = _wandb_commit_context(report)
+        marker = _canonical_sha256(context)
+        manifest = _read_wandb_manifest(self.run_manifest)
+        run_id = getattr(run, "id", None)
+        if run_id != manifest["run_id"]:
+            raise WandbSyncError("W&B active run differs from the persisted run manifest")
+        ledger_path = self.commit_dir / f"validation-{validation_index:02d}.json"
+        ledger = _read_wandb_commit(ledger_path, validation_index, run_id, context, marker)
+        if (ledger["media_logged"], ledger["scalars_logged"], ledger["committed"]) != (True, True, True):
+            raise WandbSyncError("W&B validation ledger is incomplete")
+        scalar = f"validation/commit/{validation_index:02d}/scalars"
+        media = f"validation/commit/{validation_index:02d}/media"
+        remote = _wandb_remote_markers(run, scalar, media, self._remote_history_reader)
+        if remote != {scalar: marker, media: marker}:
+            raise WandbSyncError("W&B remote validation markers are missing or changed")
+        return WandbCommitEvidence(run_id, context, marker, sha256_file(self.run_manifest), ledger_path, sha256_file(ledger_path), remote)
 
     def preflight(self, validation_index: int) -> Any:
         if not os.environ.get("WANDB_API_KEY", "").strip():

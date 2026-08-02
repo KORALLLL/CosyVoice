@@ -88,6 +88,7 @@ class ExportRequest:
     output_dir: Path
     validation_request: object | None = None
     wandb_run_manifest: Path | None = None
+    wandb_logger: object | None = None
     test_mode: bool = False
     expected_training_identity: Mapping[str, object] | None = None
     verification_voices: Sequence[Mapping[str, object]] | None = None
@@ -98,8 +99,8 @@ class ExportRequest:
         for name in ("base_model_dir", "phase2_checkpoint", "validation_summary", "output_dir"):
             if not isinstance(getattr(self, name), Path):
                 raise TypeError(f"{name} must be a pathlib.Path")
-        if self.test_mode is not True and (self.validation_request is None or not isinstance(self.wandb_run_manifest, Path)):
-            raise ValueError("production export requires Task 10 evidence request and W&B run manifest")
+        if self.test_mode is not True and (self.validation_request is None or self.wandb_logger is None):
+            raise ValueError("production export requires Task 10 evidence request and W&B logger")
         if self.test_mode is not True and not isinstance(self.expected_training_identity, Mapping):
             raise ValueError("production export requires the complete immutable training identity")
         if self.test_mode and (self.verification_voices is None or self.recognizer is None):
@@ -835,7 +836,7 @@ def _require_final_export_lineage(request: ExportRequest) -> dict[str, object]:
             expected_model_state_sha256=model_state_sha256,
             expected_base_checkpoint_sha256=str(adapter["base_checkpoint_sha256"]),
             expected_adapter_sha256=str(adapter["weights_sha256"]),
-            wandb_run_manifest=request.wandb_run_manifest,
+            wandb_logger=request.wandb_logger,
         )
     base_path = request.base_model_dir / "llm.pt"
     if not base_path.is_file() or sha256_file(base_path) != adapter["base_checkpoint_sha256"]:
