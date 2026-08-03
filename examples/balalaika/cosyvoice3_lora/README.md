@@ -89,6 +89,12 @@ assert "CUDAExecutionProvider" in ort.get_available_providers()
 PY
 ```
 
+ONNX Runtime normally reports the created speech-tokenizer session as
+`["CUDAExecutionProvider", "CPUExecutionProvider"]`: CUDA is primary, while
+shape/control nodes may use the standard CPU fallback. Qualification rejects a
+CPU-only session or any session where CUDA is not first, and runs the real model
+twice on every GPU to verify deterministic outputs and expected token lengths.
+
 The Accelerate configuration is fixed at one machine, eight processes, GPU IDs
 0-7, and BF16 in [`conf/accelerate.yaml`](conf/accelerate.yaml). Both launchers
 also reject anything other than eight unique visible device IDs.

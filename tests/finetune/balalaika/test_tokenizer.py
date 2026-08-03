@@ -58,6 +58,16 @@ class CpuFallbackSession(OomOnceSession):
         return ["CPUExecutionProvider"]
 
 
+class CudaPrimaryWithCpuFallbackSession(OomOnceSession):
+    def get_providers(self):
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+
+class CpuPrimarySession(OomOnceSession):
+    def get_providers(self):
+        return ["CPUExecutionProvider", "CUDAExecutionProvider"]
+
+
 class UnverifiableSession(OomOnceSession):
     get_providers = None
 
@@ -155,10 +165,19 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(session.item_history, [self.ids, self.ids[:4], self.ids[4:]])
         self.assertEqual(result, [[item] for item in self.ids])
 
-    def test_session_rejects_cpu_provider_fallback(self) -> None:
+    def test_session_accepts_cuda_primary_with_standard_cpu_fallback(self) -> None:
+        session = CudaPrimaryWithCpuFallbackSession()
+        session._runs = 1
+        backend = OnnxSpeechTokenizer(session=session, feature_builder=self._features)
+
+        self.assertEqual(backend.extract(self.audio[:1]), [[self.ids[0]]])
+
+    def test_session_rejects_cpu_only_or_cpu_primary_provider(self) -> None:
         # A seemingly successful CPU session invalidates the per-GPU qualification/cache contract.
-        with self.assertRaisesRegex(TokenizerError, "CUDAExecutionProvider"):
-            OnnxSpeechTokenizer(session=CpuFallbackSession(), feature_builder=self._features)
+        for session in (CpuFallbackSession(), CpuPrimarySession()):
+            with self.subTest(session=type(session).__name__):
+                with self.assertRaisesRegex(TokenizerError, "CUDAExecutionProvider"):
+                    OnnxSpeechTokenizer(session=session, feature_builder=self._features)
 
     def test_session_rejects_unverifiable_or_empty_provider_identity(self) -> None:
         # A session that cannot prove CUDA placement must never get an inference call.

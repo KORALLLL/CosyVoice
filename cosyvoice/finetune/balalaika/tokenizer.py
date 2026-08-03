@@ -1,4 +1,4 @@
-"""CUDA-only CosyVoice3 speech tokens, listening pilots, and cache-worker gate."""
+"""CUDA-primary CosyVoice3 speech tokens, listening pilots, and cache-worker gate."""
 
 from __future__ import annotations
 
@@ -366,8 +366,8 @@ def _create_cuda_session(model_path: Path, local_rank: int) -> Any:
 
 def _require_cuda_provider(session: Any) -> None:
     providers = _session_providers(session)
-    if providers != ["CUDAExecutionProvider"]:
-        raise TokenizerError(f"speech-tokenizer session did not bind CUDAExecutionProvider exclusively: {providers}")
+    if providers[0] != "CUDAExecutionProvider":
+        raise TokenizerError(f"speech-tokenizer session did not bind CUDAExecutionProvider as its primary provider: {providers}")
 
 
 def _session_providers(session: Any) -> list[str]:

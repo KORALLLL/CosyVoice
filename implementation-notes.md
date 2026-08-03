@@ -1,5 +1,19 @@
 # Implementation Notes
 
+## 2026-08-03 - Accept CUDA-primary ONNX sessions with standard CPU fallback
+
+- Real ONNX Runtime session creation successfully initialized
+  `CUDAExecutionProvider` and assigned only shape/control nodes to CPU, reporting
+  providers as `[CUDAExecutionProvider, CPUExecutionProvider]`. Requiring the
+  provider list to contain CUDA exclusively rejected this normal configuration
+  before the eight-device deterministic inference check could run.
+- The gate now requires CUDA to be the first/primary provider, still rejects
+  CPU-only, CPU-primary, empty, erroring, or unverifiable sessions, and retains
+  real double inference, token-range/rate/length checks, and per-device records.
+- The preceding production attempt sealed `preflight_complete` with the exact
+  split and authenticated 2,000-row benchmark, then stopped before tokenizer
+  qualification publication, pilot generation, or any later work.
+
 ## 2026-08-03 - Reuse only fully authenticated split plans
 
 - A downstream benchmark failure occurred after the 4,075,032-row split plan
