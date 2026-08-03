@@ -10,14 +10,14 @@ from unittest import mock
 
 import torch
 
-from cosyvoice.finetune.balalaika.artifacts import sha256_file
+from cosyvoice.finetune.balalaika.artifacts import atomic_write_json, sha256_file
 from cosyvoice.finetune.balalaika.cache import CacheManifest
 from cosyvoice.finetune.balalaika.model import TrainableAudit
 from cosyvoice.finetune.balalaika.smoke import ThreeGpuSmokeError, ThreeGpuSmokeRequest, run_three_gpu_smoke
 
 
 class ThreeGpuSmokeTests(unittest.TestCase):
-    def test_request_accepts_only_three_bf16_ranks_and_distinct_smoke_root(self) -> None:
+    def test_request_defaults_to_cache_root_split_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cache = CacheManifest(root / "cache", {0: root / "cache" / "shard.json"}, {1: 2, 2: 2}, 0)
@@ -32,6 +32,25 @@ class ThreeGpuSmokeTests(unittest.TestCase):
             self.assertEqual(request.world_size, 3)
             self.assertEqual(request.steps, 2)
             self.assertEqual(request.split_plan, cache.root / "split_plan")
+
+    def test_request_forbids_split_plan_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = _fixture_cache(root)
+            with self.assertRaisesRegex(ValueError, "split_plan override"):
+                ThreeGpuSmokeRequest(
+                    cache=cache,
+                    output_root=root / "three_gpu_smoke",
+                    base_model_dir=root / "Fun-CosyVoice3-0.5B-2512",
+                    split_plan=root / "foreign_split_plan",
+                )
+
+    def test_request_accepts_only_three_bf16_ranks_and_distinct_smoke_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = CacheManifest(root / "cache", {0: root / "cache" / "shard.json"}, {1: 2, 2: 2}, 0)
+            base = root / "Fun-CosyVoice3-0.5B-2512"
+
             with self.assertRaisesRegex(ValueError, "world_size=3"):
                 ThreeGpuSmokeRequest(
                     cache=cache,
@@ -140,6 +159,37 @@ class ThreeGpuSmokeTests(unittest.TestCase):
             select.assert_not_called()
             self.assertFalse((root / "three_gpu_smoke").exists())
             self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
+
+    def test_direct_cache_manifest_requires_intact_authenticated_artifact_chain(self) -> None:
+        artifacts = (
+            "shard_manifest.json",
+            "phase1/shard_000000.parquet",
+            "phase2/shard_000000.parquet",
+            "split_plan/shard_000000.jsonl",
+        )
+        for artifact in artifacts:
+            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cache = _fixture_cache(root)
+                with (cache.root / artifact).open("ab") as handle:
+                    handle.write(b"tampered")
+                request = ThreeGpuSmokeRequest(
+                    cache=cache,
+                    output_root=root / "three_gpu_smoke",
+                    base_model_dir=root / "Fun-CosyVoice3-0.5B-2512",
+                    accelerator_factory=lambda **kwargs: _ThreeRankAccelerator(**kwargs),
+                )
+
+                with mock.patch(
+                    "cosyvoice.finetune.balalaika.smoke.select_memorization_rows",
+                    side_effect=AssertionError("data load reached"),
+                ) as select:
+                    with self.assertRaisesRegex(ThreeGpuSmokeError, "changed"):
+                        run_three_gpu_smoke(request)
+
+                select.assert_not_called()
+                self.assertFalse((root / "three_gpu_smoke").exists())
+                self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
 
     def test_rank_zero_preflight_rejects_existing_target_before_loader_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -337,13 +387,10 @@ class ThreeGpuSmokeTests(unittest.TestCase):
                 base_model_dir=base,
                 accelerator_factory=lambda **kwargs: _ThreeRankAccelerator(**kwargs),
             )
-            replace = Path.replace
-
-            def collide(source: Path, target: Path) -> Path:
-                if source == request.temporary_root:
-                    target.mkdir()
-                    (target / "foreign.txt").write_text("do not delete", encoding="utf-8")
-                return replace(source, target)
+            def collide(path: Path, payload: object) -> None:
+                atomic_write_json(path, payload)
+                request.output_root.mkdir()
+                (request.output_root / "foreign.txt").write_text("do not delete", encoding="utf-8")
 
             with (
                 mock.patch("cosyvoice.finetune.balalaika.smoke.select_memorization_rows", return_value=(object(),)),
@@ -351,12 +398,46 @@ class ThreeGpuSmokeTests(unittest.TestCase):
                 mock.patch("cosyvoice.finetune.balalaika.smoke.load_base_llm", return_value=_FiniteLossModel()),
                 mock.patch("cosyvoice.finetune.balalaika.smoke.inject_lora", side_effect=lambda value, _: value),
                 mock.patch("cosyvoice.finetune.balalaika.smoke.audit_trainable_parameters", return_value=_audit()),
-                mock.patch.object(Path, "replace", autospec=True, side_effect=collide),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.atomic_write_json", side_effect=collide),
             ):
                 with self.assertRaisesRegex(ThreeGpuSmokeError, "FileExistsError"):
                     run_three_gpu_smoke(request)
 
             self.assertEqual((root / "three_gpu_smoke/foreign.txt").read_text(encoding="utf-8"), "do not delete")
+            self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
+
+    def test_empty_foreign_target_race_is_preserved_on_publish_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = _fixture_cache(root)
+            base = root / "Fun-CosyVoice3-0.5B-2512"
+            base.mkdir()
+            (base / "llm.pt").write_bytes(b"base-llm")
+            target = root / "three_gpu_smoke"
+            request = ThreeGpuSmokeRequest(
+                cache=cache,
+                output_root=target,
+                base_model_dir=base,
+                accelerator_factory=lambda **kwargs: _ThreeRankAccelerator(**kwargs),
+            )
+
+            def collide(path: Path, payload: object) -> None:
+                atomic_write_json(path, payload)
+                target.mkdir()
+
+            with (
+                mock.patch("cosyvoice.finetune.balalaika.smoke.select_memorization_rows", return_value=(object(),)),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.build_memorization_dataloader", return_value=[{"target": torch.tensor(1.0)}]),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.load_base_llm", return_value=_FiniteLossModel()),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.inject_lora", side_effect=lambda value, _: value),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.audit_trainable_parameters", return_value=_audit()),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.atomic_write_json", side_effect=collide),
+            ):
+                with self.assertRaisesRegex(ThreeGpuSmokeError, "FileExistsError"):
+                    run_three_gpu_smoke(request)
+
+            self.assertTrue(target.is_dir())
+            self.assertEqual(list(target.iterdir()), [])
             self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
 
     def test_status_gather_failure_after_publish_removes_target(self) -> None:

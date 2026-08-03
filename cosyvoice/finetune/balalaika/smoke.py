@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import secrets
 import shutil
@@ -28,6 +30,8 @@ class _CollectiveFailure(ThreeGpuSmokeError):
 
 
 _ATTEMPT_MARKER = ".attempt_id"
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 
 @dataclass(frozen=True)
@@ -62,8 +66,8 @@ class ThreeGpuSmokeRequest:
             raise ValueError("three-GPU smoke output directory must be named three_gpu_smoke")
         if self.split_plan is None:
             object.__setattr__(self, "split_plan", self.cache.root / "split_plan")
-        elif not isinstance(self.split_plan, Path):
-            raise TypeError("split_plan must be a pathlib.Path")
+        else:
+            raise ValueError("three-GPU smoke forbids a split_plan override")
 
     @property
     def temporary_root(self) -> Path:
@@ -89,8 +93,11 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
     cache_checksum: str | None = None
     base_checksum: str | None = None
     try:
+        from .workflow import _load_memorization_cache
+
         cache_checksum = _cache_manifest_checksum(request.cache)
-        rows = select_memorization_rows(request.split_plan, request.cache)
+        cache = _load_memorization_cache(request.cache.root)
+        rows = select_memorization_rows(cache.root / "split_plan", cache)
         train_loader = build_memorization_dataloader(rows, batch_size=1)
         batches = tuple(train_loader)
         if not batches:
@@ -207,7 +214,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
     rename_error: Mapping[str, object] | None = None
     if getattr(accelerator, "is_main_process", False):
         try:
-            request.temporary_root.replace(request.output_root)
+            _rename_directory_noreplace(request.temporary_root, request.output_root)
             (request.output_root / _ATTEMPT_MARKER).unlink()
         except Exception as exc:
             rename_error = _failure_status(accelerator, exc)
@@ -228,6 +235,33 @@ def _create_accelerator(request: ThreeGpuSmokeRequest) -> Any:
 
         factory = Accelerator
     return factory(mixed_precision=request.mixed_precision)
+
+
+def _rename_directory_noreplace(source: Path, target: Path) -> None:
+    """Atomically publish a same-filesystem directory without replacing a target."""
+
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise ThreeGpuSmokeError("atomic no-replace directory publication is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), target)
 
 
 def _create_temporary_root(accelerator: Any, request: ThreeGpuSmokeRequest) -> str:
