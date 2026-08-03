@@ -139,6 +139,43 @@ class ThreeGpuSmokeTests(unittest.TestCase):
             self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
             self.assertEqual(accelerators[0].broadcast_calls, 1)
 
+    def test_collective_failures_teardown_without_a_following_status_gather(self) -> None:
+        for operation in ("prepare", "backward", "gather"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cache = _fixture_cache(root)
+                base = root / "Fun-CosyVoice3-0.5B-2512"
+                base.mkdir()
+                (base / "llm.pt").write_bytes(b"base-llm")
+                accelerators: list[_FailingCollectiveAccelerator] = []
+
+                def accelerator_factory(**kwargs):
+                    accelerator = _FailingCollectiveAccelerator(operation, **kwargs)
+                    accelerators.append(accelerator)
+                    return accelerator
+
+                request = ThreeGpuSmokeRequest(
+                    cache=cache,
+                    output_root=root / "three_gpu_smoke",
+                    base_model_dir=base,
+                    accelerator_factory=accelerator_factory,
+                )
+                with (
+                    mock.patch("cosyvoice.finetune.balalaika.smoke.select_memorization_rows", return_value=(object(),)),
+                    mock.patch("cosyvoice.finetune.balalaika.smoke.build_memorization_dataloader", return_value=[{"target": torch.tensor(1.0)}]),
+                    mock.patch("cosyvoice.finetune.balalaika.smoke.load_base_llm", return_value=_FiniteLossModel()),
+                    mock.patch("cosyvoice.finetune.balalaika.smoke.inject_lora", side_effect=lambda value, _: value),
+                    mock.patch("cosyvoice.finetune.balalaika.smoke.audit_trainable_parameters", return_value=_audit()),
+                ):
+                    with self.assertRaisesRegex(ThreeGpuSmokeError, f"{operation} collective"):
+                        run_three_gpu_smoke(request)
+
+                accelerator = accelerators[0]
+                self.assertEqual(accelerator.teardown_calls, 1)
+                self.assertEqual(accelerator.status_gathers_after_failure, 0)
+                self.assertFalse((root / "three_gpu_smoke").exists())
+                self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
+
 
 def _fixture_cache(root: Path) -> CacheManifest:
     cache_root = root / "cache"
@@ -214,6 +251,42 @@ class _ThreeRankAccelerator:
 
     def wait_for_everyone(self) -> None:
         return None
+
+
+class _FailingCollectiveAccelerator(_ThreeRankAccelerator):
+    def __init__(self, failing_operation: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.failing_operation = failing_operation
+        self.collective_failed = False
+        self.status_gathers_after_failure = 0
+        self.teardown_calls = 0
+
+    def prepare(self, *values):
+        if self.failing_operation == "prepare":
+            self.collective_failed = True
+            raise RuntimeError("simulated prepare collective failure")
+        return super().prepare(*values)
+
+    def backward(self, loss) -> None:
+        if self.failing_operation == "backward":
+            self.collective_failed = True
+            raise RuntimeError("simulated backward collective failure")
+        super().backward(loss)
+
+    def gather(self, value):
+        if self.failing_operation == "gather":
+            self.collective_failed = True
+            raise RuntimeError("simulated gather collective failure")
+        return super().gather(value)
+
+    def gather_object(self, value):
+        if self.collective_failed:
+            self.status_gathers_after_failure += 1
+            raise AssertionError("status gather after failed collective would deadlock")
+        return super().gather_object(value)
+
+    def end_training(self) -> None:
+        self.teardown_calls += 1
 
 
 if __name__ == "__main__":

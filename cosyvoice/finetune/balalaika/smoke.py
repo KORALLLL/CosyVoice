@@ -22,6 +22,10 @@ class ThreeGpuSmokeError(RuntimeError):
     """The isolated three-rank smoke run could not complete safely."""
 
 
+class _CollectiveFailure(ThreeGpuSmokeError):
+    """A distributed operation failed after its process group was torn down."""
+
+
 @dataclass(frozen=True)
 class ThreeGpuSmokeRequest:
     """Immutable inputs for one fresh three-rank smoke attempt."""
@@ -103,12 +107,13 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
 
     assert model is not None and optimizer is not None and train_loader is not None
     assert audit_payload is not None and cache_checksum is not None and base_checksum is not None
-    prepare_error: Mapping[str, object] | None = None
-    try:
-        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-    except Exception as exc:
-        prepare_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, prepare_error, request.temporary_root, temporary_created)
+    model, optimizer, train_loader = _run_collective(
+        accelerator,
+        "prepare",
+        request.temporary_root,
+        temporary_created,
+        lambda: accelerator.prepare(model, optimizer, train_loader),
+    )
 
     batches_error: Mapping[str, object] | None = None
     batches: tuple[object, ...] = ()
@@ -129,8 +134,16 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             model.train()
             optimizer.zero_grad(set_to_none=True)
             batch = next(local_batches)
-            result = model(batch, accelerator.device)
+            result = _run_collective(
+                accelerator,
+                "forward",
+                request.temporary_root,
+                temporary_created,
+                lambda: model(batch, accelerator.device),
+            )
             loss = _finite_scalar_loss(result)
+        except _CollectiveFailure:
+            raise
         except Exception as exc:
             step_error = _failure_status(accelerator, exc)
         _raise_if_any_rank_failed(accelerator, step_error, request.temporary_root, temporary_created)
@@ -138,16 +151,30 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
         assert loss is not None
         optimization_error: Mapping[str, object] | None = None
         try:
-            accelerator.backward(loss)
+            _run_collective(
+                accelerator,
+                "backward",
+                request.temporary_root,
+                temporary_created,
+                lambda: accelerator.backward(loss),
+            )
             accelerator.clip_grad_norm_(model.parameters(), request.max_grad_norm)
             optimizer.step()
+        except _CollectiveFailure:
+            raise
         except Exception as exc:
             optimization_error = _failure_status(accelerator, exc)
         _raise_if_any_rank_failed(accelerator, optimization_error, request.temporary_root, temporary_created)
 
         gather_error: Mapping[str, object] | None = None
+        gathered = _run_collective(
+            accelerator,
+            "gather",
+            request.temporary_root,
+            temporary_created,
+            lambda: accelerator.gather(loss.detach().reshape(1)),
+        )
         try:
-            gathered = accelerator.gather(loss.detach().reshape(1))
             loss_values = [float(value) for value in gathered.detach().cpu().reshape(-1).tolist()]
             if len(loss_values) != request.world_size or not all(torch.isfinite(torch.tensor(value)).item() for value in loss_values):
                 raise ThreeGpuSmokeError("three-GPU smoke must gather one finite loss per rank")
@@ -213,6 +240,62 @@ def _create_temporary_root(accelerator: Any, request: ThreeGpuSmokeRequest) -> b
         shutil.rmtree(request.temporary_root)
     accelerator.wait_for_everyone()
     raise ThreeGpuSmokeError(f"three-GPU smoke failed on rank {shared['rank']}: {error}")
+
+
+def _run_collective(
+    accelerator: Any,
+    name: str,
+    temporary: Path,
+    temporary_created: bool,
+    operation: Callable[[], Any],
+) -> Any:
+    """Run one collective without entering status-gather after an abort."""
+
+    try:
+        return operation()
+    except Exception as exc:
+        _teardown_collectives(accelerator)
+        if getattr(accelerator, "is_main_process", False) and temporary_created and temporary.exists():
+            shutil.rmtree(temporary)
+        raise _CollectiveFailure(f"{name} collective failed after process-group teardown: {exc}") from exc
+
+
+def _teardown_collectives(accelerator: Any) -> None:
+    """Best-effort abort/teardown that lets blocked peers leave a failed collective."""
+
+    state = getattr(accelerator, "state", None)
+    candidates = (
+        getattr(accelerator, "process_group", None),
+        getattr(state, "process_group", None),
+        getattr(torch.distributed.group, "WORLD", None),
+    )
+    for process_group in candidates:
+        abort = getattr(process_group, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+                return
+            except Exception:
+                pass
+    end_training = getattr(accelerator, "end_training", None)
+    if callable(end_training):
+        try:
+            end_training()
+            return
+        except Exception:
+            pass
+    destroy = getattr(state, "destroy_process_group", None)
+    if callable(destroy):
+        try:
+            destroy()
+            return
+        except Exception:
+            pass
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            torch.distributed.destroy_process_group()
+        except Exception:
+            pass
 
 
 def _cache_manifest_checksum(cache: CacheManifest) -> str:
