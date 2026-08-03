@@ -170,7 +170,8 @@ class WorkflowTests(unittest.TestCase):
         backend.coordinator = FakeCoordinator()
         options = _args(Path("/tmp/qualification-fixture"), FakeBackend()).options
         records = [{"device": device, "token_count": 25} for device in range(8)]
-        backend.coordinator.gather = lambda value: records  # type: ignore[method-assign]
+        statuses = [{"ok": True, "record": record} for record in records]
+        backend.coordinator.gather = lambda value: statuses  # type: ignore[method-assign]
         payload = {"model_sha256": "a" * 64, "devices": records}
 
         with (
@@ -188,6 +189,32 @@ class WorkflowTests(unittest.TestCase):
         qualify.assert_called_once_with(options.paths, 0)
         publish.assert_called_once_with(options.paths, records)
         self.assertEqual(result, payload)
+
+    def test_production_tokenizer_qualification_gathers_local_error_before_raising(self) -> None:
+        backend = ProductionBackend.__new__(ProductionBackend)
+        backend.coordinator = FakeCoordinator()
+        options = _args(Path("/tmp/qualification-error-fixture"), FakeBackend()).options
+        remote_error = {
+            "ok": False,
+            "rank": 3,
+            "type": "TokenizerError",
+            "error": "device 3 failed",
+        }
+        backend.coordinator.gather = lambda value: [value, remote_error]  # type: ignore[method-assign]
+
+        with (
+            mock.patch(
+                "cosyvoice.finetune.balalaika.tokenizer.qualify_tokenizer_device",
+                return_value={"device": 0},
+            ),
+            mock.patch(
+                "cosyvoice.finetune.balalaika.tokenizer.publish_tokenizer_qualification"
+            ) as publish,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "device 3 failed"):
+                backend.qualify_tokenizer(options)
+
+        publish.assert_not_called()
 
     def test_production_resume_reconstructs_only_prior_committed_validation_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

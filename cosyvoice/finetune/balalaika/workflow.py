@@ -294,17 +294,45 @@ class ProductionBackend:
         if self.coordinator.num_processes != len(options.paths.visible_devices):
             raise StageRequirementError("tokenizer qualification requires one process per visible GPU")
         device = options.paths.visible_devices[self.coordinator.process_index]
-        local = qualify_tokenizer_device(options.paths, device)
+        try:
+            local: dict[str, object] = {
+                "ok": True,
+                "record": qualify_tokenizer_device(options.paths, device),
+            }
+        except Exception as exc:
+            local = {
+                "ok": False,
+                "rank": self.coordinator.process_index,
+                "type": type(exc).__name__,
+                "error": str(exc),
+            }
         gathered = self.coordinator.gather(local)
-        payload = (
-            publish_tokenizer_qualification(options.paths, [cast(Mapping[str, object], record) for record in gathered])
-            if self.coordinator.is_main_process
-            else None
-        )
-        received = self.coordinator.broadcast(payload)
-        if not isinstance(received, Mapping):
+        failures = [status for status in gathered if isinstance(status, Mapping) and status.get("ok") is not True]
+        if failures:
+            first = cast(Mapping[str, object], failures[0])
+            _raise_remote(
+                "tokenizer device qualification",
+                str(first.get("type", "RuntimeError")),
+                str(first.get("error", "local GPU qualification failed")),
+            )
+        records = [
+            cast(Mapping[str, object], cast(Mapping[str, object], status).get("record"))
+            for status in gathered
+        ]
+        publish_status: dict[str, object] | None = None
+        if self.coordinator.is_main_process:
+            try:
+                publish_status = {
+                    "ok": True,
+                    "value": publish_tokenizer_qualification(options.paths, records),
+                }
+            except Exception as exc:
+                publish_status = {"ok": False, "type": type(exc).__name__, "error": str(exc)}
+        received = self.coordinator.broadcast(publish_status)
+        payload = _unwrap_status("publish tokenizer qualification", received)
+        if not isinstance(payload, Mapping):
             raise StageRequirementError("tokenizer qualification did not broadcast combined evidence")
-        return dict(received)
+        return dict(payload)
 
     def ensure_pilot(self, options: WorkflowOptions) -> dict[str, object]:
         from .artifacts import StageStore

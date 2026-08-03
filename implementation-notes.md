@@ -12,6 +12,11 @@
   stage, and the resulting evidence is broadcast before workflow publication.
 - Focused tokenizer/workflow/integration tests pass 38 tests plus 16 subtests,
   including the collective gate and exact-device-set regressions.
+- Follow-up qualification exposed a mismatched-collective risk when one device
+  errors before the inner record gather. Each rank now always gathers a local
+  success/error envelope first; only a globally successful set proceeds to a
+  separately broadcast publication envelope. The expanded suite passes 39
+  tests plus 16 subtests and preserves the first concrete remote error.
 
 ## 2026-08-03 - Pack speech-token features in the model's declared layout
 
