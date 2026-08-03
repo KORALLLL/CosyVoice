@@ -1,0 +1,271 @@
+"""Isolated three-rank LoRA smoke run for the Balalaika recipe."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import hashlib
+from pathlib import Path
+import shutil
+from itertools import cycle
+from typing import Any, Callable, Mapping, Sequence
+
+import torch
+
+from .artifacts import atomic_write_json, sha256_file
+from .cache import CacheManifest
+from .data import build_memorization_dataloader
+from .memorization import select_memorization_rows
+from .model import LoraSettings, audit_trainable_parameters, inject_lora, load_base_llm, validate_trainable_audit_payload
+
+
+class ThreeGpuSmokeError(RuntimeError):
+    """The isolated three-rank smoke run could not complete safely."""
+
+
+@dataclass(frozen=True)
+class ThreeGpuSmokeRequest:
+    """Immutable inputs for one fresh three-rank smoke attempt."""
+
+    cache: CacheManifest
+    output_root: Path
+    base_model_dir: Path
+    split_plan: Path | None = None
+    steps: int = 2
+    world_size: int = 3
+    mixed_precision: str = "bf16"
+    learning_rate: float = 1e-4
+    max_grad_norm: float = 1.0
+    accelerator_factory: Callable[..., Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cache, CacheManifest):
+            raise TypeError("cache must be a CacheManifest")
+        if not isinstance(self.output_root, Path) or not isinstance(self.base_model_dir, Path):
+            raise TypeError("output_root and base_model_dir must be pathlib.Path values")
+        if self.world_size != 3:
+            raise ValueError("three-GPU smoke requires world_size=3")
+        if self.mixed_precision != "bf16":
+            raise ValueError("three-GPU smoke requires mixed_precision='bf16'")
+        if self.steps != 2:
+            raise ValueError("three-GPU smoke requires steps=2")
+        if self.learning_rate <= 0 or self.max_grad_norm <= 0:
+            raise ValueError("learning_rate and max_grad_norm must be positive")
+        if self.output_root.name != "three_gpu_smoke":
+            raise ValueError("three-GPU smoke output directory must be named three_gpu_smoke")
+        if self.output_root.exists() or self.temporary_root.exists():
+            raise ValueError("three_gpu_smoke target or incomplete directory already exists")
+        if self.split_plan is None:
+            object.__setattr__(self, "split_plan", self.cache.root / "split_plan")
+        elif not isinstance(self.split_plan, Path):
+            raise TypeError("split_plan must be a pathlib.Path")
+
+    @property
+    def temporary_root(self) -> Path:
+        return self.output_root.parent / ".three_gpu_smoke.incomplete"
+
+
+def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
+    """Run exactly two isolated LoRA optimization steps across three ranks."""
+
+    if not isinstance(request, ThreeGpuSmokeRequest):
+        raise TypeError("request must be a ThreeGpuSmokeRequest")
+    accelerator = _create_accelerator(request)
+    if getattr(accelerator, "num_processes", None) != request.world_size:
+        raise ThreeGpuSmokeError("three-GPU smoke requires exactly three Accelerate ranks")
+
+    temporary_created = False
+    setup_error: Mapping[str, object] | None = None
+    if getattr(accelerator, "is_main_process", False):
+        try:
+            if request.output_root.exists() or request.temporary_root.exists():
+                raise ThreeGpuSmokeError("three_gpu_smoke target or incomplete directory already exists")
+            request.temporary_root.mkdir(parents=True)
+            temporary_created = True
+        except Exception as exc:
+            setup_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, setup_error, request.temporary_root, temporary_created)
+
+    prepared_error: Mapping[str, object] | None = None
+    model = None
+    optimizer = None
+    train_loader = None
+    audit_payload: dict[str, object] | None = None
+    cache_checksum: str | None = None
+    base_checksum: str | None = None
+    try:
+        rows = select_memorization_rows(request.split_plan, request.cache)
+        train_loader = build_memorization_dataloader(rows, batch_size=1)
+        batches = tuple(train_loader)
+        if not batches:
+            raise ThreeGpuSmokeError("three-GPU smoke dataloader is empty")
+        cache_checksum = _cache_manifest_checksum(request.cache)
+        base_checkpoint = request.base_model_dir / "llm.pt"
+        if not base_checkpoint.is_file():
+            raise FileNotFoundError(f"missing CosyVoice3 LLM checkpoint: {base_checkpoint}")
+        base_checksum = sha256_file(base_checkpoint)
+        model = inject_lora(load_base_llm(request.base_model_dir), LoraSettings())
+        audit_payload = _validated_audit_payload(audit_trainable_parameters(model))
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if not trainable:
+            raise ThreeGpuSmokeError("fresh smoke adapter has no trainable parameters")
+        optimizer = torch.optim.AdamW(trainable, lr=request.learning_rate)
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    except Exception as exc:
+        prepared_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, prepared_error, request.temporary_root, temporary_created)
+
+    assert model is not None and optimizer is not None and train_loader is not None
+    assert audit_payload is not None and cache_checksum is not None and base_checksum is not None
+    batches = tuple(train_loader)
+    if not batches:
+        _raise_if_any_rank_failed(
+            accelerator,
+            _failure_status(accelerator, ThreeGpuSmokeError("three-GPU smoke prepared dataloader is empty")),
+            request.temporary_root,
+            temporary_created,
+        )
+    losses_by_step: list[list[float]] = []
+    local_batches = cycle(batches)
+    for _step in range(request.steps):
+        step_error: Mapping[str, object] | None = None
+        loss: torch.Tensor | None = None
+        try:
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            batch = next(local_batches)
+            result = model(batch, accelerator.device)
+            loss = _finite_scalar_loss(result)
+        except Exception as exc:
+            step_error = _failure_status(accelerator, exc)
+        _raise_if_any_rank_failed(accelerator, step_error, request.temporary_root, temporary_created)
+
+        assert loss is not None
+        optimization_error: Mapping[str, object] | None = None
+        try:
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), request.max_grad_norm)
+            optimizer.step()
+            gathered = accelerator.gather(loss.detach().reshape(1))
+            loss_values = [float(value) for value in gathered.detach().cpu().reshape(-1).tolist()]
+            if len(loss_values) != request.world_size or not all(torch.isfinite(torch.tensor(value)).item() for value in loss_values):
+                raise ThreeGpuSmokeError("three-GPU smoke must gather one finite loss per rank")
+            losses_by_step.append(loss_values)
+        except Exception as exc:
+            optimization_error = _failure_status(accelerator, exc)
+        _raise_if_any_rank_failed(accelerator, optimization_error, request.temporary_root, temporary_created)
+
+    manifest: dict[str, object] = {
+        "world_size": request.world_size,
+        "steps": request.steps,
+        "cache_manifest_sha256": cache_checksum,
+        "base_llm_sha256": base_checksum,
+        "trainable_audit": audit_payload,
+        "losses_by_step": losses_by_step,
+    }
+    publish_error: Mapping[str, object] | None = None
+    if getattr(accelerator, "is_main_process", False):
+        try:
+            atomic_write_json(request.temporary_root / "manifest.json", manifest)
+        except Exception as exc:
+            publish_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, publish_error, request.temporary_root, temporary_created)
+
+    rename_error: Mapping[str, object] | None = None
+    if getattr(accelerator, "is_main_process", False):
+        try:
+            request.temporary_root.replace(request.output_root)
+        except Exception as exc:
+            rename_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, rename_error, request.temporary_root, temporary_created)
+    return manifest
+
+
+def _create_accelerator(request: ThreeGpuSmokeRequest) -> Any:
+    factory = request.accelerator_factory
+    if factory is None:
+        from accelerate import Accelerator
+
+        factory = Accelerator
+    return factory(mixed_precision=request.mixed_precision)
+
+
+def _cache_manifest_checksum(cache: CacheManifest) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(cache.prompt_count).encode("ascii"))
+    for phase in sorted(cache.phase_rows):
+        digest.update(f"{phase}:{cache.phase_rows[phase]}".encode("ascii"))
+    for shard, path in sorted(cache.shards.items()):
+        shard_path = Path(path)
+        if not shard_path.is_file():
+            raise ThreeGpuSmokeError(f"cache shard manifest is missing: {shard_path}")
+        digest.update(str(shard).encode("ascii"))
+        digest.update(sha256_file(shard_path).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _validated_audit_payload(audit: Any) -> dict[str, object]:
+    payload = asdict(audit) if hasattr(audit, "__dataclass_fields__") else audit
+    if not isinstance(payload, Mapping):
+        raise ThreeGpuSmokeError("adapter audit is not serializable")
+    result = dict(payload)
+    validate_trainable_audit_payload(result)
+    return {
+        name: list(value) if isinstance(value, tuple) else value
+        for name, value in result.items()
+    }
+
+
+def _finite_scalar_loss(result: Any) -> torch.Tensor:
+    if not isinstance(result, Mapping) or not isinstance(result.get("loss"), torch.Tensor):
+        raise ThreeGpuSmokeError("adapted model must return a tensor loss")
+    loss = result["loss"]
+    if loss.numel() != 1 or not bool(torch.isfinite(loss).all().item()):
+        raise ThreeGpuSmokeError("loss must be a finite scalar")
+    return loss
+
+
+def _failure_status(accelerator: Any, exc: Exception) -> Mapping[str, object]:
+    return {
+        "rank": int(getattr(accelerator, "process_index", 0)),
+        "error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _raise_if_any_rank_failed(
+    accelerator: Any,
+    local_failure: Mapping[str, object] | None,
+    temporary: Path,
+    temporary_created: bool,
+) -> None:
+    status = local_failure or {"rank": int(getattr(accelerator, "process_index", 0)), "error": None}
+    statuses = _gather_statuses(accelerator, status)
+    accelerator.wait_for_everyone()
+    failures = sorted(
+        (
+            item for item in statuses
+            if isinstance(item.get("rank"), int) and isinstance(item.get("error"), str) and item["error"]
+        ),
+        key=lambda item: int(item["rank"]),
+    )
+    if not failures:
+        return
+    if getattr(accelerator, "is_main_process", False) and temporary_created and temporary.exists():
+        shutil.rmtree(temporary)
+    accelerator.wait_for_everyone()
+    first = failures[0]
+    raise ThreeGpuSmokeError(f"three-GPU smoke failed on rank {first['rank']}: {first['error']}")
+
+
+def _gather_statuses(accelerator: Any, status: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
+    gather_object = getattr(accelerator, "gather_object", None)
+    if callable(gather_object):
+        gathered = gather_object(dict(status))
+    else:
+        from accelerate.utils import gather_object as accelerate_gather_object
+
+        gathered = accelerate_gather_object(dict(status))
+    if not isinstance(gathered, Sequence) or isinstance(gathered, (str, bytes)):
+        raise ThreeGpuSmokeError("three-GPU smoke failure status gather is invalid")
+    if len(gathered) != 3 or any(not isinstance(item, Mapping) for item in gathered):
+        raise ThreeGpuSmokeError("three-GPU smoke must gather one failure status per rank")
+    return gathered
