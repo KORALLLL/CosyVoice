@@ -640,6 +640,34 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("huggingface_hub", text)
             subprocess.run(["bash", "-n", str(path)], check=True)
 
+    def test_launchers_export_repository_and_matcha_on_pythonpath(self) -> None:
+        # Without the pinned submodule path, real CosyVoice3 YAML construction cannot import matcha.
+        repository = Path(__file__).parents[3]
+        recipe = repository / "examples/balalaika/cosyvoice3_lora"
+        for launcher in sorted(recipe.glob("*.sh")):
+            with self.subTest(launcher=launcher.name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                capture = root / "pythonpath.txt"
+                fake_python = root / "python"
+                fake_python.write_text(
+                    "#!/usr/bin/env bash\nprintf '%s' \"${PYTHONPATH}\" > \"${CAPTURE}\"\n",
+                    encoding="utf-8",
+                )
+                fake_python.chmod(0o755)
+                environment = dict(os.environ)
+                environment.update({
+                    "CAPTURE": str(capture),
+                    "PATH": f"{root}:{environment['PATH']}",
+                    "PYTHONPATH": "existing-entry",
+                })
+
+                subprocess.run(["bash", str(launcher), "--status"], check=True, env=environment)
+
+                self.assertEqual(
+                    capture.read_text(encoding="utf-8").split(":"),
+                    [str(repository), str(repository / "third_party/Matcha-TTS"), "existing-entry"],
+                )
+
     def test_workflow_has_no_upload_surface(self) -> None:
         source = (Path(__file__).parents[3] / "cosyvoice/finetune/balalaika/workflow.py").read_text(encoding="utf-8")
         for forbidden in ("upload_file", "upload_folder", "HfApi", "create_repo", "push_to_hub"):

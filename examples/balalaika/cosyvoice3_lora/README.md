@@ -54,6 +54,7 @@ to the qualified Blackwell versions so the upstream CUDA 12.1 pins do not win.
 
 ```bash
 cd /workspace/CosyVoice
+git submodule update --init --recursive third_party/Matcha-TTS
 python3.12 -m venv .venv-cu128
 source .venv-cu128/bin/activate
 python -m pip install --upgrade pip setuptools wheel
@@ -63,6 +64,10 @@ python -m pip install --upgrade torch==2.8.0 torchaudio==2.8.0 \
 python -m pip install --upgrade \
   -r examples/balalaika/cosyvoice3_lora/requirements-cu128.txt
 ```
+
+Both launchers prepend the repository root and the pinned Matcha-TTS submodule
+to `PYTHONPATH`; an uninitialized submodule is therefore a fatal setup error,
+not a cue to install an unrelated `matcha` package from PyPI.
 
 Do not downgrade Torch after this step. Confirm the qualified versions and
 providers before any run. The recipe overrides upstream `openai-whisper`

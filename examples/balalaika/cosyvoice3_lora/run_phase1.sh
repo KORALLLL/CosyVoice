@@ -21,7 +21,7 @@ done
 
 export CUDA_VISIBLE_DEVICES="${visible_devices}"
 export BALALAIKA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${repo_root}:${repo_root}/third_party/Matcha-TTS${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ "${1:-}" == "--status" ]]; then
   shift
