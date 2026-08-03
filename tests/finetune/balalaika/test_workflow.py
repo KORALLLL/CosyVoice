@@ -201,7 +201,9 @@ class WorkflowTests(unittest.TestCase):
 
             subprocess.run(["bash", str(phase1)], env=environment, text=True, capture_output=True, check=True)
 
-            self.assertIn("--num_processes 3", capture.read_text(encoding="utf-8"))
+            arguments = capture.read_text(encoding="utf-8")
+            self.assertIn("--multi_gpu", arguments)
+            self.assertIn("--num_processes 3", arguments)
 
     def test_phase2_smoke_mode_is_rejected(self) -> None:
         phase2 = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora/run_phase2.sh"

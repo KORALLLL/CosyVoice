@@ -23,7 +23,7 @@ if [[ "${BALALAIKA_THREE_GPU_SMOKE:-}" == "1" ]]; then
   export CUDA_VISIBLE_DEVICES="${visible_devices}"
   export BALALAIKA_VISIBLE_DEVICES="0,1,2"
   export PYTHONPATH="${repo_root}:${repo_root}/third_party/Matcha-TTS${PYTHONPATH:+:${PYTHONPATH}}"
-  exec accelerate launch --num_processes 3 --mixed_precision bf16 \
+  exec accelerate launch --multi_gpu --num_processes 3 --mixed_precision bf16 \
     -m cosyvoice.finetune.balalaika.workflow three-gpu-smoke "$@"
 fi
 
