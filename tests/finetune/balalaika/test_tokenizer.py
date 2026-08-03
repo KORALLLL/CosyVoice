@@ -36,6 +36,7 @@ class OomOnceSession:
 
     def __init__(self) -> None:
         self.item_history: list[list[int]] = []
+        self.shape_history: list[tuple[int, ...]] = []
         self._runs = 0
 
     def get_inputs(self):
@@ -47,6 +48,7 @@ class OomOnceSession:
     def run(self, _, inputs):
         ids = [int(item) for item in inputs["features"][:, 0, 0]]
         self.item_history.append(ids)
+        self.shape_history.append(tuple(inputs["features"].shape))
         self._runs += 1
         if self._runs == 1:
             raise RuntimeError("CUDA out of memory")
@@ -163,6 +165,7 @@ class TokenizerTests(unittest.TestCase):
         result = backend.extract(self.audio)
 
         self.assertEqual(session.item_history, [self.ids, self.ids[:4], self.ids[4:]])
+        self.assertEqual(session.shape_history, [(8, 128, 1), (4, 128, 1), (4, 128, 1)])
         self.assertEqual(result, [[item] for item in self.ids])
 
     def test_session_accepts_cuda_primary_with_standard_cpu_fallback(self) -> None:

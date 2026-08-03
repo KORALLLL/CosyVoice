@@ -1,5 +1,18 @@
 # Implementation Notes
 
+## 2026-08-03 - Pack speech-token features in the model's declared layout
+
+- The real batch speech-tokenizer declares `feats` as `[B, 128, T]`, while the
+  adapter packed the correct `[128, T]` Whisper features into `[B, T, 128]`.
+  ONNX Runtime rejected the silence qualification input as 100 where feature
+  dimension 128 was required.
+- Batch packing now preserves feature-major layout and pads only the final time
+  axis. The OOM bisection regression asserts `[B, 128, T]` on the original and
+  both retry batches, preventing item-order and layout regressions together.
+- A real GPU-0 double-inference smoke produced 25 identical valid tokens for
+  100 feature frames, with token IDs spanning 27 through 6493. No tokenizer
+  qualification stage or pilot had been published by the failed attempt.
+
 ## 2026-08-03 - Accept CUDA-primary ONNX sessions with standard CPU fallback
 
 - Real ONNX Runtime session creation successfully initialized

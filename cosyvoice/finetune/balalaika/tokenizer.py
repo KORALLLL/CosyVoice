@@ -134,9 +134,9 @@ class OnnxSpeechTokenizer:
         features = [_feature_array(self._feature_builder(item)) for item in audio]
         lengths = np.asarray([feature.shape[1] for feature in features], dtype=np.int32)
         max_frames = int(lengths.max())
-        batched = np.zeros((len(features), max_frames, 128), dtype=np.float32)
+        batched = np.zeros((len(features), 128, max_frames), dtype=np.float32)
         for index, feature in enumerate(features):
-            batched[index, : feature.shape[1], :] = feature.T
+            batched[index, :, : feature.shape[1]] = feature
         inputs = self.session.get_inputs()
         if len(inputs) < 2:
             raise TokenizerError("speech-tokenizer ONNX model must expose features and lengths inputs")
