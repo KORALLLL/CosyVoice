@@ -411,11 +411,14 @@ Primary metrics use corpus-level micro aggregation:
   characters over the spoken hard-number spans.
 
 Number-span extraction is validated for all 2,000 rows before training. Locate
-`hard_number` in raw `text`, use the unchanged sentence prefix and suffix to
-anchor the corresponding spoken span in `normalized_gold`, and reject ambiguous
-or missing anchors. During scoring, align the full normalized reference and ASR
-hypothesis, then project the gold number-span boundaries into the hypothesis.
-No hand correction or category-specific metric shortcut is allowed.
+the ordered digit groups from `hard_number` in raw `text`, including composite
+range, currency, date, telephone, and identifier forms. Use exact unchanged
+sentence context where available and the longest unchanged utterance-boundary
+context when adjacent unit morphology changes in `normalized_gold`; reject
+ambiguous or missing anchors. During scoring, align the full normalized
+reference and ASR hypothesis, then project the gold number-span boundaries into
+the hypothesis. No hand correction or category-specific metric shortcut is
+allowed.
 
 Also log macro per-row averages and metrics for each of the 12 `category`
 values, but keep the four micro metrics above as the primary model-selection

@@ -40,6 +40,12 @@ the split audit but are excluded from training and prompt reservation. Agreement
 Stress marks and the already normalized sidecar text are preserved; this recipe
 does not substitute raw transcripts.
 
+For validation, synthesis always uses `stressed`. The raw digit-bearing `text`
+is used only to locate the ordered numeric groups and unchanged sentence
+context that bound the spoken number span in `normalized_gold`. The Dataset
+Viewer Parquet is downloaded through the immutable commit currently referenced
+by `refs/convert/parquet`, then independently bound by its local SHA-256.
+
 ## CUDA 12.8 environment
 
 Use a clean Python 3.12 environment on a host with the CUDA 12.8 driver stack

@@ -12,7 +12,13 @@ from cosyvoice.finetune.balalaika.metrics import (
 
 
 def validation_row(*, text: str, hard_number: str, normalized_gold: str, category: str = "cardinal") -> dict[str, object]:
-    return {"stressed": text, "hard_number": hard_number, "normalized_gold": normalized_gold, "category": category}
+    return {
+        "text": text,
+        "stressed": normalized_gold,
+        "hard_number": hard_number,
+        "normalized_gold": normalized_gold,
+        "category": category,
+    }
 
 
 class MetricsTests(unittest.TestCase):
@@ -59,10 +65,25 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual((extract_number_span(starts).reference_start, extract_number_span(starts).reference_end), (0, 2))
         self.assertEqual((extract_number_span(ends).reference_start, extract_number_span(ends).reference_end), (1, 3))
 
-    def test_number_span_requires_stressed_instead_of_falling_back_to_text(self):
-        row = {"text": "Оплатите 25 рублей", "hard_number": "25", "normalized_gold": "Оплатите двадцать пять рублей"}
-        with self.assertRaisesRegex(NumberSpanError, "missing required string: stressed"):
+    def test_number_span_requires_raw_digit_bearing_text_instead_of_stressed_input(self):
+        row = {
+            "stressed": "Оплат+ите дв+адцать п+ять рубл+ей",
+            "hard_number": "25",
+            "normalized_gold": "Оплатите двадцать пять рублей",
+        }
+        with self.assertRaisesRegex(NumberSpanError, "missing required string: text"):
             extract_number_span(row)
+
+    def test_number_span_anchors_real_stressed_benchmark_shape(self):
+        row = {
+            "text": "Предлагаю внести 1004 рубля в течение двух дней.",
+            "stressed": "Предлаг+аю внест+и одн+а т+ысяча чет+ыре рубл+я в теч+ение дв+ух дн+ей.",
+            "hard_number": "1004",
+            "normalized_gold": "Предлагаю внести одна тысяча четыре рубля в течение двух дней.",
+            "category": "agree",
+        }
+        span = extract_number_span(row)
+        self.assertEqual((span.reference_start, span.reference_end), (2, 5))
 
     def test_alignment_counts_substitution_deletion_and_insertion(self):
         row = validation_row(

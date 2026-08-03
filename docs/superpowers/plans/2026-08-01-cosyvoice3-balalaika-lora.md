@@ -289,7 +289,13 @@ class ErrorCounts:
 
 - [ ] **Step 5: Implement authenticated Dataset Viewer fetch without persisting credentials**
 
-Read `HF_TOKEN` from the caller, send it only as an `Authorization` header, resolve the private Parquet URL through the Dataset Viewer API, download it atomically, and load it with PyArrow. Require config `default`, split `train`, 2,000 rows, ten columns, unique IDs 1–2000, 12 categories, and nonempty required strings. Never include headers in exceptions or manifests.
+Read `HF_TOKEN` from the caller, send it only as authentication, resolve the
+private Parquet listing through the Dataset Viewer API, resolve
+`refs/convert/parquet` to its immutable Hub commit, download through that pinned
+revision atomically, and load it with PyArrow. Require config `default`, split
+`train`, 2,000 rows, ten columns, unique IDs 1–2000, 12 categories, and nonempty
+required strings. Never include credentials or headers in exceptions or
+manifests.
 
 - [ ] **Step 6: Add all-2,000 span preflight fixture behavior**
 

@@ -7,10 +7,13 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Mapping
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from huggingface_hub import HfApi, hf_hub_url
 
 from .artifacts import atomic_write_json, sha256_file
 from .metrics import NumberSpanError, NumberSpan, extract_number_span
@@ -24,6 +27,7 @@ EXPECTED_COLUMNS = 10
 EXPECTED_CATEGORIES = 12
 PARQUET_NAME = "hard-number-validation.parquet"
 MANIFEST_NAME = "hard-number-validation.manifest.json"
+PARQUET_REVISION = "refs/convert/parquet"
 
 
 class ValidationDataError(RuntimeError):
@@ -96,7 +100,6 @@ def _resolve_parquet(token: str) -> tuple[str, str]:
     try:
         with urlopen(request) as response:
             payload = json.loads(response.read().decode("utf-8"))
-            etag = response.headers.get("ETag", "")
     except Exception as exc:
         raise ValidationDataError("dataset viewer request failed") from exc
     files = payload.get("parquet_files") if isinstance(payload, dict) else None
@@ -105,11 +108,22 @@ def _resolve_parquet(token: str) -> tuple[str, str]:
     matching = [entry for entry in files if isinstance(entry, dict) and entry.get("config") == CONFIG and entry.get("split") == SPLIT]
     if len(matching) != 1 or not isinstance(matching[0].get("url"), str):
         raise ValidationDataError("dataset viewer did not resolve the required default/train Parquet")
-    revision = matching[0].get("revision")
-    identity = revision if isinstance(revision, str) and revision else etag
-    if not identity:
-        raise ValidationDataError("dataset snapshot has no revision or ETag")
-    return matching[0]["url"], identity
+    filename = matching[0].get("filename")
+    if not isinstance(filename, str) or not filename or Path(filename).name != filename:
+        raise ValidationDataError("dataset viewer returned an invalid Parquet filename")
+    try:
+        revision = HfApi(token=token).dataset_info(DATASET, revision=PARQUET_REVISION).sha
+    except Exception as exc:
+        raise ValidationDataError("dataset conversion revision lookup failed") from exc
+    if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise ValidationDataError("dataset conversion snapshot has no immutable revision")
+    immutable_url = hf_hub_url(
+        DATASET,
+        f"{CONFIG}/{SPLIT}/{filename}",
+        repo_type="dataset",
+        revision=revision,
+    )
+    return immutable_url, revision
 
 
 def _download_parquet(url: str, target: Path, token: str) -> None:

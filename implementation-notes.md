@@ -1,5 +1,25 @@
 # Implementation Notes
 
+## 2026-08-03 - Pin the real benchmark snapshot and preflight all number spans
+
+- The live Dataset Viewer listing for the private benchmark contains one
+  `default/train` Parquet entry but supplies neither an entry revision nor a
+  response ETag. The fetcher now resolves `refs/convert/parquet` to its immutable
+  40-hex Hub commit and constructs the download URL from that commit instead of
+  trusting the mutable viewer URL. The downloaded Parquet SHA-256 remains a
+  separate content identity.
+- Real rows use `stressed` as already-spoken synthesis input; consequently the
+  digit-bearing `hard_number` is absent there. Span extraction now correctly
+  anchors ordered digit groups in raw `text`, handles composite currency/range/
+  telephone forms, and falls back to unchanged utterance-boundary context when
+  adjacent Russian unit morphology changes.
+- Real authenticated qualification downloaded the pinned 356,320-byte Parquet,
+  validated exactly 2,000 IDs, ten columns, 12 categories, and all 2,000 number
+  spans, then atomically published both files in a temporary directory.
+- The production attempt published the exact split manifest but stopped before
+  preflight-stage publication, pilot generation, approval, memorization, cache,
+  validation, W&B logging, or training.
+
 ## 2026-08-02 - Separate null agreement from text exclusions
 
 - The completed 4,075,032-row production join showed that the earlier expected

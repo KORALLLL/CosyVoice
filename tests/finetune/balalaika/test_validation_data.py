@@ -5,34 +5,79 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from cosyvoice.finetune.balalaika.validation_data import ValidationDataError, fetch_validation_rows
+from cosyvoice.finetune.balalaika.validation_data import ValidationDataError, _resolve_parquet, fetch_validation_rows
 
 
 def rows(count: int = 2000) -> list[dict[str, object]]:
     return [
         {
             "id": index,
-            "stressed": f"Товар {index} готов",
-            "normalized_gold": f"Товар номер {index} готов",
-            "hard_number": str(index),
             "category": f"category-{(index - 1) % 12}",
-            "source": "fixture",
-            "language": "ru",
-            "split": "train",
-            "revision": "fixture-revision",
-            "notes": "local-only",
+            "hard_number": str(index),
+            "why_hard": "fixture",
+            "text": f"Товар {index} готов",
+            "normalized_runorm": f"Товар номер {index} готов",
+            "normalized_gold": f"Товар номер {index} готов",
+            "runorm_wrong": False,
+            "error_type": "fixture",
+            "stressed": f"Тов+ар н+омер {index} гот+ов",
         }
         for index in range(1, count + 1)
     ]
 
 
 def schema() -> tuple[tuple[str, str], ...]:
-    return tuple((name, "int64" if name == "id" else "string") for name in rows(1)[0])
+    return tuple(
+        (name, "int64" if name == "id" else "bool" if name == "runorm_wrong" else "string")
+        for name in rows(1)[0]
+    )
 
 
 class ValidationDataTests(unittest.TestCase):
+    def test_resolve_pins_current_viewer_file_to_conversion_commit(self):
+        listing = MagicMock()
+        listing.__enter__.return_value = listing
+        listing.read.return_value = json.dumps(
+            {
+                "parquet_files": [
+                    {
+                        "dataset": "bitmanagerai/hard_number_eval_for_tts",
+                        "config": "default",
+                        "split": "train",
+                        "filename": "0000.parquet",
+                        "url": "https://huggingface.co/datasets/example/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet",
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        listing.headers = {}
+        dataset_info = MagicMock(sha="5" * 40)
+
+        with (
+            patch("cosyvoice.finetune.balalaika.validation_data.urlopen", return_value=listing),
+            patch("cosyvoice.finetune.balalaika.validation_data.HfApi") as api,
+            patch(
+                "cosyvoice.finetune.balalaika.validation_data.hf_hub_url",
+                return_value="https://huggingface.co/immutable.parquet",
+            ) as hub_url,
+        ):
+            api.return_value.dataset_info.return_value = dataset_info
+            url, revision = _resolve_parquet("secret-token")
+
+        self.assertEqual(url, "https://huggingface.co/immutable.parquet")
+        self.assertEqual(revision, "5" * 40)
+        api.return_value.dataset_info.assert_called_once_with(
+            "bitmanagerai/hard_number_eval_for_tts", revision="refs/convert/parquet"
+        )
+        hub_url.assert_called_once_with(
+            "bitmanagerai/hard_number_eval_for_tts",
+            "default/train/0000.parquet",
+            repo_type="dataset",
+            revision="5" * 40,
+        )
+
     def test_fetch_validates_all_rows_and_publishes_a_checksum_bound_manifest(self):
         fixture_rows = rows()
         downloaded_tokens: list[str] = []

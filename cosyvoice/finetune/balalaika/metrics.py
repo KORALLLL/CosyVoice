@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import re
 import unicodedata
 from typing import Iterable, Mapping, Sequence
 
@@ -83,22 +84,19 @@ def normalize_asr_text(text: str) -> str:
 def extract_number_span(row: Mapping[str, object]) -> NumberSpan:
     """Locate one spoken number phrase using its raw-text context anchors."""
 
-    raw_text = _required_string(row, "stressed")
+    raw_text = _required_string(row, "text")
     hard_number = _required_string(row, "hard_number")
     gold = _required_string(row, "normalized_gold")
     raw_tokens = normalize_asr_text(raw_text).split()
-    number_tokens = normalize_asr_text(hard_number).split()
     gold_tokens = normalize_asr_text(gold).split()
-    if not number_tokens:
-        raise NumberSpanError("hard number is empty after normalization")
 
-    raw_occurrences = _subsequence_starts(raw_tokens, number_tokens)
+    raw_occurrences = _digit_group_regions(raw_tokens, hard_number)
     if not raw_occurrences:
         raise NumberSpanError("hard number is absent from raw text")
 
-    candidates: set[tuple[int, int]] = set()
-    for raw_start in raw_occurrences:
-        raw_end = raw_start + len(number_tokens)
+    exact_candidates: set[tuple[int, int]] = set()
+    fallback_candidates: set[tuple[int, int]] = set()
+    for raw_start, raw_end in raw_occurrences:
         prefix, suffix = raw_tokens[:raw_start], raw_tokens[raw_end:]
         prefix_starts = (0,) if not prefix else _subsequence_starts(gold_tokens, prefix)
         suffix_starts = (len(gold_tokens),) if not suffix else None
@@ -107,12 +105,23 @@ def extract_number_span(row: Mapping[str, object]) -> NumberSpan:
             candidate_suffix_starts = suffix_starts if suffix_starts is not None else _subsequence_starts(gold_tokens, suffix, minimum=span_start)
             for suffix_start in candidate_suffix_starts:
                 if suffix_start > span_start:
-                    candidates.add((span_start, suffix_start))
+                    exact_candidates.add((span_start, suffix_start))
 
-    if len(candidates) != 1:
-        kind = "ambiguous" if candidates else "unanchorable"
+        prefix_length = _common_prefix_length(prefix, gold_tokens)
+        suffix_length = _common_suffix_length(suffix, gold_tokens, maximum=len(gold_tokens) - prefix_length)
+        fallback_end = len(gold_tokens) - suffix_length
+        if fallback_end > prefix_length:
+            fallback_candidates.add((prefix_length, fallback_end))
+
+    if len(exact_candidates) > 1:
+        raise NumberSpanError("ambiguous number span")
+    if exact_candidates:
+        start, end = exact_candidates.pop()
+    elif len(fallback_candidates) == 1:
+        start, end = fallback_candidates.pop()
+    else:
+        kind = "ambiguous" if fallback_candidates else "unanchorable"
         raise NumberSpanError(f"{kind} number span")
-    start, end = candidates.pop()
     category = row.get("category", "unknown")
     return NumberSpan(start, end, category if isinstance(category, str) and category else "unknown")
 
@@ -162,6 +171,43 @@ def _subsequence_starts(tokens: Sequence[str], needle: Sequence[str], minimum: i
     if not needle:
         return list(range(minimum, len(tokens) + 1))
     return [index for index in range(minimum, len(tokens) - len(needle) + 1) if list(tokens[index : index + len(needle)]) == list(needle)]
+
+
+def _digit_group_regions(raw_tokens: Sequence[str], hard_number: str) -> tuple[tuple[int, int], ...]:
+    """Locate a composite numeric expression by its ordered digit groups."""
+
+    expected = re.findall(r"\d+", unicodedata.normalize("NFKC", hard_number))
+    if not expected:
+        raise NumberSpanError("hard number contains no digit groups")
+    observed = [
+        (match.group(), token_index)
+        for token_index, token in enumerate(raw_tokens)
+        for match in re.finditer(r"\d+", token)
+    ]
+    width = len(expected)
+    return tuple(
+        sorted(
+            {
+                (observed[start][1], observed[start + width - 1][1] + 1)
+                for start in range(len(observed) - width + 1)
+                if [digits for digits, _ in observed[start : start + width]] == expected
+            }
+        )
+    )
+
+
+def _common_prefix_length(left: Sequence[str], right: Sequence[str]) -> int:
+    length = 0
+    while length < min(len(left), len(right)) and left[length] == right[length]:
+        length += 1
+    return length
+
+
+def _common_suffix_length(left: Sequence[str], right: Sequence[str], *, maximum: int) -> int:
+    length = 0
+    while length < min(len(left), len(right), maximum) and left[-length - 1] == right[-length - 1]:
+        length += 1
+    return length
 
 
 def _levenshtein_alignment(reference: Sequence[str], hypothesis: Sequence[str]) -> tuple[tuple[int | None, int | None, str], ...]:
