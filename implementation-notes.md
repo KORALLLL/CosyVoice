@@ -1,5 +1,18 @@
 # Implementation Notes
 
+## 2026-08-03 - Qualify one tokenizer GPU per Accelerate rank
+
+- Running all eight ONNX checks inside rank 0 while peer ranks waited in an
+  NCCL object broadcast left persistent NCCL kernels occupying GPUs 1–7. Rank
+  0's ONNX work on those devices was starved, so the pre-pilot launch stalled
+  after session initialization and was terminated without publishing a stage.
+- `tokenizer_qualified` is now a collective stage. Each rank runs the real
+  double-inference check on its own local device, the eight records are gathered,
+  rank 0 rejects missing/duplicate devices and publishes the combined tokenizer
+  stage, and the resulting evidence is broadcast before workflow publication.
+- Focused tokenizer/workflow/integration tests pass 38 tests plus 16 subtests,
+  including the collective gate and exact-device-set regressions.
+
 ## 2026-08-03 - Pack speech-token features in the model's declared layout
 
 - The real batch speech-tokenizer declares `feats` as `[B, 128, T]`, while the

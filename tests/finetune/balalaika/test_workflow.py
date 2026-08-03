@@ -165,6 +165,30 @@ def _args(root: Path, backend: FakeBackend, approval: str | None = None) -> argp
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_production_tokenizer_qualification_gathers_one_local_device_per_rank(self) -> None:
+        backend = ProductionBackend.__new__(ProductionBackend)
+        backend.coordinator = FakeCoordinator()
+        options = _args(Path("/tmp/qualification-fixture"), FakeBackend()).options
+        records = [{"device": device, "token_count": 25} for device in range(8)]
+        backend.coordinator.gather = lambda value: records  # type: ignore[method-assign]
+        payload = {"model_sha256": "a" * 64, "devices": records}
+
+        with (
+            mock.patch(
+                "cosyvoice.finetune.balalaika.tokenizer.qualify_tokenizer_device",
+                return_value=records[0],
+            ) as qualify,
+            mock.patch(
+                "cosyvoice.finetune.balalaika.tokenizer.publish_tokenizer_qualification",
+                return_value=payload,
+            ) as publish,
+        ):
+            result = backend.qualify_tokenizer(options)
+
+        qualify.assert_called_once_with(options.paths, 0)
+        publish.assert_called_once_with(options.paths, records)
+        self.assertEqual(result, payload)
+
     def test_production_resume_reconstructs_only_prior_committed_validation_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -374,6 +398,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("memorize", names)
             self.assertNotIn("build_cache", names)
             self.assertNotIn("capacity_smoke", names)
+            self.assertEqual(len(backend.coordinator.gathers), 1)
             self.assertFalse((_args(Path(directory), backend).options.paths.run_root / "workflow_stages/phase1_complete.json").exists())
 
     def test_pilot_approval_is_checksum_bound(self) -> None:

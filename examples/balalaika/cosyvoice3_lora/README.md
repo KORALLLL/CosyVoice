@@ -94,6 +94,8 @@ ONNX Runtime normally reports the created speech-tokenizer session as
 shape/control nodes may use the standard CPU fallback. Qualification rejects a
 CPU-only session or any session where CUDA is not first, and runs the real model
 twice on every GPU to verify deterministic outputs and expected token lengths.
+Under Accelerate this is a true collective: each of the eight ranks qualifies
+only its local GPU, then rank 0 validates and publishes the gathered device set.
 
 The Accelerate configuration is fixed at one machine, eight processes, GPU IDs
 0-7, and BF16 in [`conf/accelerate.yaml`](conf/accelerate.yaml). Both launchers

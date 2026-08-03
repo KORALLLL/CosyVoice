@@ -289,9 +289,22 @@ class ProductionBackend:
         }
 
     def qualify_tokenizer(self, options: WorkflowOptions) -> dict[str, object]:
-        from .tokenizer import run_tokenizer_qualification
+        from .tokenizer import qualify_tokenizer_device, publish_tokenizer_qualification
 
-        return cast(dict[str, object], run_tokenizer_qualification(options.paths))
+        if self.coordinator.num_processes != len(options.paths.visible_devices):
+            raise StageRequirementError("tokenizer qualification requires one process per visible GPU")
+        device = options.paths.visible_devices[self.coordinator.process_index]
+        local = qualify_tokenizer_device(options.paths, device)
+        gathered = self.coordinator.gather(local)
+        payload = (
+            publish_tokenizer_qualification(options.paths, [cast(Mapping[str, object], record) for record in gathered])
+            if self.coordinator.is_main_process
+            else None
+        )
+        received = self.coordinator.broadcast(payload)
+        if not isinstance(received, Mapping):
+            raise StageRequirementError("tokenizer qualification did not broadcast combined evidence")
+        return dict(received)
 
     def ensure_pilot(self, options: WorkflowOptions) -> dict[str, object]:
         from .artifacts import StageStore
@@ -1247,7 +1260,7 @@ def run_phase1(args: argparse.Namespace) -> int:
     options, backend = _resolve(args)
     _ensure_stage(options, backend, "preflight_complete", collective=False, operation=lambda: backend.preflight(options))
     _ensure_stage(
-        options, backend, "tokenizer_qualified", collective=False,
+        options, backend, "tokenizer_qualified", collective=True,
         operation=lambda: backend.qualify_tokenizer(options),
     )
     pilot = _ensure_stage(options, backend, "pilot_ready", collective=False, operation=lambda: backend.ensure_pilot(options))

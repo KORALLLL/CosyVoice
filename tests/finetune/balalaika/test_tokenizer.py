@@ -20,6 +20,7 @@ from cosyvoice.finetune.balalaika.tokenizer import (
     _validate_worker_result,
     _verify_requested_cache_set,
     approve_pilot,
+    publish_tokenizer_qualification,
     require_pilot_approval,
     run_cache_workers,
     run_tokenizer_qualification,
@@ -146,6 +147,11 @@ class TokenizerTests(unittest.TestCase):
                         run_tokenizer_qualification(self.paths)
                 self.assertEqual(cuda.current, 3)
                 self.assertEqual(cuda.set_history[-1], 3)
+
+    def test_qualification_publication_requires_each_visible_device_once(self) -> None:
+        records = [{"device": 0}] * 8
+        with self.assertRaisesRegex(TokenizerError, "exactly once"):
+            publish_tokenizer_qualification(self.paths, records)
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

@@ -148,50 +148,71 @@ def run_tokenizer_qualification(paths: RunPaths) -> dict[str, object]:
     """Qualify deterministic CUDA token extraction independently on all eight GPUs."""
 
     _require_eight_devices(paths)
+    return publish_tokenizer_qualification(
+        paths,
+        [qualify_tokenizer_device(paths, device) for device in paths.visible_devices],
+    )
+
+
+def qualify_tokenizer_device(paths: RunPaths, device: int) -> dict[str, object]:
+    """Run the real deterministic speech-token checks on exactly one local GPU."""
+
+    if device not in paths.visible_devices:
+        raise TokenizerError(f"tokenizer qualification device is not visible: {device}")
     fixed = AudioInput("qualification/silence.wav", np.zeros(24_000, dtype=np.float32), 24_000, 24_000)
-    devices: list[dict[str, object]] = []
     torch = import_module("torch")
     original_device = int(torch.cuda.current_device())
     try:
-        for device in paths.visible_devices:
-            torch.cuda.set_device(device)
-            torch.cuda.reset_peak_memory_stats(device)
-            tokenizer = OnnxSpeechTokenizer.for_paths(paths, local_rank=device)
-            first = tokenizer.extract([fixed])[0]
-            second = tokenizer.extract([fixed])[0]
-            if first != second:
-                raise TokenizerError(f"non-deterministic speech tokens on CUDA device {device}")
-            _validate_tokens(first, fixed.source_relative_path)
-            rate = len(first) / (fixed.frames / fixed.sample_rate)
-            if not 20.0 <= rate <= 30.0:
-                raise TokenizerError(f"speech token rate is not approximately 25 Hz on CUDA device {device}: {rate:.3f}")
-            feature_length = tokenizer.feature_lengths([fixed])[0]
-            expected_tokens = max(1, (feature_length + 3) // 4)
-            if len(first) != expected_tokens:
-                raise TokenizerError(
-                    f"speech-token length does not match CPU feature length on CUDA device {device}: "
-                    f"{len(first)} != {expected_tokens}"
-                )
-            providers = _session_providers(tokenizer.session)
-            devices.append(
-                {
-                    "device": device,
-                    "providers": providers,
-                    "feature_frames": feature_length,
-                    "token_count": len(first),
-                    "token_rate_hz": rate,
-                    "peak_vram_bytes": int(torch.cuda.max_memory_allocated(device)),
-                }
+        torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        tokenizer = OnnxSpeechTokenizer.for_paths(paths, local_rank=device)
+        first = tokenizer.extract([fixed])[0]
+        second = tokenizer.extract([fixed])[0]
+        if first != second:
+            raise TokenizerError(f"non-deterministic speech tokens on CUDA device {device}")
+        _validate_tokens(first, fixed.source_relative_path)
+        rate = len(first) / (fixed.frames / fixed.sample_rate)
+        if not 20.0 <= rate <= 30.0:
+            raise TokenizerError(f"speech token rate is not approximately 25 Hz on CUDA device {device}: {rate:.3f}")
+        feature_length = tokenizer.feature_lengths([fixed])[0]
+        expected_tokens = max(1, (feature_length + 3) // 4)
+        if len(first) != expected_tokens:
+            raise TokenizerError(
+                f"speech-token length does not match CPU feature length on CUDA device {device}: "
+                f"{len(first)} != {expected_tokens}"
             )
-        payload: dict[str, object] = {
-            "model": str(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
-            "model_sha256": sha256_file(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
-            "devices": devices,
+        return {
+            "device": device,
+            "providers": _session_providers(tokenizer.session),
+            "feature_frames": feature_length,
+            "token_count": len(first),
+            "token_rate_hz": rate,
+            "peak_vram_bytes": int(torch.cuda.max_memory_allocated(device)),
         }
-        StageStore(paths.stages_dir).publish("tokenizer_qualification", payload)
-        return payload
     finally:
         torch.cuda.set_device(original_device)
+
+
+def publish_tokenizer_qualification(paths: RunPaths, devices: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Validate and publish one gathered qualification record per visible GPU."""
+
+    _require_eight_devices(paths)
+    records = [dict(record) for record in devices]
+    observed = [record.get("device") for record in records]
+    if (
+        len(records) != len(paths.visible_devices)
+        or any(type(device) is not int for device in observed)
+        or sorted(observed) != sorted(paths.visible_devices)
+    ):
+        raise TokenizerError(f"tokenizer qualification did not cover each visible device exactly once: {observed}")
+    records.sort(key=lambda record: int(record["device"]))
+    payload: dict[str, object] = {
+        "model": str(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
+        "model_sha256": sha256_file(paths.base_model_dir / "speech_tokenizer_v3.batch.onnx"),
+        "devices": records,
+    }
+    StageStore(paths.stages_dir).publish("tokenizer_qualification", payload)
+    return payload
 
 
 def build_pilot(paths: RunPaths) -> PilotManifest:
