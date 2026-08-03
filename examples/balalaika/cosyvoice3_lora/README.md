@@ -165,7 +165,10 @@ CUDA_VISIBLE_DEVICES=0,3,7 BALALAIKA_THREE_GPU_SMOKE=1 \
 It runs precisely two optimizer updates on the four cached clips and writes
 only `three_gpu_smoke/manifest.json`. It cannot satisfy the mandatory eight-GPU
 memorization gate or start training. The diagnostic is phase-1-only; phase 2
-rejects `BALALAIKA_THREE_GPU_SMOKE=1`.
+rejects `BALALAIKA_THREE_GPU_SMOKE=1`. Its `cache_manifest_sha256` field is the
+SHA-256 of `memorization_cache/manifest.json`; before loading rows, the launcher
+also verifies that manifest's checksum chain through the shard manifest to both
+phase Parquets and the split-plan JSONL.
 
 ## 1. Status and tokenization pilot
 

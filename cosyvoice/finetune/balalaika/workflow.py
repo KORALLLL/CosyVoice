@@ -1104,18 +1104,38 @@ def _load_memorization_cache(root: Path) -> Any:
     from .cache import CacheManifest
 
     manifest = _read_mapping(root / "manifest.json")
-    if manifest.get("format_version") != 1 or manifest.get("phase_rows") != {"1": 2, "2": 2}:
+    if (
+        manifest.get("format_version") != 1
+        or manifest.get("phase_rows") != {"1": 2, "2": 2}
+        or manifest.get("shard_manifest") != "shard_manifest.json"
+    ):
         raise StageRequirementError("memorization cache manifest is invalid")
-    shard = root / cast(str, manifest.get("shard_manifest"))
+    shard = root / "shard_manifest.json"
     digest = manifest.get("shard_manifest_sha256")
-    if not isinstance(digest, str) or not shard.is_file() or sha256_file(shard) != digest:
+    if (
+        not isinstance(digest, str)
+        or _SHA256.fullmatch(digest) is None
+        or not shard.is_file()
+        or sha256_file(shard) != digest
+    ):
         raise StageRequirementError("memorization cache shard manifest changed")
-    for phase in (1, 2):
-        path = root / f"phase{phase}/shard_000000.parquet"
+    shard_manifest = _read_mapping(shard)
+    if shard_manifest.get("format_version") != 1 or shard_manifest.get("rows") != 4:
+        raise StageRequirementError("memorization cache shard manifest is invalid")
+    artifacts = (
+        (root / "phase1/shard_000000.parquet", shard_manifest.get("phase1_sha256"), "phase-1 cache"),
+        (root / "phase2/shard_000000.parquet", shard_manifest.get("phase2_sha256"), "phase-2 cache"),
+        (root / "split_plan/shard_000000.jsonl", shard_manifest.get("plan_sha256"), "split plan"),
+    )
+    for path, expected, label in artifacts:
         if not path.is_file():
-            raise StageRequirementError(f"memorization phase-{phase} cache is missing")
-    if not (root / "split_plan/shard_000000.jsonl").is_file():
-        raise StageRequirementError("memorization split plan is missing")
+            raise StageRequirementError(f"memorization {label} is missing")
+        if (
+            not isinstance(expected, str)
+            or _SHA256.fullmatch(expected) is None
+            or sha256_file(path) != expected
+        ):
+            raise StageRequirementError(f"memorization {label} changed")
     return CacheManifest(root, {0: shard}, {1: 2, 2: 2}, 0)
 
 

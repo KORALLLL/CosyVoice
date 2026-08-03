@@ -23,6 +23,7 @@ from cosyvoice.finetune.balalaika.workflow import (
     _AccelerateCoordinator,
     _collective_call,
     _accelerator_scope,
+    _load_memorization_cache,
     _stage_payload,
     main,
     redact_secrets,
@@ -166,6 +167,41 @@ def _args(root: Path, backend: FakeBackend, approval: str | None = None) -> argp
     )
 
 
+def _write_memorization_cache(root: Path) -> Path:
+    cache_root = root / "memorization_cache"
+    (cache_root / "phase1").mkdir(parents=True)
+    (cache_root / "phase2").mkdir()
+    (cache_root / "split_plan").mkdir()
+    phase1 = cache_root / "phase1/shard_000000.parquet"
+    phase2 = cache_root / "phase2/shard_000000.parquet"
+    split_plan = cache_root / "split_plan/shard_000000.jsonl"
+    phase1.write_bytes(b"phase-one")
+    phase2.write_bytes(b"phase-two")
+    split_plan.write_text('{"phase":1}\n{"phase":2}\n', encoding="utf-8")
+    shard_manifest = cache_root / "shard_manifest.json"
+    shard_manifest.write_text(
+        json.dumps({
+            "format_version": 1,
+            "rows": 4,
+            "phase1_sha256": sha256_file(phase1),
+            "phase2_sha256": sha256_file(phase2),
+            "plan_sha256": sha256_file(split_plan),
+        }),
+        encoding="utf-8",
+    )
+    (cache_root / "manifest.json").write_text(
+        json.dumps({
+            "format_version": 1,
+            "shard_manifest": "shard_manifest.json",
+            "shard_manifest_sha256": sha256_file(shard_manifest),
+            "phase_rows": {"1": 2, "2": 2},
+            "seed": 1986,
+        }),
+        encoding="utf-8",
+    )
+    return cache_root
+
+
 class WorkflowTests(unittest.TestCase):
     def test_internal_smoke_command_does_not_construct_production_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -203,7 +239,88 @@ class WorkflowTests(unittest.TestCase):
 
             arguments = capture.read_text(encoding="utf-8")
             self.assertIn("--multi_gpu", arguments)
+            self.assertIn("--gpu_ids all", arguments)
+            self.assertIn("--num_machines 1", arguments)
             self.assertIn("--num_processes 3", arguments)
+
+    def test_phase1_launcher_rejects_base10_device_aliases_in_both_modes(self) -> None:
+        phase1 = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora/run_phase1.sh"
+        cases = (
+            ("1", "0,00,7", "three unique"),
+            ("", "0,00,1,2,3,4,5,6", "eight unique"),
+        )
+        for smoke_mode, devices, message in cases:
+            with self.subTest(smoke_mode=smoke_mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                called = root / "accelerate-called"
+                fake_accelerate = root / "accelerate"
+                fake_accelerate.write_text(
+                    "#!/usr/bin/env bash\ntouch \"${CALLED}\"\n",
+                    encoding="utf-8",
+                )
+                fake_accelerate.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", str(phase1)],
+                    env={
+                        **os.environ,
+                        "BALALAIKA_THREE_GPU_SMOKE": smoke_mode,
+                        "CUDA_VISIBLE_DEVICES": devices,
+                        "CALLED": str(called),
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                    },
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(called.exists())
+
+    def test_phase1_launcher_rejects_malformed_device_ids_in_both_modes(self) -> None:
+        phase1 = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora/run_phase1.sh"
+        for smoke_mode, devices in (("1", "0,3,nope"), ("", "0,1,2,3,4,5,6,nope")):
+            with self.subTest(smoke_mode=smoke_mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                called = root / "accelerate-called"
+                fake_accelerate = root / "accelerate"
+                fake_accelerate.write_text(
+                    "#!/usr/bin/env bash\ntouch \"${CALLED}\"\n",
+                    encoding="utf-8",
+                )
+                fake_accelerate.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", str(phase1)],
+                    env={
+                        **os.environ,
+                        "BALALAIKA_THREE_GPU_SMOKE": smoke_mode,
+                        "CUDA_VISIBLE_DEVICES": devices,
+                        "CALLED": str(called),
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                    },
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("non-negative integer IDs", result.stderr)
+                self.assertFalse(called.exists())
+
+    def test_memorization_cache_rejects_tampered_phase_parquets(self) -> None:
+        for phase in (1, 2):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                cache_root = _write_memorization_cache(Path(directory))
+                (cache_root / f"phase{phase}/shard_000000.parquet").write_bytes(b"tampered")
+
+                with self.assertRaisesRegex(StageRequirementError, f"phase-{phase}.*changed"):
+                    _load_memorization_cache(cache_root)
+
+    def test_memorization_cache_rejects_tampered_split_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = _write_memorization_cache(Path(directory))
+            (cache_root / "split_plan/shard_000000.jsonl").write_text("tampered\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(StageRequirementError, "split plan.*changed"):
+                _load_memorization_cache(cache_root)
 
     def test_phase2_smoke_mode_is_rejected(self) -> None:
         phase2 = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora/run_phase2.sh"
@@ -215,6 +332,35 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("phase 1", result.stderr)
+
+    def test_phase2_launcher_rejects_base10_aliases_and_malformed_ids(self) -> None:
+        phase2 = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora/run_phase2.sh"
+        for devices in ("0,00,1,2,3,4,5,6", "0,1,2,3,4,5,6,nope"):
+            with self.subTest(devices=devices), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                called = root / "accelerate-called"
+                fake_accelerate = root / "accelerate"
+                fake_accelerate.write_text(
+                    "#!/usr/bin/env bash\ntouch \"${CALLED}\"\n",
+                    encoding="utf-8",
+                )
+                fake_accelerate.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", str(phase2)],
+                    env={
+                        **os.environ,
+                        "BALALAIKA_THREE_GPU_SMOKE": "",
+                        "CUDA_VISIBLE_DEVICES": devices,
+                        "CALLED": str(called),
+                        "PATH": f"{root}:{os.environ['PATH']}",
+                    },
+                    text=True,
+                    capture_output=True,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("eight unique non-negative integer IDs", result.stderr)
+                self.assertFalse(called.exists())
 
     def test_accelerate_coordinator_wraps_object_before_flattening_gather(self) -> None:
         class Accelerator:

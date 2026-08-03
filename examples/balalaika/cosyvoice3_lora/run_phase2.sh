@@ -18,11 +18,17 @@ if [[ ${#device_ids[@]} -ne 8 ]]; then
 fi
 declare -A seen_devices=()
 for device_id in "${device_ids[@]}"; do
-  if [[ ! "${device_id}" =~ ^[0-9]+$ ]] || [[ -n "${seen_devices[${device_id}]:-}" ]]; then
+  if [[ ! "${device_id}" =~ ^[0-9]+$ ]]; then
     echo "CUDA_VISIBLE_DEVICES must contain eight unique non-negative integer IDs" >&2
     exit 2
   fi
-  seen_devices["${device_id}"]=1
+  normalized_device_id="${device_id#"${device_id%%[!0]*}"}"
+  normalized_device_id="${normalized_device_id:-0}"
+  if [[ -n "${seen_devices[${normalized_device_id}]:-}" ]]; then
+    echo "CUDA_VISIBLE_DEVICES must contain eight unique non-negative integer IDs" >&2
+    exit 2
+  fi
+  seen_devices["${normalized_device_id}"]=1
 done
 
 export CUDA_VISIBLE_DEVICES="${visible_devices}"

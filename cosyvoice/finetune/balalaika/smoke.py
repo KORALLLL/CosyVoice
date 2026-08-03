@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
+import json
 from pathlib import Path
+import secrets
 import shutil
 from itertools import cycle
 from typing import Any, Callable, Mapping, Sequence
@@ -24,6 +25,9 @@ class ThreeGpuSmokeError(RuntimeError):
 
 class _CollectiveFailure(ThreeGpuSmokeError):
     """A distributed operation failed after its process group was torn down."""
+
+
+_ATTEMPT_MARKER = ".attempt_id"
 
 
 @dataclass(frozen=True)
@@ -75,7 +79,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
     if getattr(accelerator, "num_processes", None) != request.world_size:
         raise ThreeGpuSmokeError("three-GPU smoke requires exactly three Accelerate ranks")
 
-    temporary_created = _create_temporary_root(accelerator, request)
+    attempt_id = _create_temporary_root(accelerator, request)
 
     setup_error: Mapping[str, object] | None = None
     model = None
@@ -85,12 +89,12 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
     cache_checksum: str | None = None
     base_checksum: str | None = None
     try:
+        cache_checksum = _cache_manifest_checksum(request.cache)
         rows = select_memorization_rows(request.split_plan, request.cache)
         train_loader = build_memorization_dataloader(rows, batch_size=1)
         batches = tuple(train_loader)
         if not batches:
             raise ThreeGpuSmokeError("three-GPU smoke dataloader is empty")
-        cache_checksum = _cache_manifest_checksum(request.cache)
         base_checkpoint = request.base_model_dir / "llm.pt"
         if not base_checkpoint.is_file():
             raise FileNotFoundError(f"missing CosyVoice3 LLM checkpoint: {base_checkpoint}")
@@ -103,7 +107,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
         optimizer = torch.optim.AdamW(trainable, lr=request.learning_rate)
     except Exception as exc:
         setup_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, setup_error, request.temporary_root, temporary_created)
+    _raise_if_any_rank_failed(accelerator, setup_error, request.temporary_root, attempt_id)
 
     assert model is not None and optimizer is not None and train_loader is not None
     assert audit_payload is not None and cache_checksum is not None and base_checksum is not None
@@ -111,7 +115,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
         accelerator,
         "prepare",
         request.temporary_root,
-        temporary_created,
+        attempt_id,
         lambda: accelerator.prepare(model, optimizer, train_loader),
     )
 
@@ -123,7 +127,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             raise ThreeGpuSmokeError("three-GPU smoke prepared dataloader is empty")
     except Exception as exc:
         batches_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, batches_error, request.temporary_root, temporary_created)
+    _raise_if_any_rank_failed(accelerator, batches_error, request.temporary_root, attempt_id)
 
     losses_by_step: list[list[float]] = []
     local_batches = cycle(batches)
@@ -138,7 +142,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
                 accelerator,
                 "forward",
                 request.temporary_root,
-                temporary_created,
+                attempt_id,
                 lambda: model(batch, accelerator.device),
             )
             loss = _finite_scalar_loss(result)
@@ -146,7 +150,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             raise
         except Exception as exc:
             step_error = _failure_status(accelerator, exc)
-        _raise_if_any_rank_failed(accelerator, step_error, request.temporary_root, temporary_created)
+        _raise_if_any_rank_failed(accelerator, step_error, request.temporary_root, attempt_id)
 
         assert loss is not None
         optimization_error: Mapping[str, object] | None = None
@@ -155,7 +159,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
                 accelerator,
                 "backward",
                 request.temporary_root,
-                temporary_created,
+                attempt_id,
                 lambda: accelerator.backward(loss),
             )
             accelerator.clip_grad_norm_(model.parameters(), request.max_grad_norm)
@@ -164,14 +168,14 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             raise
         except Exception as exc:
             optimization_error = _failure_status(accelerator, exc)
-        _raise_if_any_rank_failed(accelerator, optimization_error, request.temporary_root, temporary_created)
+        _raise_if_any_rank_failed(accelerator, optimization_error, request.temporary_root, attempt_id)
 
         gather_error: Mapping[str, object] | None = None
         gathered = _run_collective(
             accelerator,
             "gather",
             request.temporary_root,
-            temporary_created,
+            attempt_id,
             lambda: accelerator.gather(loss.detach().reshape(1)),
         )
         try:
@@ -181,9 +185,10 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             losses_by_step.append(loss_values)
         except Exception as exc:
             gather_error = _failure_status(accelerator, exc)
-        _raise_if_any_rank_failed(accelerator, gather_error, request.temporary_root, temporary_created)
+        _raise_if_any_rank_failed(accelerator, gather_error, request.temporary_root, attempt_id)
 
     manifest: dict[str, object] = {
+        "attempt_id": attempt_id,
         "world_size": request.world_size,
         "steps": request.steps,
         "cache_manifest_sha256": cache_checksum,
@@ -197,15 +202,22 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             atomic_write_json(request.temporary_root / "manifest.json", manifest)
         except Exception as exc:
             publish_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, publish_error, request.temporary_root, temporary_created)
+    _raise_if_any_rank_failed(accelerator, publish_error, request.temporary_root, attempt_id)
 
     rename_error: Mapping[str, object] | None = None
     if getattr(accelerator, "is_main_process", False):
         try:
             request.temporary_root.replace(request.output_root)
+            (request.output_root / _ATTEMPT_MARKER).unlink()
         except Exception as exc:
             rename_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, rename_error, request.temporary_root, temporary_created)
+    _raise_if_any_rank_failed(
+        accelerator,
+        rename_error,
+        request.temporary_root,
+        attempt_id,
+        published_output=request.output_root,
+    )
     return manifest
 
 
@@ -218,9 +230,16 @@ def _create_accelerator(request: ThreeGpuSmokeRequest) -> Any:
     return factory(mixed_precision=request.mixed_precision)
 
 
-def _create_temporary_root(accelerator: Any, request: ThreeGpuSmokeRequest) -> bool:
-    """Let rank zero create the temporary root, then broadcast that decision."""
+def _create_temporary_root(accelerator: Any, request: ThreeGpuSmokeRequest) -> str:
+    """Share an ownership token before rank zero creates the temporary root."""
 
+    attempt_id = _run_collective(
+        accelerator,
+        "attempt-id broadcast",
+        request.temporary_root,
+        None,
+        lambda: _broadcast_attempt_id(accelerator),
+    )
     created = False
     status: Mapping[str, object] | None = None
     if getattr(accelerator, "is_main_process", False):
@@ -229,16 +248,36 @@ def _create_temporary_root(accelerator: Any, request: ThreeGpuSmokeRequest) -> b
                 raise ThreeGpuSmokeError("three_gpu_smoke target or incomplete directory already exists")
             request.temporary_root.mkdir(parents=True)
             created = True
+            (request.temporary_root / _ATTEMPT_MARKER).write_text(attempt_id, encoding="ascii")
         except Exception as exc:
+            if created:
+                shutil.rmtree(request.temporary_root, ignore_errors=True)
             status = _failure_status(accelerator, exc)
-    shared = _broadcast_main_status(accelerator, status)
-    accelerator.wait_for_everyone()
+    shared = _run_collective(
+        accelerator,
+        "preflight broadcast",
+        request.temporary_root,
+        attempt_id,
+        lambda: _broadcast_main_status(accelerator, status),
+    )
+    _run_collective(
+        accelerator,
+        "preflight barrier",
+        request.temporary_root,
+        attempt_id,
+        accelerator.wait_for_everyone,
+    )
     error = shared.get("error")
     if error is None:
-        return created
-    if getattr(accelerator, "is_main_process", False) and created and request.temporary_root.exists():
-        shutil.rmtree(request.temporary_root)
-    accelerator.wait_for_everyone()
+        return attempt_id
+    _cleanup_smoke_outputs(request.temporary_root, attempt_id)
+    _run_collective(
+        accelerator,
+        "preflight cleanup barrier",
+        request.temporary_root,
+        attempt_id,
+        accelerator.wait_for_everyone,
+    )
     raise ThreeGpuSmokeError(f"three-GPU smoke failed on rank {shared['rank']}: {error}")
 
 
@@ -246,18 +285,49 @@ def _run_collective(
     accelerator: Any,
     name: str,
     temporary: Path,
-    temporary_created: bool,
+    attempt_id: str | None,
     operation: Callable[[], Any],
+    *,
+    published_output: Path | None = None,
 ) -> Any:
-    """Run one collective without entering status-gather after an abort."""
+    """Run one collective, aborting and cleaning before any later collective."""
 
     try:
         return operation()
     except Exception as exc:
         _teardown_collectives(accelerator)
-        if getattr(accelerator, "is_main_process", False) and temporary_created and temporary.exists():
-            shutil.rmtree(temporary)
+        _cleanup_smoke_outputs(temporary, attempt_id, published_output)
         raise _CollectiveFailure(f"{name} collective failed after process-group teardown: {exc}") from exc
+
+
+def _cleanup_smoke_outputs(
+    temporary: Path,
+    attempt_id: str | None,
+    published_output: Path | None = None,
+) -> None:
+    """Best-effort removal of outputs owned by the current smoke attempt."""
+
+    if _smoke_output_is_owned(temporary, attempt_id):
+        shutil.rmtree(temporary, ignore_errors=True)
+    if published_output is not None and _smoke_output_is_owned(published_output, attempt_id):
+        shutil.rmtree(published_output, ignore_errors=True)
+
+
+def _smoke_output_is_owned(path: Path, attempt_id: str | None) -> bool:
+    if attempt_id is None or not path.is_dir() or path.is_symlink():
+        return False
+    marker = path / _ATTEMPT_MARKER
+    try:
+        if not marker.is_symlink() and marker.read_text(encoding="ascii") == attempt_id:
+            return True
+    except (OSError, UnicodeError):
+        pass
+    manifest = path / "manifest.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, Mapping) and payload.get("attempt_id") == attempt_id
 
 
 def _teardown_collectives(accelerator: Any) -> None:
@@ -299,17 +369,10 @@ def _teardown_collectives(accelerator: Any) -> None:
 
 
 def _cache_manifest_checksum(cache: CacheManifest) -> str:
-    digest = hashlib.sha256()
-    digest.update(str(cache.prompt_count).encode("ascii"))
-    for phase in sorted(cache.phase_rows):
-        digest.update(f"{phase}:{cache.phase_rows[phase]}".encode("ascii"))
-    for shard, path in sorted(cache.shards.items()):
-        shard_path = Path(path)
-        if not shard_path.is_file():
-            raise ThreeGpuSmokeError(f"cache shard manifest is missing: {shard_path}")
-        digest.update(str(shard).encode("ascii"))
-        digest.update(sha256_file(shard_path).encode("ascii"))
-    return digest.hexdigest()
+    manifest = cache.root / "manifest.json"
+    if not manifest.is_file():
+        raise ThreeGpuSmokeError(f"cache manifest is missing: {manifest}")
+    return sha256_file(manifest)
 
 
 def _validated_audit_payload(audit: Any) -> dict[str, object]:
@@ -340,6 +403,26 @@ def _failure_status(accelerator: Any, exc: Exception) -> Mapping[str, object]:
     }
 
 
+def _broadcast_attempt_id(accelerator: Any) -> str:
+    values: list[object] = [secrets.token_hex(16)] if getattr(accelerator, "is_main_process", False) else [None]
+    broadcaster = getattr(accelerator, "broadcast_object_list", None)
+    if callable(broadcaster):
+        broadcaster(values, from_process=0)
+    else:
+        from accelerate.utils import broadcast_object_list
+
+        broadcast_object_list(values, from_process=0)
+    shared = values[0]
+    if (
+        not isinstance(shared, str)
+        or len(shared) != 32
+        or shared != shared.lower()
+        or any(character not in "0123456789abcdef" for character in shared)
+    ):
+        raise ThreeGpuSmokeError("three-GPU smoke attempt-id broadcast is invalid")
+    return shared
+
+
 def _broadcast_main_status(accelerator: Any, status: Mapping[str, object] | None) -> Mapping[str, object]:
     values: list[object] = [
         dict(status) if status is not None else {"rank": 0, "error": None}
@@ -363,11 +446,27 @@ def _raise_if_any_rank_failed(
     accelerator: Any,
     local_failure: Mapping[str, object] | None,
     temporary: Path,
-    temporary_created: bool,
+    attempt_id: str,
+    *,
+    published_output: Path | None = None,
 ) -> None:
     status = local_failure or {"rank": int(getattr(accelerator, "process_index", 0)), "error": None}
-    statuses = _gather_statuses(accelerator, status)
-    accelerator.wait_for_everyone()
+    statuses = _run_collective(
+        accelerator,
+        "status gather",
+        temporary,
+        attempt_id,
+        lambda: _gather_statuses(accelerator, status),
+        published_output=published_output,
+    )
+    _run_collective(
+        accelerator,
+        "status barrier",
+        temporary,
+        attempt_id,
+        accelerator.wait_for_everyone,
+        published_output=published_output,
+    )
     failures = sorted(
         (
             item for item in statuses
@@ -377,9 +476,15 @@ def _raise_if_any_rank_failed(
     )
     if not failures:
         return
-    if getattr(accelerator, "is_main_process", False) and temporary_created and temporary.exists():
-        shutil.rmtree(temporary)
-    accelerator.wait_for_everyone()
+    _cleanup_smoke_outputs(temporary, attempt_id, published_output)
+    _run_collective(
+        accelerator,
+        "cleanup barrier",
+        temporary,
+        attempt_id,
+        accelerator.wait_for_everyone,
+        published_output=published_output,
+    )
     first = failures[0]
     raise ThreeGpuSmokeError(f"three-GPU smoke failed on rank {first['rank']}: {first['error']}")
 
