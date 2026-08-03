@@ -346,3 +346,10 @@
 - Decision: Construct production Accelerate with an `InitProcessGroupKwargs` handler set to 24 hours. This covers intentionally long main-only preflight and cache operations while retaining a finite watchdog for genuine hangs; the operator guide documents how to diagnose an actual 24-hour timeout.
 - Security: The production-only test-export guard remains before any Accelerate import or construction, so the internal test-mode capability cannot initialize a production process group.
 - Validation: The regression first failed because Accelerator received no `kwargs_handlers`; focused workflow tests now pass 21/21 with the exact handler type and timeout, and all Balalaika tests pass 228/228 in 98.619 seconds.
+
+## 2026-08-03 - Real pilot selection performance
+
+- Root cause: Pilot selection repeated the full source inventory hash and then streamed every MP3 payload from all 519 archives after preflight had already authenticated a complete split plan, turning a 33-candidate selection into two additional reads of the 373 GB corpus.
+- Decision: Select the same deterministic hash reservoir from authenticated split-plan JSONL files, verify their published checksums, and read only the selected MP3 members from their source tars.
+- Safety: Keep the manual listening, memorization, cache, and training gates unchanged; this run must stop after publishing the three pilot pairs.
+- Validation: The real 4,075,032-row plan selected 33 clips across 33 archives in 43.11 seconds; selected-tar verification and targeted extraction loaded 33 MP3s (2,140,738 bytes) in 68.27 seconds. The complete Balalaika suite passes 244 tests and 114 subtests in 184.32 seconds; compilation, shell syntax, and whitespace checks pass.

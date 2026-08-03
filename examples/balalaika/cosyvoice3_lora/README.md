@@ -165,6 +165,13 @@ checksum and reuses the plan instead of repeating both four-million-row
 tokenizer scans. Any changed, missing, extra, partial, or corrupt shard forces a
 fresh plan build.
 
+Pilot selection does not stream the 373 GB audio corpus a second time. It
+verifies the published split-plan shard checksums, selects the 33 lowest seeded
+source IDs from that approximately 1.9 GB plan, verifies only the source tars
+containing those IDs, and extracts only those 33 MP3 members. On the reference
+corpus, plan selection took about 43 seconds and selected 33 distinct tars; tar
+verification and targeted extraction took about 68 seconds.
+
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   bash examples/balalaika/cosyvoice3_lora/run_phase1.sh

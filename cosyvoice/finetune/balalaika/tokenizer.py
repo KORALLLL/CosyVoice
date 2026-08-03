@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 import hashlib
 from importlib import import_module
@@ -10,6 +11,8 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import queue
+import re
+import tarfile
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 import wave
@@ -29,11 +32,10 @@ from .cache import (
     _load_mapping,
     _verify_phase_metadata,
     build_cache_shard,
-    iter_tar_audio,
     verify_cache,
 )
 from .config import RunPaths
-from .sources import inventory_sources
+from .sources import SourceIntegrityError, inventory_sources, iter_split_rows
 
 
 class TokenizerError(RuntimeError):
@@ -478,22 +480,129 @@ def _require_eight_devices(paths: RunPaths) -> None:
 
 
 def _select_duration_stratified_clips(paths: RunPaths) -> list[AudioInput]:
-    """Choose short/median/long from a deterministic bounded candidate reservoir."""
+    """Choose short/median/long without rereading every source audio payload."""
 
-    candidates: list[tuple[bytes, TarAudioSample]] = []
-    for archive in inventory_sources(paths).source_archives:
-        for sample in iter_tar_audio(archive):
-            score = hashlib.sha256(f"{paths.seed}\0{sample.source_relative_path}".encode("utf-8")).digest()
-            candidates.append((score, sample))
-            candidates.sort(key=lambda value: value[0])
-            del candidates[33:]
-    if len(candidates) < 3:
-        raise TokenizerError("pilot needs at least three deterministic source clips")
+    selected, source_checksums = _select_pilot_source_paths(paths)
+    samples = _read_selected_pilot_audio(paths, selected, source_checksums)
     from .cache import _decode_audio
 
-    decoded = [_decode_audio(sample) for _, sample in candidates]
+    decoded = [_decode_audio(sample) for sample in samples]
     decoded.sort(key=lambda item: (item.frames, item.source_relative_path))
     return [decoded[0], decoded[len(decoded) // 2], decoded[-1]]
+
+
+def _select_pilot_source_paths(paths: RunPaths) -> tuple[tuple[str, ...], Mapping[str, str]]:
+    """Authenticate the split plan and retain its 33 lowest seeded source IDs."""
+
+    plan_dir = paths.run_root / "split_plan"
+    try:
+        manifest = _load_mapping(plan_dir / "manifest.json")
+    except CacheIntegrityError as exc:
+        raise TokenizerError("pilot cannot load the authenticated split-plan manifest") from exc
+    if manifest.get("seed") != paths.seed:
+        raise TokenizerError("pilot split-plan seed does not match the configured seed")
+    plan_shards = manifest.get("plan_shards")
+    source_inventory = manifest.get("source_inventory")
+    source_checksums = source_inventory.get("source_archives") if isinstance(source_inventory, Mapping) else None
+    if not isinstance(plan_shards, Mapping) or not plan_shards or not isinstance(source_checksums, Mapping):
+        raise TokenizerError("pilot split-plan manifest has no authenticated shard inventory")
+    actual_shards = {path.name: path for path in plan_dir.glob("shard_*.jsonl") if path.is_file()}
+    if set(actual_shards) != set(plan_shards):
+        raise TokenizerError("pilot split-plan shard set does not match its manifest")
+
+    candidates: list[tuple[bytes, str]] = []
+    observed_rows = 0
+    for name in sorted(plan_shards):
+        expected_sha256 = plan_shards[name]
+        match = re.fullmatch(r"shard_(\d{6})\.jsonl", name)
+        if (
+            match is None
+            or not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+            or sha256_file(actual_shards[name]) != expected_sha256
+        ):
+            raise TokenizerError(f"pilot split-plan shard checksum changed: {name}")
+        shard = int(match.group(1))
+        try:
+            rows = iter_split_rows(plan_dir, shard)
+            for row in rows:
+                if not row.source_relative_path.startswith(f"{shard:06d}/"):
+                    raise TokenizerError(f"pilot split-plan row is stored under the wrong shard: {row.source_relative_path}")
+                candidate = (
+                    hashlib.sha256(f"{paths.seed}\0{row.source_relative_path}".encode("utf-8")).digest(),
+                    row.source_relative_path,
+                )
+                if len(candidates) < 33:
+                    bisect.insort(candidates, candidate)
+                elif candidate < candidates[-1]:
+                    bisect.insort(candidates, candidate)
+                    candidates.pop()
+                observed_rows += 1
+        except (OSError, SourceIntegrityError, ValueError) as exc:
+            raise TokenizerError(f"pilot cannot read split-plan shard: {name}") from exc
+    total = manifest.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or observed_rows != total:
+        raise TokenizerError(f"pilot split-plan row count changed: expected {total!r}, got {observed_rows}")
+    if len(candidates) < 3:
+        raise TokenizerError("pilot needs at least three deterministic source clips")
+
+    checksums: dict[str, str] = {}
+    for name, value in source_checksums.items():
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"shard_\d{6}\.tar", name) is None
+            or not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        ):
+            raise TokenizerError("pilot source archive inventory is malformed")
+        checksums[name] = value
+    return tuple(source_relative_path for _, source_relative_path in candidates), checksums
+
+
+def _read_selected_pilot_audio(
+    paths: RunPaths,
+    selected: Sequence[str],
+    source_checksums: Mapping[str, str],
+) -> list[TarAudioSample]:
+    """Read only selected MP3 members after checking each touched source tar."""
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for source_relative_path in selected:
+        match = re.fullmatch(r"(\d{6})/([^/]+\.mp3)", source_relative_path)
+        if match is None:
+            raise TokenizerError(f"invalid pilot source path: {source_relative_path}")
+        archive_name = f"shard_{match.group(1)}.tar"
+        grouped.setdefault(archive_name, []).append((source_relative_path, match.group(2)))
+
+    loaded: dict[str, TarAudioSample] = {}
+    for archive_name, requested in grouped.items():
+        expected_sha256 = source_checksums.get(archive_name)
+        archive_path = paths.dataset_root / "train" / archive_name
+        if expected_sha256 is None or not archive_path.is_file() or sha256_file(archive_path) != expected_sha256:
+            raise TokenizerError(f"pilot source archive checksum changed: {archive_name}")
+        wanted = {member_name for _, member_name in requested}
+        found: dict[str, list[tarfile.TarInfo]] = {name: [] for name in wanted}
+        try:
+            with tarfile.open(archive_path, "r") as archive:
+                for member in archive:
+                    if member.name in found:
+                        found[member.name].append(member)
+                for source_relative_path, member_name in requested:
+                    members = found[member_name]
+                    if len(members) != 1 or not members[0].isfile():
+                        raise TokenizerError(f"pilot source member is missing, duplicated, or not a file: {source_relative_path}")
+                    extracted = archive.extractfile(members[0])
+                    if extracted is None:
+                        raise TokenizerError(f"pilot source member cannot be extracted: {source_relative_path}")
+                    payload = extracted.read()
+                    if len(payload) != members[0].size:
+                        raise TokenizerError(f"pilot source member is truncated: {source_relative_path}")
+                    loaded[source_relative_path] = TarAudioSample(source_relative_path, payload)
+        except (OSError, tarfile.TarError) as exc:
+            raise TokenizerError(f"pilot cannot read selected source archive: {archive_name}") from exc
+    if set(loaded) != set(selected):
+        raise TokenizerError("pilot selected source set was not extracted exactly once")
+    return [loaded[source_relative_path] for source_relative_path in selected]
 
 
 def _load_frozen_reconstructor(paths: RunPaths) -> Any:

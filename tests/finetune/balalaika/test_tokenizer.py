@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import tempfile
+import tarfile
 import types
 import unittest
 from pathlib import Path
@@ -17,6 +21,7 @@ from cosyvoice.finetune.balalaika.tokenizer import (
     OnnxSpeechTokenizer,
     PilotApprovalError,
     TokenizerError,
+    _select_duration_stratified_clips,
     _validate_worker_result,
     _verify_requested_cache_set,
     approve_pilot,
@@ -202,6 +207,24 @@ class TokenizerTests(unittest.TestCase):
         with self.assertRaisesRegex(TokenizerError, r"outside \[0, 6560\]"):
             backend.extract(self.audio[:1])
 
+    def test_pilot_selection_uses_authenticated_plan_without_full_inventory_scan(self) -> None:
+        # Re-entering inventory_sources would hash all 373 GB and reject this bounded fixture.
+        durations = {
+            "000000/short.mp3": 10,
+            "000000/median.mp3": 20,
+            "000000/long.mp3": 30,
+        }
+        self._write_pilot_fixture(durations)
+
+        def decode(sample):
+            frames = sample.audio_bytes[0]
+            return AudioInput(sample.source_relative_path, np.zeros(frames, dtype=np.float32), 24_000, frames)
+
+        with patch("cosyvoice.finetune.balalaika.cache._decode_audio", side_effect=decode):
+            clips = _select_duration_stratified_clips(self.paths)
+
+        self.assertEqual([clip.source_relative_path for clip in clips], list(durations))
+
     def test_approval_is_bound_to_exact_pilot(self) -> None:
         # A stale approval must not authorize tokenization for a changed listening bundle.
         manifest, _ = self._publish_fake_pilot()
@@ -361,6 +384,45 @@ class TokenizerTests(unittest.TestCase):
             "artifacts": artifacts,
         }
         return StageStore(self.paths.stages_dir).publish("pilot", payload), paths
+
+    def _write_pilot_fixture(self, durations: dict[str, int]) -> None:
+        plan_dir = self.paths.run_root / "split_plan"
+        train_dir = self.paths.dataset_root / "train"
+        plan_dir.mkdir(parents=True)
+        train_dir.mkdir(parents=True)
+        plan_path = plan_dir / "shard_000000.jsonl"
+        rows = []
+        for source_relative_path in durations:
+            rows.append(json.dumps({
+                "source_relative_path": source_relative_path,
+                "text": "тест",
+                "instruct": "You are a helpful assistant.<|endofprompt|>",
+                "agreement": 1.0,
+                "phase": 2,
+                "reserved": False,
+                "reservation_score": None,
+                "model_limit_exclusion": None,
+                "text_token_count": 1,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        plan_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+        archive_path = train_dir / "shard_000000.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            for source_relative_path, duration in durations.items():
+                stem = Path(source_relative_path).stem
+                metadata = json.dumps({"source_relative_path": source_relative_path}).encode("utf-8")
+                for name, payload in ((f"{stem}.json", metadata), (f"{stem}.mp3", bytes([duration]))):
+                    member = tarfile.TarInfo(name)
+                    member.size = len(payload)
+                    archive.addfile(member, io.BytesIO(payload))
+
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        (plan_dir / "manifest.json").write_text(json.dumps({
+            "seed": self.paths.seed,
+            "total": len(durations),
+            "plan_shards": {plan_path.name: digest(plan_path)},
+            "source_inventory": {"source_archives": {archive_path.name: digest(archive_path)}},
+        }, sort_keys=True), encoding="utf-8")
 
 
 if __name__ == "__main__":
