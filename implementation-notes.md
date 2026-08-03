@@ -360,3 +360,10 @@
 - Validation: Reopened and checksum-verified every pilot artifact. Short, median, and long originals contain 26,880, 188,160, and 518,401 frames; reconstructions contain 26,880, 188,160, and 518,400 frames. All six WAVs are mono 24 kHz 16-bit PCM, token arrays contain 28, 196, and 540 IDs, and no approval, memorization, cache, validation, W&B, or training stage exists.
 - Real pre-gate diagnostic: After the listener approved the pilot, a free GPU prepared the authenticated four-row memorization cache (two rows from each phase). A separate free GPU then loaded the frozen production base, injected and strictly audited the broad LoRA configuration, and completed a no-gradient forward pass on a real cached row with finite loss 6.31266 across 28 target speech tokens and 171 matched target modules.
 - Safety: This diagnostic performed no optimizer step and did not publish sealed memorization evidence or begin training. The mandatory memorization gate remains exactly eight BF16 Accelerate ranks and is intentionally deferred until all eight GPUs are available.
+
+## 2026-08-03 - Three-GPU LoRA smoke evidence
+
+- The bounded phase-1 diagnostic ran once with only CUDA devices 0, 3, and 7 visible, and exited successfully without launching an official training phase.
+- Its isolated manifest records `world_size=3`, exactly two optimizer steps, and three finite per-rank losses at each step: `[6.298747, 5.314507, 5.807076]` and `[4.632812, 5.395062, 4.652365]`.
+- Independent manifest verification accepted its trainable-parameter audit and both SHA-256 evidence fields. The official workflow-stage set remained exactly `pilot_ready.json`, `preflight_complete.json`, and `tokenizer_qualified.json`.
+- GPUs 0, 3, and 7 were idle before launch and returned to 0 MiB / 0% utilization afterward. The launcher emitted only its standard Accelerate default-argument and PyTorch process-group cleanup warnings.
