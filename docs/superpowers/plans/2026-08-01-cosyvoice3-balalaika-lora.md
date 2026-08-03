@@ -16,7 +16,8 @@
 - Training text is `rover_punctuated_accented`; instruction is `You are a helpful assistant.<|endofprompt|>`.
 - Phase 1 is non-null `asr_agreement_mean < 0.95` for 2 epochs at `1e-4`.
 - Phase 2 is non-null `asr_agreement_mean >= 0.95` for 3 epochs at `5e-5`.
-- Exclude all 309 null-agreement rows and the 20 deterministic phase-2 prompt clips.
+- Exclude all 141 true null-agreement rows, 168 empty transcripts, 26,729
+  over-limit transcripts, and the 20 deterministic phase-2 prompt clips.
 - LoRA defaults are rank 64, alpha 128, dropout 0.05, bias `none`.
 - Target every active Qwen2 linear layer, Qwen2 text embeddings, CosyVoice3 speech embeddings, and CosyVoice3 `llm_decoder`; exclude internal Qwen `lm_head`.
 - Do not train flow, HiFT, CampPlus, dense base weights, or the internal Qwen `lm_head`.
@@ -208,7 +209,11 @@ Choose the 20 lowest scores among eligible phase-2 rows after text/model-limit p
 
 - [ ] **Step 5: Implement exact source reconciliation**
 
-Require 519 source tars, 4,075,032 combined rows, 4,075,032 ROVER rows, unique IDs, 309 null agreement rows, and exactly 20 reserved rows. Publish `split_plan/manifest.json` only when `phase1 + phase2 + null + reserved + model_limit_exclusions == 4_075_032`.
+Require 519 source tars, 4,075,032 combined rows, 4,075,032 ROVER rows,
+unique IDs, 141 true null-agreement rows, 168 empty transcripts, 26,729
+over-limit transcripts, and exactly 20 reserved rows. Publish
+`split_plan/manifest.json` only when
+`phase1 + phase2 + null + reserved + model_limit_exclusions == 4_075_032`.
 
 - [ ] **Step 6: Run focused and full fixture tests**
 
@@ -284,7 +289,13 @@ class ErrorCounts:
 
 - [ ] **Step 5: Implement authenticated Dataset Viewer fetch without persisting credentials**
 
-Read `HF_TOKEN` from the caller, send it only as an `Authorization` header, resolve the private Parquet URL through the Dataset Viewer API, download it atomically, and load it with PyArrow. Require config `default`, split `train`, 2,000 rows, ten columns, unique IDs 1–2000, 12 categories, and nonempty required strings. Never include headers in exceptions or manifests.
+Read `HF_TOKEN` from the caller, send it only as authentication, resolve the
+private Parquet listing through the Dataset Viewer API, resolve
+`refs/convert/parquet` to its immutable Hub commit, download through that pinned
+revision atomically, and load it with PyArrow. Require config `default`, split
+`train`, 2,000 rows, ten columns, unique IDs 1–2000, 12 categories, and nonempty
+required strings. Never include credentials or headers in exceptions or
+manifests.
 
 - [ ] **Step 6: Add all-2,000 span preflight fixture behavior**
 
@@ -963,7 +974,8 @@ Record the implementation commit, clean-worktree status, pilot path, and checksu
 ## Final Review Checklist
 
 - [ ] Every design-spec requirement maps to a task above.
-- [ ] Tests cover the exact 0.95 equality boundary and all 309 null rows.
+- [ ] Tests cover the exact 0.95 equality boundary and separately audit all
+  null-agreement, empty-text, and over-limit rows.
 - [ ] No training Parquet contains audio bytes or speaker/mel features.
 - [ ] The tokenizer pilot physically blocks memorization/cache/training until user approval.
 - [ ] Memorization requires 100% on each of four samples for three checks.

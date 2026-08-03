@@ -86,7 +86,9 @@ versions unless the operator starts a new qualified run root.
 - Agreement source:
   `punctuation_artifacts/20260729T135419Z/balalaika-rover-results-20260729T135419Z.tar.zst`.
 - Agreement field: `asr_agreement_mean`.
-- The 309 rows with null agreement are excluded and counted explicitly.
+- The 141 true null-agreement rows are excluded and counted explicitly.
+- The 168 empty transcripts and 26,729 transcripts above the 200-token model
+  limit are separately excluded and counted explicitly.
 
 ### Validation corpus
 
@@ -409,11 +411,14 @@ Primary metrics use corpus-level micro aggregation:
   characters over the spoken hard-number spans.
 
 Number-span extraction is validated for all 2,000 rows before training. Locate
-`hard_number` in raw `text`, use the unchanged sentence prefix and suffix to
-anchor the corresponding spoken span in `normalized_gold`, and reject ambiguous
-or missing anchors. During scoring, align the full normalized reference and ASR
-hypothesis, then project the gold number-span boundaries into the hypothesis.
-No hand correction or category-specific metric shortcut is allowed.
+the ordered digit groups from `hard_number` in raw `text`, including composite
+range, currency, date, telephone, and identifier forms. Use exact unchanged
+sentence context where available and the longest unchanged utterance-boundary
+context when adjacent unit morphology changes in `normalized_gold`; reject
+ambiguous or missing anchors. During scoring, align the full normalized
+reference and ASR hypothesis, then project the gold number-span boundaries into
+the hypothesis. No hand correction or category-specific metric shortcut is
+allowed.
 
 Also log macro per-row averages and metrics for each of the 12 `category`
 values, but keep the four micro metrics above as the primary model-selection

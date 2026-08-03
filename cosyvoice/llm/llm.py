@@ -228,6 +228,11 @@ class Qwen2Encoder(torch.nn.Module):
         super().__init__()
         self.model = Qwen2ForCausalLM.from_pretrained(pretrain_path)
 
+    def get_input_embeddings(self) -> torch.nn.Module:
+        """Return Qwen's input embeddings without exposing its internal layout."""
+
+        return self.model.get_input_embeddings()
+
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T)
@@ -363,7 +368,7 @@ class Qwen2LM(TransformerLM):
         # 1. encode text_token
         text_token = batch['text_token'].to(device)
         text_token_len = batch['text_token_len'].to(device)
-        text_token_emb = self.llm.model.model.embed_tokens(text_token)
+        text_token_emb = self.llm.get_input_embeddings()(text_token)
 
         # 2. encode speech_token
         if 'speech_token' not in batch:
@@ -387,7 +392,7 @@ class Qwen2LM(TransformerLM):
         if self.__class__.__name__ == 'CosyVoice3LM':
             instruct_token = batch['instruct_token'].to(device)
             instruct_token_len = batch['instruct_token_len'].to(device)
-            instruct_token_emb = self.llm.model.model.embed_tokens(instruct_token)
+            instruct_token_emb = self.llm.get_input_embeddings()(instruct_token)
             lm_target, lm_input, lm_input_len = self.prepare_lm_input_target(sos_emb, text_token, text_token_emb, text_token_len, task_id_emb,
                                                                              speech_token, speech_token_emb, speech_token_len, instruct_token, instruct_token_emb, instruct_token_len)
         elif self.__class__.__name__ == 'Qwen2LM':
@@ -402,7 +407,18 @@ class Qwen2LM(TransformerLM):
         logits = self.llm_decoder(lm_output)
         loss = self.criterion_ce(logits, lm_target.to(device))
         acc = th_accuracy(logits.view(-1, self.llm_decoder.out_features), lm_target, ignore_label=IGNORE_ID)
-        return {'loss': loss, 'acc': acc}
+        target_mask = lm_target.ge(0) & lm_target.lt(self.speech_token_size)
+        teacher_forced_predictions = logits.argmax(dim=-1)
+        correct_tokens_per_sample = (teacher_forced_predictions.eq(lm_target) & target_mask).sum(dim=1, dtype=torch.int64)
+        target_tokens_per_sample = target_mask.sum(dim=1, dtype=torch.int64)
+        return {
+            'loss': loss,
+            'acc': acc,
+            'correct_tokens_per_sample': correct_tokens_per_sample,
+            'target_tokens_per_sample': target_tokens_per_sample,
+            'teacher_forced_predictions': teacher_forced_predictions,
+            'teacher_forced_targets': lm_target,
+        }
 
     def forward_dpo(
             self,
@@ -417,7 +433,7 @@ class Qwen2LM(TransformerLM):
         reject_speech_token_len = batch['reject_speech_token_len'].to(device)
 
         # 1. encode text_token
-        text_token_emb = self.llm.model.model.embed_tokens(text_token)
+        text_token_emb = self.llm.get_input_embeddings()(text_token)
 
         # 3. sos and task_id
         sos_emb = self.llm_embedding.weight[self.sos].reshape(1, 1, -1)
@@ -473,7 +489,7 @@ class Qwen2LM(TransformerLM):
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
         text_len += prompt_text_len
-        text_emb = self.llm.model.model.embed_tokens(text)
+        text_emb = self.llm.get_input_embeddings()(text)
         if self.__class__.__name__ == 'CosyVoice3LM':
             # NOTE temporary hardcode, 151646 is <|endofprompt|> token
             assert 151646 in text, '<|endofprompt|> not detected in CosyVoice3 text or prompt_text, check your input!'
@@ -586,12 +602,12 @@ class Qwen2LM(TransformerLM):
             # NOTE temporary hardcode, 151646 is <|endofprompt|> token
             assert 151646 in prompt_text, '<|endofprompt|> not detected in CosyVoice3 prompt_text, check your input!'
             eop_index = prompt_text.flatten().tolist().index(151646)
-            lm_input = torch.concat([lm_input, self.llm.model.model.embed_tokens(prompt_text[:, :eop_index + 1])], dim=1)
+            lm_input = torch.concat([lm_input, self.llm.get_input_embeddings()(prompt_text[:, :eop_index + 1])], dim=1)
             prompt_text = prompt_text[:, eop_index + 1:]
-        text_cache = self.llm.model.model.embed_tokens(prompt_text)
+        text_cache = self.llm.get_input_embeddings()(prompt_text)
         next_fill_index = (int(prompt_speech_token.shape[1] / self.mix_ratio[1]) + 1) * self.mix_ratio[1] - prompt_speech_token.shape[1]
         for this_text in text:
-            text_cache = torch.concat([text_cache, self.llm.model.model.embed_tokens(this_text)], dim=1)
+            text_cache = torch.concat([text_cache, self.llm.get_input_embeddings()(this_text)], dim=1)
             # prompt_speech_token_emb not empty, try append to lm_input
             while prompt_speech_token_emb.size(1) != 0:
                 if text_cache.size(1) >= self.mix_ratio[0]:
