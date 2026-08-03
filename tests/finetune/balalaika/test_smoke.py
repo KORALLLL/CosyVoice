@@ -440,6 +440,45 @@ class ThreeGpuSmokeTests(unittest.TestCase):
             self.assertEqual(list(target.iterdir()), [])
             self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
 
+    def test_publish_collision_never_cleans_foreign_target_with_current_attempt_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = _fixture_cache(root)
+            base = root / "Fun-CosyVoice3-0.5B-2512"
+            base.mkdir()
+            (base / "llm.pt").write_bytes(b"base-llm")
+            target = root / "three_gpu_smoke"
+            attempt_id = "c" * 32
+            request = ThreeGpuSmokeRequest(
+                cache=cache,
+                output_root=target,
+                base_model_dir=base,
+                accelerator_factory=lambda **kwargs: _ThreeRankAccelerator(**kwargs),
+            )
+
+            def collide(path: Path, payload: object) -> None:
+                atomic_write_json(path, payload)
+                target.mkdir()
+                (target / ".attempt_id").write_text(attempt_id, encoding="ascii")
+                (target / "foreign.txt").write_text("do not delete", encoding="utf-8")
+
+            with (
+                mock.patch("cosyvoice.finetune.balalaika.smoke.secrets.token_hex", return_value=attempt_id),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.select_memorization_rows", return_value=(object(),)),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.build_memorization_dataloader", return_value=[{"target": torch.tensor(1.0)}]),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.load_base_llm", return_value=_FiniteLossModel()),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.inject_lora", side_effect=lambda value, _: value),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.audit_trainable_parameters", return_value=_audit()),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.atomic_write_json", side_effect=collide),
+            ):
+                with self.assertRaisesRegex(ThreeGpuSmokeError, "FileExistsError"):
+                    run_three_gpu_smoke(request)
+
+            self.assertTrue(target.is_dir())
+            self.assertEqual((target / ".attempt_id").read_text(encoding="ascii"), attempt_id)
+            self.assertEqual((target / "foreign.txt").read_text(encoding="utf-8"), "do not delete")
+            self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
+
     def test_status_gather_failure_after_publish_removes_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

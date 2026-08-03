@@ -212,9 +212,11 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
     _raise_if_any_rank_failed(accelerator, publish_error, request.temporary_root, attempt_id)
 
     rename_error: Mapping[str, object] | None = None
+    published_output: Path | None = None
     if getattr(accelerator, "is_main_process", False):
         try:
             _rename_directory_noreplace(request.temporary_root, request.output_root)
+            published_output = request.output_root
             (request.output_root / _ATTEMPT_MARKER).unlink()
         except Exception as exc:
             rename_error = _failure_status(accelerator, exc)
@@ -223,7 +225,7 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
         rename_error,
         request.temporary_root,
         attempt_id,
-        published_output=request.output_root,
+        published_output=published_output,
     )
     return manifest
 
