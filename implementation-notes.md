@@ -1,5 +1,20 @@
 # Implementation Notes
 
+## 2026-08-03 - Preserve dictionaries through Accelerate object gather
+
+- Accelerate 1.12's GPU `gather_object` assumes each rank supplies an iterable
+  collection and flattens it after `all_gather_object`. Passing an evidence
+  dictionary directly therefore returned only its keys and hid both successful
+  values and remote errors; the generic collective wrapper later raised
+  `KeyError: value` despite successful eight-device tokenizer publication.
+- `_AccelerateCoordinator.gather` now wraps every payload in a singleton list,
+  producing one intact object per rank under both Accelerator-owned and utility
+  gather implementations. A regression simulates Accelerate's exact flattening
+  behavior and verifies success/error dictionaries survive unchanged.
+- The focused tokenizer/workflow/integration suite passes 40 tests plus 16
+  subtests. `stages/tokenizer_qualification.json` was published, but the failed
+  workflow wrapper did not publish `tokenizer_qualified` or begin pilot work.
+
 ## 2026-08-03 - Qualify one tokenizer GPU per Accelerate rank
 
 - Running all eight ONNX checks inside rank 0 while peer ranks waited in an

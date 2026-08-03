@@ -19,6 +19,7 @@ from cosyvoice.finetune.balalaika.workflow import (
     ExitCode,
     ProductionBackend,
     WorkflowOptions,
+    _AccelerateCoordinator,
     _collective_call,
     _accelerator_scope,
     _stage_payload,
@@ -165,6 +166,28 @@ def _args(root: Path, backend: FakeBackend, approval: str | None = None) -> argp
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_accelerate_coordinator_wraps_object_before_flattening_gather(self) -> None:
+        class Accelerator:
+            is_main_process = True
+            process_index = 0
+            num_processes = 2
+
+            def __init__(self) -> None:
+                self.seen: object | None = None
+
+            def gather_object(self, value: object) -> list[object]:
+                self.seen = value
+                return [item for rank_value in (value, value) for item in rank_value]
+
+        accelerator = Accelerator()
+        coordinator = _AccelerateCoordinator(accelerator)
+        payload = {"ok": False, "error": "device failed"}
+
+        gathered = coordinator.gather(payload)
+
+        self.assertEqual(accelerator.seen, [payload])
+        self.assertEqual(gathered, [payload, payload])
+
     def test_production_tokenizer_qualification_gathers_one_local_device_per_rank(self) -> None:
         backend = ProductionBackend.__new__(ProductionBackend)
         backend.coordinator = FakeCoordinator()

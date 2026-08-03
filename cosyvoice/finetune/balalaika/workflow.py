@@ -139,11 +139,11 @@ class _AccelerateCoordinator:
     def gather(self, value: object) -> Sequence[object]:
         gatherer = getattr(self.accelerator, "gather_object", None)
         if callable(gatherer):
-            gathered = gatherer(value)
+            gathered = gatherer([value])
         else:
             from accelerate.utils import gather_object
 
-            gathered = gather_object(value)
+            gathered = gather_object([value])
         if isinstance(gathered, Sequence) and not isinstance(gathered, (str, bytes)):
             return list(gathered)
         return [gathered]
