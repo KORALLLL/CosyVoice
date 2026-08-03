@@ -1470,7 +1470,7 @@ def _status(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Two-phase CosyVoice3 Balalaika LoRA workflow")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("phase1", "phase2", "status"):
+    for command in ("phase1", "phase2", "status", "three-gpu-smoke"):
         item = subparsers.add_parser(command)
         _common_arguments(item)
         if command == "phase1":
@@ -1515,6 +1515,34 @@ def _options_from_namespace(args: argparse.Namespace) -> WorkflowOptions:
         resume_checkpoint=args.resume_checkpoint,
         allow_test_export=False,
     )
+
+
+def _run_three_gpu_smoke_command(args: argparse.Namespace) -> int:
+    """Run the isolated diagnostic without entering the production workflow."""
+
+    base_model = Path(args.base_model_dir)
+    if any("_RL" in component.upper() for component in base_model.parts):
+        raise ValueError("base model must select the non-RL checkpoint")
+    paths = RunPaths(
+        dataset_root=Path(args.dataset_root),
+        repository_root=Path(args.repository_root),
+        run_root=Path(args.run_root),
+        base_model_dir=base_model,
+        visible_devices=(0, 1, 2),
+        seed=int(args.seed),
+    )
+    cache = _load_memorization_cache(paths.run_root / "memorization_cache")
+    from . import smoke
+
+    evidence = smoke.run_three_gpu_smoke(smoke.ThreeGpuSmokeRequest(
+        cache=cache,
+        output_root=paths.run_root / "three_gpu_smoke",
+        base_model_dir=paths.base_model_dir,
+    ))
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    if rank == 0:
+        print(json.dumps(redact_secrets(evidence), ensure_ascii=False, sort_keys=True, indent=2))
+    return int(ExitCode.SUCCESS)
 
 
 def _positive_int(value: str) -> int:
@@ -1582,6 +1610,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "three-gpu-smoke":
+            return _run_three_gpu_smoke_command(args)
         if args.command == "status":
             return _status(args)
         if args.command == "phase1":

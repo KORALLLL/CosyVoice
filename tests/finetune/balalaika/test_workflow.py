@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from cosyvoice.finetune.balalaika.artifacts import StageRequirementError, sha256_file
+from cosyvoice.finetune.balalaika.cache import CacheManifest
 from cosyvoice.finetune.balalaika.config import PhaseSpec, RunPaths
 from cosyvoice.finetune.balalaika.workflow import (
     ExitCode,
@@ -166,6 +167,53 @@ def _args(root: Path, backend: FakeBackend, approval: str | None = None) -> argp
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_internal_smoke_command_does_not_construct_production_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = CacheManifest(root / "memorization_cache", {}, {1: 2, 2: 2}, 0)
+            with (
+                mock.patch("cosyvoice.finetune.balalaika.workflow.ProductionBackend") as production,
+                mock.patch("cosyvoice.finetune.balalaika.workflow._load_memorization_cache", return_value=cache),
+                mock.patch("cosyvoice.finetune.balalaika.smoke.run_three_gpu_smoke", return_value={"world_size": 3}),
+            ):
+                self.assertEqual(main(["three-gpu-smoke", "--run-root", str(root)]), ExitCode.SUCCESS)
+            production.assert_not_called()
+
+    def test_phase1_smoke_launcher_uses_only_three_visible_devices(self) -> None:
+        repository = Path(__file__).parents[3]
+        phase1 = repository / "examples/balalaika/cosyvoice3_lora/run_phase1.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture = root / "accelerate-arguments.txt"
+            fake_accelerate = root / "accelerate"
+            fake_accelerate.write_text(
+                "#!/usr/bin/env bash\nprintf '%s' \"$*\" > \"${CAPTURE}\"\n",
+                encoding="utf-8",
+            )
+            fake_accelerate.chmod(0o755)
+            environment = dict(os.environ)
+            environment.update({
+                "BALALAIKA_THREE_GPU_SMOKE": "1",
+                "CUDA_VISIBLE_DEVICES": "0,3,7",
+                "CAPTURE": str(capture),
+                "PATH": f"{root}:{environment['PATH']}",
+            })
+
+            subprocess.run(["bash", str(phase1)], env=environment, text=True, capture_output=True, check=True)
+
+            self.assertIn("--num_processes 3", capture.read_text(encoding="utf-8"))
+
+    def test_phase2_smoke_mode_is_rejected(self) -> None:
+        phase2 = Path(__file__).parents[3] / "examples/balalaika/cosyvoice3_lora/run_phase2.sh"
+        result = subprocess.run(
+            ["bash", str(phase2)],
+            env={**os.environ, "BALALAIKA_THREE_GPU_SMOKE": "1"},
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("phase 1", result.stderr)
+
     def test_accelerate_coordinator_wraps_object_before_flattening_gather(self) -> None:
         class Accelerator:
             is_main_process = True

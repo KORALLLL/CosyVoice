@@ -152,6 +152,21 @@ Defaults place all generated state under
 shown by `python -m cosyvoice.finetune.balalaika.workflow phase1 --help` or the
 equivalent `BALALAIKA_*` environment variables.
 
+## Isolated three-GPU diagnostic
+
+For a non-production diagnostic of the already prepared four-clip memorization
+cache, run phase 1's explicit smoke mode with exactly three physical GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,3,7 BALALAIKA_THREE_GPU_SMOKE=1 \
+  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh
+```
+
+It runs precisely two optimizer updates on the four cached clips and writes
+only `three_gpu_smoke/manifest.json`. It cannot satisfy the mandatory eight-GPU
+memorization gate or start training. The diagnostic is phase-1-only; phase 2
+rejects `BALALAIKA_THREE_GPU_SMOKE=1`.
+
 ## 1. Status and tokenization pilot
 
 Status is read-only and never launches Accelerate:

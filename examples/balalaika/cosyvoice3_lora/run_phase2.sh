@@ -3,6 +3,12 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "${script_dir}/../../.." && pwd -P)"
+
+if [[ "${BALALAIKA_THREE_GPU_SMOKE:-}" == "1" ]]; then
+  echo "BALALAIKA_THREE_GPU_SMOKE is a phase 1-only diagnostic" >&2
+  exit 2
+fi
+
 visible_devices="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 IFS=',' read -r -a device_ids <<< "${visible_devices}"
