@@ -151,6 +151,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 Generate the pilot. The command performs preflight and tokenizer qualification,
 then deliberately exits 20 after writing the listening bundle. It must not run
 memorization, corpus-wide cache extraction, baseline validation, or training.
+A retry still rechecks the immutable source inventory; when a complete split
+manifest already matches it, the workflow verifies every recorded shard
+checksum and reuses the plan instead of repeating both four-million-row
+tokenizer scans. Any changed, missing, extra, partial, or corrupt shard forces a
+fresh plan build.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \

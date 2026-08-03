@@ -144,6 +144,49 @@ class SourceTests(unittest.TestCase):
         with self.assertRaisesRegex(SourceIntegrityError, "519 source tar archives"):
             inventory_sources(self.paths)
 
+    def test_split_plan_reuses_fully_checksummed_published_plan_without_retokenizing(self) -> None:
+        with (
+            patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/rover.jsonl"),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 1),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_EMPTY_TEXT_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_OVER_LIMIT_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
+        ):
+            inventory = inventory_sources(self.paths)
+            first = build_split_plan(self.paths, source_inventory=inventory, _count_text_tokens=lambda text: 1)
+            with (
+                patch(
+                    "cosyvoice.finetune.balalaika.sources._load_cosyvoice3_text_token_counter",
+                    side_effect=AssertionError("published plan must not reload the tokenizer"),
+                ),
+                patch(
+                    "cosyvoice.finetune.balalaika.sources._iter_joined_rows",
+                    side_effect=AssertionError("published plan must not rescan sidecars"),
+                ),
+            ):
+                reused = build_split_plan(self.paths, source_inventory=inventory)
+
+        self.assertEqual(reused, first)
+
+    def test_split_plan_rebuilds_instead_of_reusing_tampered_shard(self) -> None:
+        with (
+            patch("cosyvoice.finetune.balalaika.sources.ROVER_ARCHIVE_RELATIVE", "punctuation_artifacts/20260729T135419Z/rover.jsonl"),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_SOURCE_ROWS", 3),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_NULL_ROWS", 1),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_EMPTY_TEXT_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.EXPECTED_OVER_LIMIT_ROWS", 0),
+            patch("cosyvoice.finetune.balalaika.sources.PROMPT_RESERVATION_COUNT", 0),
+        ):
+            inventory = inventory_sources(self.paths)
+            first = build_split_plan(self.paths, source_inventory=inventory, _count_text_tokens=lambda text: 1)
+            shard = first.plan_dir / "shard_000000.jsonl"
+            shard.write_text(shard.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
+            rebuilt = build_split_plan(self.paths, source_inventory=inventory, _count_text_tokens=lambda text: 1)
+
+        self.assertEqual(rebuilt, first)
+        self.assertNotIn("tampered", shard.read_text(encoding="utf-8"))
+
     def test_join_rejects_sidecar_paths_outside_the_canonical_tar_range(self) -> None:
         # A six-digit but non-existent shard must not create an unreachable plan row.
         combined = self._combined_path()

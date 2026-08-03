@@ -165,6 +165,9 @@ def build_split_plan(
     """Publish a per-source-shard plan only after full canonical reconciliation."""
 
     inventory = source_inventory if source_inventory is not None else inventory_sources(paths)
+    reused = _reuse_published_split_plan(paths, inventory, seed)
+    if reused is not None:
+        return reused
     count_text_tokens = _count_text_tokens or _load_cosyvoice3_text_token_counter(paths)
     first_audit = _JoinAudit()
     selected_ids = reserve_prompt_ids(
@@ -237,6 +240,90 @@ def build_split_plan(
         },
     )
     return replace(counts, manifest_sha256=sha256_file(manifest_path))
+
+
+def _reuse_published_split_plan(paths: RunPaths, inventory: SourceInventory, seed: int) -> SplitCounts | None:
+    """Reuse a complete plan only after revalidating all provenance and shard hashes."""
+
+    plan_dir = paths.run_root / "split_plan"
+    manifest_path = plan_dir / "manifest.json"
+    if not manifest_path.is_file() or any(plan_dir.glob(".*.partial")) or any(plan_dir.glob("*.partial")):
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    expected_inventory = {
+        "source_archives": dict(inventory.source_archive_sha256),
+        "combined_sidecar": str(inventory.combined_sidecar),
+        "combined_sha256": inventory.combined_sha256,
+        "rover_archive": str(inventory.rover_archive),
+        "rover_sha256": inventory.rover_sha256,
+    }
+    if (
+        manifest.get("schema_version") != SPLIT_PLAN_SCHEMA_VERSION
+        or manifest.get("source_schema_versions")
+        != {"combined_sidecar": COMBINED_SCHEMA_VERSION, "rover_archive": ROVER_SCHEMA_VERSION}
+        or manifest.get("seed") != seed
+        or manifest.get("source_inventory") != expected_inventory
+    ):
+        return None
+
+    names = ("phase1", "phase2", "null", "reserved", "model_limit_exclusions", "total")
+    values = {name: manifest.get(name) for name in names}
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values.values()):
+        return None
+    text_exclusions = manifest.get("text_exclusions")
+    expected_text_exclusions = {
+        "text_token_length=0": EXPECTED_EMPTY_TEXT_ROWS,
+        f"text_token_length>{TEXT_TOKEN_MAX_LENGTH}": EXPECTED_OVER_LIMIT_ROWS,
+    }
+    if text_exclusions != expected_text_exclusions:
+        return None
+    if (
+        values["null"] != EXPECTED_NULL_ROWS
+        or values["reserved"] != PROMPT_RESERVATION_COUNT
+        or values["model_limit_exclusions"] != sum(expected_text_exclusions.values())
+        or values["total"] != EXPECTED_SOURCE_ROWS
+        or values["phase1"]
+        + values["phase2"]
+        + values["null"]
+        + values["reserved"]
+        + values["model_limit_exclusions"]
+        != EXPECTED_SOURCE_ROWS
+    ):
+        return None
+
+    reserved_prompts = manifest.get("reserved_prompts")
+    if not isinstance(reserved_prompts, list) or len(reserved_prompts) != PROMPT_RESERVATION_COUNT:
+        return None
+    plan_shards = manifest.get("plan_shards")
+    if not isinstance(plan_shards, dict) or not plan_shards:
+        return None
+    shard_paths = {path.name: path for path in plan_dir.glob("shard_*.jsonl") if path.is_file()}
+    if set(shard_paths) != set(plan_shards):
+        return None
+    for name, expected_sha256 in plan_shards.items():
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"shard_\d{6}\.jsonl", name) is None
+            or not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+            or sha256_file(shard_paths[name]) != expected_sha256
+        ):
+            return None
+    return SplitCounts(
+        phase1=values["phase1"],
+        phase2=values["phase2"],
+        null=values["null"],
+        reserved=values["reserved"],
+        model_limit_exclusions=values["model_limit_exclusions"],
+        total=values["total"],
+        plan_dir=plan_dir,
+        manifest_sha256=sha256_file(manifest_path),
+    )
 
 
 def iter_split_rows(plan_dir: Path, shard: int) -> Iterator[JoinedRow]:

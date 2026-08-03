@@ -1,5 +1,18 @@
 # Implementation Notes
 
+## 2026-08-03 - Reuse only fully authenticated split plans
+
+- A downstream benchmark failure occurred after the 4,075,032-row split plan
+  had been completely published but before the encompassing preflight stage was
+  sealed. Retrying would previously repeat both full joined tokenizer scans.
+- `build_split_plan` now reuses a published plan only after matching schema,
+  seed, complete source inventory paths/checksums, exact count invariants,
+  text-exclusion reasons, reserved-prompt cardinality, the exact on-disk shard
+  set, every shard SHA-256, and the absence of partial files.
+- A tampered shard regression proves invalid output is rebuilt. The production
+  manifest and all 519 shard checksums passed the new reuse path with totals
+  2,469,768 / 1,578,206 / 141 / 20 / 26,897 / 4,075,032.
+
 ## 2026-08-03 - Pin the real benchmark snapshot and preflight all number spans
 
 - The live Dataset Viewer listing for the private benchmark contains one
