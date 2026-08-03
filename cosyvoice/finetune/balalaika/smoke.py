@@ -52,8 +52,6 @@ class ThreeGpuSmokeRequest:
             raise ValueError("learning_rate and max_grad_norm must be positive")
         if self.output_root.name != "three_gpu_smoke":
             raise ValueError("three-GPU smoke output directory must be named three_gpu_smoke")
-        if self.output_root.exists() or self.temporary_root.exists():
-            raise ValueError("three_gpu_smoke target or incomplete directory already exists")
         if self.split_plan is None:
             object.__setattr__(self, "split_plan", self.cache.root / "split_plan")
         elif not isinstance(self.split_plan, Path):
@@ -73,19 +71,9 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
     if getattr(accelerator, "num_processes", None) != request.world_size:
         raise ThreeGpuSmokeError("three-GPU smoke requires exactly three Accelerate ranks")
 
-    temporary_created = False
-    setup_error: Mapping[str, object] | None = None
-    if getattr(accelerator, "is_main_process", False):
-        try:
-            if request.output_root.exists() or request.temporary_root.exists():
-                raise ThreeGpuSmokeError("three_gpu_smoke target or incomplete directory already exists")
-            request.temporary_root.mkdir(parents=True)
-            temporary_created = True
-        except Exception as exc:
-            setup_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, setup_error, request.temporary_root, temporary_created)
+    temporary_created = _create_temporary_root(accelerator, request)
 
-    prepared_error: Mapping[str, object] | None = None
+    setup_error: Mapping[str, object] | None = None
     model = None
     optimizer = None
     train_loader = None
@@ -109,21 +97,29 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
         if not trainable:
             raise ThreeGpuSmokeError("fresh smoke adapter has no trainable parameters")
         optimizer = torch.optim.AdamW(trainable, lr=request.learning_rate)
-        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     except Exception as exc:
-        prepared_error = _failure_status(accelerator, exc)
-    _raise_if_any_rank_failed(accelerator, prepared_error, request.temporary_root, temporary_created)
+        setup_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, setup_error, request.temporary_root, temporary_created)
 
     assert model is not None and optimizer is not None and train_loader is not None
     assert audit_payload is not None and cache_checksum is not None and base_checksum is not None
-    batches = tuple(train_loader)
-    if not batches:
-        _raise_if_any_rank_failed(
-            accelerator,
-            _failure_status(accelerator, ThreeGpuSmokeError("three-GPU smoke prepared dataloader is empty")),
-            request.temporary_root,
-            temporary_created,
-        )
+    prepare_error: Mapping[str, object] | None = None
+    try:
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    except Exception as exc:
+        prepare_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, prepare_error, request.temporary_root, temporary_created)
+
+    batches_error: Mapping[str, object] | None = None
+    batches: tuple[object, ...] = ()
+    try:
+        batches = tuple(train_loader)
+        if not batches:
+            raise ThreeGpuSmokeError("three-GPU smoke prepared dataloader is empty")
+    except Exception as exc:
+        batches_error = _failure_status(accelerator, exc)
+    _raise_if_any_rank_failed(accelerator, batches_error, request.temporary_root, temporary_created)
+
     losses_by_step: list[list[float]] = []
     local_batches = cycle(batches)
     for _step in range(request.steps):
@@ -145,14 +141,20 @@ def run_three_gpu_smoke(request: ThreeGpuSmokeRequest) -> dict[str, object]:
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(model.parameters(), request.max_grad_norm)
             optimizer.step()
+        except Exception as exc:
+            optimization_error = _failure_status(accelerator, exc)
+        _raise_if_any_rank_failed(accelerator, optimization_error, request.temporary_root, temporary_created)
+
+        gather_error: Mapping[str, object] | None = None
+        try:
             gathered = accelerator.gather(loss.detach().reshape(1))
             loss_values = [float(value) for value in gathered.detach().cpu().reshape(-1).tolist()]
             if len(loss_values) != request.world_size or not all(torch.isfinite(torch.tensor(value)).item() for value in loss_values):
                 raise ThreeGpuSmokeError("three-GPU smoke must gather one finite loss per rank")
             losses_by_step.append(loss_values)
         except Exception as exc:
-            optimization_error = _failure_status(accelerator, exc)
-        _raise_if_any_rank_failed(accelerator, optimization_error, request.temporary_root, temporary_created)
+            gather_error = _failure_status(accelerator, exc)
+        _raise_if_any_rank_failed(accelerator, gather_error, request.temporary_root, temporary_created)
 
     manifest: dict[str, object] = {
         "world_size": request.world_size,
@@ -187,6 +189,30 @@ def _create_accelerator(request: ThreeGpuSmokeRequest) -> Any:
 
         factory = Accelerator
     return factory(mixed_precision=request.mixed_precision)
+
+
+def _create_temporary_root(accelerator: Any, request: ThreeGpuSmokeRequest) -> bool:
+    """Let rank zero create the temporary root, then broadcast that decision."""
+
+    created = False
+    status: Mapping[str, object] | None = None
+    if getattr(accelerator, "is_main_process", False):
+        try:
+            if request.output_root.exists() or request.temporary_root.exists():
+                raise ThreeGpuSmokeError("three_gpu_smoke target or incomplete directory already exists")
+            request.temporary_root.mkdir(parents=True)
+            created = True
+        except Exception as exc:
+            status = _failure_status(accelerator, exc)
+    shared = _broadcast_main_status(accelerator, status)
+    accelerator.wait_for_everyone()
+    error = shared.get("error")
+    if error is None:
+        return created
+    if getattr(accelerator, "is_main_process", False) and created and request.temporary_root.exists():
+        shutil.rmtree(request.temporary_root)
+    accelerator.wait_for_everyone()
+    raise ThreeGpuSmokeError(f"three-GPU smoke failed on rank {shared['rank']}: {error}")
 
 
 def _cache_manifest_checksum(cache: CacheManifest) -> str:
@@ -231,6 +257,25 @@ def _failure_status(accelerator: Any, exc: Exception) -> Mapping[str, object]:
     }
 
 
+def _broadcast_main_status(accelerator: Any, status: Mapping[str, object] | None) -> Mapping[str, object]:
+    values: list[object] = [
+        dict(status) if status is not None else {"rank": 0, "error": None}
+    ] if getattr(accelerator, "is_main_process", False) else [None]
+    broadcaster = getattr(accelerator, "broadcast_object_list", None)
+    if callable(broadcaster):
+        broadcaster(values, from_process=0)
+    else:
+        from accelerate.utils import broadcast_object_list
+
+        broadcast_object_list(values, from_process=0)
+    shared = values[0]
+    if not isinstance(shared, Mapping) or not isinstance(shared.get("rank"), int) or "error" not in shared:
+        raise ThreeGpuSmokeError("three-GPU smoke preflight broadcast is invalid")
+    if shared["error"] is not None and not isinstance(shared["error"], str):
+        raise ThreeGpuSmokeError("three-GPU smoke preflight broadcast has an invalid error")
+    return shared
+
+
 def _raise_if_any_rank_failed(
     accelerator: Any,
     local_failure: Mapping[str, object] | None,
@@ -259,11 +304,11 @@ def _raise_if_any_rank_failed(
 def _gather_statuses(accelerator: Any, status: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
     gather_object = getattr(accelerator, "gather_object", None)
     if callable(gather_object):
-        gathered = gather_object(dict(status))
+        gathered = gather_object([dict(status)])
     else:
         from accelerate.utils import gather_object as accelerate_gather_object
 
-        gathered = accelerate_gather_object(dict(status))
+        gathered = accelerate_gather_object([dict(status)])
     if not isinstance(gathered, Sequence) or isinstance(gathered, (str, bytes)):
         raise ThreeGpuSmokeError("three-GPU smoke failure status gather is invalid")
     if len(gathered) != 3 or any(not isinstance(item, Mapping) for item in gathered):

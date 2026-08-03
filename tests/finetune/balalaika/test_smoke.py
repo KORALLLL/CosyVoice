@@ -84,6 +84,7 @@ class ThreeGpuSmokeTests(unittest.TestCase):
             self.assertFalse((root / "workflow_stages").exists())
             self.assertFalse((root / "memorization").exists())
             self.assertEqual(accelerators[0].kwargs, {"mixed_precision": "bf16"})
+            self.assertEqual(accelerators[0].broadcast_calls, 1)
 
     def test_nonfinite_loss_removes_temporary_output_and_never_publishes_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,6 +111,33 @@ class ThreeGpuSmokeTests(unittest.TestCase):
 
             self.assertFalse((root / "three_gpu_smoke").exists())
             self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
+
+    def test_rank_zero_preflight_rejects_existing_target_before_loader_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = _fixture_cache(root)
+            target = root / "three_gpu_smoke"
+            target.mkdir()
+            accelerators: list[_ThreeRankAccelerator] = []
+
+            def accelerator_factory(**kwargs):
+                accelerator = _ThreeRankAccelerator(**kwargs)
+                accelerators.append(accelerator)
+                return accelerator
+
+            request = ThreeGpuSmokeRequest(
+                cache=cache,
+                output_root=target,
+                base_model_dir=root / "Fun-CosyVoice3-0.5B-2512",
+                accelerator_factory=accelerator_factory,
+            )
+
+            with self.assertRaisesRegex(ThreeGpuSmokeError, "already exists"):
+                run_three_gpu_smoke(request)
+
+            self.assertTrue(target.exists())
+            self.assertFalse((root / ".three_gpu_smoke.incomplete").exists())
+            self.assertEqual(accelerators[0].broadcast_calls, 1)
 
 
 def _fixture_cache(root: Path) -> CacheManifest:
@@ -159,6 +187,7 @@ class _ThreeRankAccelerator:
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
+        self.broadcast_calls = 0
 
     def prepare(self, *values):
         return values
@@ -173,7 +202,12 @@ class _ThreeRankAccelerator:
         return value.reshape(-1).repeat(3)
 
     def gather_object(self, value):
-        return [value, value, value]
+        return [item for _rank in range(self.num_processes) for item in value]
+
+    def broadcast_object_list(self, values, from_process):
+        if from_process != 0:
+            raise AssertionError(from_process)
+        self.broadcast_calls += 1
 
     def unwrap_model(self, model):
         return model
