@@ -27,6 +27,9 @@ from cosyvoice.finetune.balalaika.workflow import (
     _stage_payload,
     main,
     redact_secrets,
+    run_phase1_memorize,
+    run_phase1_train,
+    run_prepare_cache,
     run_phase1,
     run_phase2,
 )
@@ -167,6 +170,21 @@ def _args(root: Path, backend: FakeBackend, approval: str | None = None) -> argp
     )
 
 
+def _publish_required_memorization_stages(root: Path, backend: FakeBackend) -> None:
+    result = run_phase1_memorize(_args(root, backend, "a" * 64))
+    if result != ExitCode.SUCCESS:
+        raise AssertionError(f"failed to publish memorization prerequisites: {result}")
+    backend.calls.clear()
+
+
+def _publish_required_memorization_and_cache_stages(root: Path, backend: FakeBackend) -> None:
+    _publish_required_memorization_stages(root, backend)
+    result = run_prepare_cache(_args(root, backend))
+    if result != ExitCode.SUCCESS:
+        raise AssertionError(f"failed to publish cache prerequisite: {result}")
+    backend.calls.clear()
+
+
 def _write_memorization_cache(root: Path) -> Path:
     cache_root = root / "memorization_cache"
     (cache_root / "phase1").mkdir(parents=True)
@@ -203,6 +221,55 @@ def _write_memorization_cache(root: Path) -> Path:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_phase1_memorize_stops_after_sealed_memorization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backend = FakeBackend()
+            self.assertEqual(
+                run_phase1_memorize(_args(Path(directory), backend, "a" * 64)),
+                ExitCode.SUCCESS,
+            )
+            operations = [item for item in backend.calls if isinstance(item, str)]
+            self.assertEqual(
+                operations,
+                ["preflight", "qualify_tokenizer", "ensure_pilot", "prepare_memorization", "memorize"],
+            )
+            self.assertNotIn("build_cache", operations)
+            self.assertNotIn("capacity_smoke", operations)
+
+    def test_phase1_memorize_reuses_sealed_pilot_approval_without_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(
+                run_phase1_memorize(_args(root, FakeBackend(), "a" * 64)),
+                ExitCode.SUCCESS,
+            )
+            resumed = FakeBackend()
+            self.assertEqual(run_phase1_memorize(_args(root, resumed)), ExitCode.SUCCESS)
+            self.assertIn(("authenticate", "pilot_approved"), resumed.calls)
+
+    def test_prepare_cache_requires_sealed_memorization_and_builds_only_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(StageRequirementError):
+                run_prepare_cache(_args(root, FakeBackend()))
+            backend = FakeBackend()
+            _publish_required_memorization_stages(root, backend)
+            self.assertEqual(run_prepare_cache(_args(root, backend)), ExitCode.SUCCESS)
+            self.assertEqual(
+                [item for item in backend.calls if isinstance(item, str)],
+                ["build_cache"],
+            )
+
+    def test_phase1_train_requires_cache_and_runs_baseline_before_training(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = FakeBackend()
+            _publish_required_memorization_and_cache_stages(root, backend)
+            self.assertEqual(run_phase1_train(_args(root, backend)), ExitCode.SUCCESS)
+            operations = [item for item in backend.calls if isinstance(item, str)]
+            self.assertEqual(operations[:3], ["capacity_smoke", "ensure_logging", "evaluate_0"])
+            self.assertTrue(any(isinstance(item, tuple) and item[0] == "train" for item in backend.calls))
+
     def test_internal_smoke_command_does_not_construct_production_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -799,11 +866,34 @@ class WorkflowTests(unittest.TestCase):
 
     def test_cli_rejects_secret_flags_and_bad_values(self) -> None:
         with self.assertRaises(SystemExit):
-            main(["phase1", "--hf-token", "secret"])
+            main(["phase1-memorize", "--hf-token", "secret"])
         with self.assertRaises(SystemExit):
-            main(["phase1", "--token-limit", "0"])
+            main(["phase1-memorize", "--token-limit", "0"])
         with self.assertRaises(SystemExit):
-            main(["phase1", "--approve-pilot-sha256", "not-a-digest"])
+            main(["phase1-memorize", "--approve-pilot-sha256", "not-a-digest"])
+
+    def test_cli_exposes_only_split_phase1_commands(self) -> None:
+        with mock.patch("cosyvoice.finetune.balalaika.workflow.ProductionBackend") as production:
+            with self.assertRaises(SystemExit):
+                main(["phase1"])
+            production.assert_not_called()
+        with self.assertRaises(SystemExit):
+            main(["prepare-cache", "--approve-pilot-sha256", "a" * 64])
+        with self.assertRaises(SystemExit):
+            main(["phase1-train", "--approve-pilot-sha256", "a" * 64])
+
+    def test_cli_dispatches_split_phase1_commands(self) -> None:
+        cases = (
+            ("phase1-memorize", "run_phase1_memorize"),
+            ("prepare-cache", "run_prepare_cache"),
+            ("phase1-train", "run_phase1_train"),
+        )
+        for command, operation in cases:
+            with self.subTest(command=command), mock.patch(
+                f"cosyvoice.finetune.balalaika.workflow.{operation}", return_value=ExitCode.SUCCESS,
+            ) as run:
+                self.assertEqual(main([command]), ExitCode.SUCCESS)
+                run.assert_called_once()
 
     def test_status_is_read_only_and_secret_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

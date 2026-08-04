@@ -1302,8 +1302,8 @@ def _ensure_stage(
     return cast(dict[str, object], _main_call(backend.coordinator, f"publish {name}", publish))
 
 
-def run_phase1(args: argparse.Namespace) -> int:
-    """Run or resume phase 1, stopping at the checksum-bound listening gate."""
+def run_phase1_memorize(args: argparse.Namespace) -> int:
+    """Run or resume phase 1 through sealed memorization only."""
 
     options, backend = _resolve(args)
     _ensure_stage(options, backend, "preflight_complete", collective=False, operation=lambda: backend.preflight(options))
@@ -1315,26 +1315,60 @@ def run_phase1(args: argparse.Namespace) -> int:
     pilot_sha256 = pilot.get("pilot_manifest_sha256")
     if not isinstance(pilot_sha256, str) or _SHA256.fullmatch(pilot_sha256) is None:
         raise StageRequirementError("pilot evidence has no valid manifest checksum")
-    if options.approve_pilot_sha256 is None:
-        if backend.coordinator.is_main_process:
-            print(json.dumps({
-                "status": "pilot_review_required",
-                "pilot_manifest_sha256": pilot_sha256,
-                "listening_index": pilot.get("listening_index"),
-            }, sort_keys=True))
-        return int(ExitCode.PILOT_REVIEW_REQUIRED)
-    if options.approve_pilot_sha256 != pilot_sha256:
+    if options.approve_pilot_sha256 is not None and options.approve_pilot_sha256 != pilot_sha256:
         raise StageRequirementError("provided pilot approval checksum does not match the current pilot")
-    _ensure_stage(
-        options, backend, "pilot_approved", collective=False,
-        operation=lambda: backend.approve_pilot(options, options.approve_pilot_sha256 or ""),
-    )
+    approval_path = _stage_store(options).root / "pilot_approved.json"
+    if approval_path.exists():
+        approval = _require_stage(options, backend, "pilot_approved")
+        if approval.get("pilot_manifest_sha256") != pilot_sha256:
+            raise StageRequirementError("sealed pilot approval does not match the current pilot")
+    else:
+        if options.approve_pilot_sha256 is None:
+            if backend.coordinator.is_main_process:
+                print(json.dumps({
+                    "status": "pilot_review_required",
+                    "pilot_manifest_sha256": pilot_sha256,
+                    "listening_index": pilot.get("listening_index"),
+                }, sort_keys=True))
+            return int(ExitCode.PILOT_REVIEW_REQUIRED)
+        _ensure_stage(
+            options, backend, "pilot_approved", collective=False,
+            operation=lambda: backend.approve_pilot(options, options.approve_pilot_sha256 or ""),
+        )
     _ensure_stage(
         options, backend, "memorization_cache_ready", collective=False,
         operation=lambda: backend.prepare_memorization(options),
     )
     _ensure_stage(options, backend, "memorization_complete", collective=True, operation=lambda: backend.memorize(options))
+    return int(ExitCode.SUCCESS)
+
+
+def _require_phase1_memorization(options: WorkflowOptions, backend: WorkflowBackend) -> None:
+    for name in (
+        "preflight_complete",
+        "tokenizer_qualified",
+        "pilot_ready",
+        "pilot_approved",
+        "memorization_complete",
+    ):
+        _require_stage(options, backend, name)
+
+
+def run_prepare_cache(args: argparse.Namespace) -> int:
+    """Build the training cache from authenticated memorization stages."""
+
+    options, backend = _resolve(args)
+    _require_phase1_memorization(options, backend)
     _ensure_stage(options, backend, "cache_complete", collective=False, operation=lambda: backend.build_cache(options))
+    return int(ExitCode.SUCCESS)
+
+
+def run_phase1_train(args: argparse.Namespace) -> int:
+    """Run or resume phase-1 capacity validation and training from a sealed cache."""
+
+    options, backend = _resolve(args)
+    _require_phase1_memorization(options, backend)
+    _require_stage(options, backend, "cache_complete")
     _ensure_stage(options, backend, "capacity_smoke_complete", collective=True, operation=lambda: backend.capacity_smoke(options))
     _collective_call(backend.coordinator, "initialize W&B logging", lambda: backend.ensure_logging(options))
     _ensure_stage(
@@ -1351,6 +1385,20 @@ def run_phase1(args: argparse.Namespace) -> int:
     _validate_phase_result(trained, 1, 16)
     _ensure_stage(options, backend, "phase1_complete", collective=False, operation=lambda: dict(trained))
     return int(ExitCode.SUCCESS)
+
+
+def run_phase1(args: argparse.Namespace) -> int:
+    """Compatibility composition for non-CLI callers."""
+
+    options, backend = _resolve(args)
+    composition_args = argparse.Namespace(options=options, backend=backend)
+    result = run_phase1_memorize(composition_args)
+    if result != ExitCode.SUCCESS:
+        return result
+    result = run_prepare_cache(composition_args)
+    if result != ExitCode.SUCCESS:
+        return result
+    return run_phase1_train(composition_args)
 
 
 def run_phase2(args: argparse.Namespace) -> int:
@@ -1490,10 +1538,17 @@ def _status(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Two-phase CosyVoice3 Balalaika LoRA workflow")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("phase1", "phase2", "status", "three-gpu-smoke"):
+    for command in (
+        "phase1-memorize",
+        "prepare-cache",
+        "phase1-train",
+        "phase2",
+        "status",
+        "three-gpu-smoke",
+    ):
         item = subparsers.add_parser(command)
         _common_arguments(item)
-        if command == "phase1":
+        if command == "phase1-memorize":
             item.add_argument("--approve-pilot-sha256", type=_sha256_argument)
     return parser
 
@@ -1634,8 +1689,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_three_gpu_smoke_command(args)
         if args.command == "status":
             return _status(args)
-        if args.command == "phase1":
-            return run_phase1(args)
+        if args.command == "phase1-memorize":
+            return run_phase1_memorize(args)
+        if args.command == "prepare-cache":
+            return run_prepare_cache(args)
+        if args.command == "phase1-train":
+            return run_phase1_train(args)
         if args.command == "phase2":
             return run_phase2(args)
         parser.error(f"unknown command: {args.command}")
