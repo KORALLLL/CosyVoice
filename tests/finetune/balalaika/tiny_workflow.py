@@ -34,7 +34,14 @@ from cosyvoice.finetune.balalaika.metrics import NumberSpan
 from cosyvoice.finetune.balalaika.model import ExportRequest, LoraSettings
 from cosyvoice.finetune.balalaika.sources import JoinedRow, assign_phases, reserve_prompt_ids
 from cosyvoice.finetune.balalaika.training import TrainRequest, TrainingCallbacks, train_phase
-from cosyvoice.finetune.balalaika.workflow import ExitCode, WorkflowOptions, run_phase1, run_phase2
+from cosyvoice.finetune.balalaika.workflow import (
+    ExitCode,
+    WorkflowOptions,
+    run_phase1_memorize,
+    run_phase1_train,
+    run_prepare_cache,
+    run_phase2,
+)
 from cosyvoice.llm.llm import CosyVoice3LM, Qwen2Encoder
 
 
@@ -43,6 +50,8 @@ class TinyWorkflowResult:
     stage: str
     phase1_first_exit: int
     phase1_approved_exit: int
+    prepare_cache_exit: int
+    phase1_train_exit: int
     phase2_exit: int
     workflow_calls: tuple[str, ...]
     final_llm: Path
@@ -729,12 +738,15 @@ def run_tiny_workflow(
     ), mock.patch(
         "cosyvoice.finetune.balalaika.workflow.VALIDATION_GENERATIONS", benchmark_rows
     ), mock.patch.dict(os.environ, {"WANDB_API_KEY": "offline-fixture-key"}, clear=False):
-        calls.append("run_phase1")
-        first_exit = run_phase1(argparse.Namespace(options=options, backend=backend))
+        first_exit = run_phase1_memorize(argparse.Namespace(options=options, backend=backend))
         pilot = StageStore(paths.stages_dir).require("pilot")
-        calls.append("run_phase1")
         approved_options = replace(options, approve_pilot_sha256=pilot.manifest_sha256)
-        approved_exit = run_phase1(argparse.Namespace(options=approved_options, backend=backend))
+        calls.append("run_phase1 --memorize")
+        approved_exit = run_phase1_memorize(argparse.Namespace(options=approved_options, backend=backend))
+        calls.append("prepare_cache")
+        prepare_cache_exit = run_prepare_cache(argparse.Namespace(options=options, backend=backend))
+        calls.append("run_phase1 --train")
+        phase1_train_exit = run_phase1_train(argparse.Namespace(options=options, backend=backend))
         calls.append("run_phase2")
         phase2_exit = run_phase2(argparse.Namespace(options=options, backend=backend))
 
@@ -751,6 +763,8 @@ def run_tiny_workflow(
         stage=complete.name,
         phase1_first_exit=int(first_exit),
         phase1_approved_exit=int(approved_exit),
+        prepare_cache_exit=int(prepare_cache_exit),
+        phase1_train_exit=int(phase1_train_exit),
         phase2_exit=int(phase2_exit),
         workflow_calls=tuple(calls),
         final_llm=backend.final_manifest.parent / "llm.pt",

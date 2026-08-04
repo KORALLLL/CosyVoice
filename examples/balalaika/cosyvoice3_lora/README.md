@@ -3,8 +3,8 @@
 This recipe fine-tunes the non-RL `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`
 SFT language model for multi-speaker voice cloning on eight RTX 5090 GPUs. It
 uses Accelerate, broad PEFT LoRA, checksum-bound resumable artifacts, and two
-separate operator scripts. It never uploads a dataset, cache, adapter, model,
-or evaluation artifact.
+phase launchers plus a dedicated cache-preparation script. It never uploads a
+dataset, cache, adapter, model, or evaluation artifact.
 
 The workflow is intentionally gated. The first phase invocation creates a
 three-clip speech-token reconstruction pilot and exits with status 20. A human
@@ -65,9 +65,9 @@ python -m pip install --upgrade \
   -r examples/balalaika/cosyvoice3_lora/requirements-cu128.txt
 ```
 
-Both launchers prepend the repository root and the pinned Matcha-TTS submodule
-to `PYTHONPATH`; an uninitialized submodule is therefore a fatal setup error,
-not a cue to install an unrelated `matcha` package from PyPI.
+All three operator scripts prepend the repository root and the pinned
+Matcha-TTS submodule to `PYTHONPATH`; an uninitialized submodule is therefore a
+fatal setup error, not a cue to install an unrelated `matcha` package from PyPI.
 
 Do not downgrade Torch after this step. Confirm the qualified versions and
 providers before any run. The recipe overrides upstream `openai-whisper`
@@ -103,8 +103,8 @@ Under Accelerate this is a true collective: each of the eight ranks qualifies
 only its local GPU, then rank 0 validates and publishes the gathered device set.
 
 The Accelerate configuration is fixed at one machine, eight processes, GPU IDs
-0-7, and BF16 in [`conf/accelerate.yaml`](conf/accelerate.yaml). Both launchers
-also reject anything other than eight unique visible device IDs.
+0-7, and BF16 in [`conf/accelerate.yaml`](conf/accelerate.yaml). All three
+scripts also reject anything other than eight unique visible device IDs.
 
 ## Credentials and base model
 
@@ -149,8 +149,9 @@ test -f /workspace/balalaika_proprietary_v2/train/shard_000518.tar
 
 Defaults place all generated state under
 `/workspace/cosyvoice3-balalaika-lora`. Override paths only with the CLI options
-shown by `python -m cosyvoice.finetune.balalaika.workflow phase1 --help` or the
-equivalent `BALALAIKA_*` environment variables.
+shown by the relevant `phase1-memorize`, `prepare-cache`, `phase1-train`, or
+`phase2` command's `--help`, or the equivalent `BALALAIKA_*` environment
+variables.
 
 ## Isolated three-GPU diagnostic
 
@@ -197,7 +198,7 @@ verification and targeted extraction took about 68 seconds.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh
+  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh --memorize
 ```
 
 Open `/workspace/cosyvoice3-balalaika-lora/pilot/index.md` and compare all three
@@ -211,43 +212,60 @@ duration-stratified A/B pairs (`short`, `median`, and `long`). For every pair:
 - confirm each WAV is audible, 24 kHz mono PCM, and matched to its label.
 
 Get the exact current checksum and bundle path from the JSON printed by the
-first run. If that output was lost, rerun phase 1 without an approval argument;
-the authenticated pilot stage is reused and the same review-required JSON is
-printed again. Do not approve from memory and do not approve a checksum after
-any pilot artifact changes. The separate status command confirms which stage
-envelopes are present and checksum-valid.
+first run. If that output was lost, rerun memorization without an approval
+argument; the authenticated pilot stage is reused and the same review-required
+JSON is printed again. Do not approve from memory and do not approve a checksum
+after any pilot artifact changes. The separate status command confirms which
+stage envelopes are present and checksum-valid.
 
 ```bash
-bash examples/balalaika/cosyvoice3_lora/run_phase1.sh
+bash examples/balalaika/cosyvoice3_lora/run_phase1.sh --memorize
 ```
 
-Only after listening, rerun phase 1 with the exact lowercase checksum:
+Only after listening, rerun memorization with the exact lowercase checksum:
 
 ```bash
 PILOT_SHA256='REPLACE_WITH_64_HEX_FROM_REVIEW_OUTPUT'
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh \
-  --approve-pilot-sha256 "${PILOT_SHA256}" \
-  --wandb-project cosyvoice3-balalaika-lora \
-  --wandb-name cosyvoice3-balalaika
+  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh --memorize \
+  --approve-pilot-sha256 "${PILOT_SHA256}"
 ```
 
 The real-hardware qualification step for this implementation stops after pilot
 generation and asks the user to approve the audio. It must not supply
 `--approve-pilot-sha256` on the user's behalf.
 
-## 2. Mandatory memorization and phase 1
+## 2. Mandatory memorization, cache preparation, and phase 1
 
-The approved rerun first builds a compact four-row cache: short and long clips
-from each agreement phase. The production LoRA/Accelerate loss path must report
-100% teacher-forced speech-token accuracy for every one of the four real audios
-at three consecutive checks. Failed or stale evidence blocks the full cache.
-The gate is exact token accuracy, not an MSE proxy.
+The approved memorization run first builds a compact four-row cache: short and
+long clips from each agreement phase. The production LoRA/Accelerate loss path
+must report 100% teacher-forced speech-token accuracy for every one of the four
+real audios at three consecutive checks. Failed or stale evidence blocks the
+full cache. The gate is exact token accuracy, not an MSE proxy.
 
-After that gate passes, the same invocation builds/verifies the full compact
-Parquet token cache, runs the eight-GPU capacity smoke, evaluates the untouched
-base at index 0, and trains phase 1. Phase 1 has 16 validations: eight boundaries
-per epoch for two epochs. W&B is mandatory; every point must durably log metrics,
+Run the three operations in this order. The cache command performs full-corpus
+speech-token extraction only; it does not run the capacity smoke, baseline
+validation, or training.
+
+```bash
+PILOT_SHA256='REPLACE_WITH_64_HEX_FROM_REVIEW_OUTPUT'
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh --memorize \
+  --approve-pilot-sha256 "${PILOT_SHA256}"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash examples/balalaika/cosyvoice3_lora/prepare_cache.sh
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash examples/balalaika/cosyvoice3_lora/run_phase1.sh --train \
+  --wandb-project cosyvoice3-balalaika-lora \
+  --wandb-name cosyvoice3-balalaika
+```
+
+Training starts with the eight-GPU capacity smoke. It selects a safe token
+budget with two GiB of headroom, then evaluates the untouched base at index 0
+before any optimizer update. Phase 1 has 16 validations: eight boundaries per
+epoch for two epochs. W&B is mandatory; every point must durably log metrics,
 the worst-error table, and the 20-voice listening panel before training proceeds.
 
 The broad LoRA inventory is discovered and audited from the active CosyVoice3
@@ -288,8 +306,7 @@ pending checkpoint directory under the corresponding `checkpoints/` tree (the
 validation index also appears in training logs):
 
 ```bash
-bash examples/balalaika/cosyvoice3_lora/run_phase1.sh \
-  --approve-pilot-sha256 "${PILOT_SHA256}" \
+bash examples/balalaika/cosyvoice3_lora/run_phase1.sh --train \
   --resume-checkpoint /workspace/cosyvoice3-balalaika-lora/phase1/checkpoints/phase-1-validation-07
 
 bash examples/balalaika/cosyvoice3_lora/run_phase2.sh \
@@ -300,7 +317,7 @@ Resume refuses changed cache/model/LoRA/schedule/sampler identities and
 re-authenticates prior local evaluation plus live W&B commits. Phase 2 also
 requires the original phase-1 adapter checksum. Do not move or edit a checkpoint.
 
-Use either launcher's identical read-only status command:
+Use either training launcher's identical read-only status command:
 
 ```bash
 bash examples/balalaika/cosyvoice3_lora/run_phase2.sh --status
@@ -378,9 +395,10 @@ model directory.
 
 - **Pilot exits 20:** this is the required listening pause, not a crash. Open
   `pilot/index.md`, listen, then rerun with the printed checksum.
-- **Approval checksum mismatch:** do not bypass it. Rerun phase 1 without an
-  approval argument, inspect the current pilot again, and approve only the
-  checksum printed in that review-required response.
+- **Approval checksum mismatch:** do not bypass it. Rerun
+  `run_phase1.sh --memorize` without an approval argument, inspect the current
+  pilot again, and approve only the checksum printed in that review-required
+  response.
 - **Preflight rejects GPUs/BF16:** confirm exactly eight RTX 5090 devices are
   visible, capability is at least 12.0, and no scheduler/container remaps them.
 - **NCCL timeout during preflight or cache preparation:** rank zero may spend
@@ -409,7 +427,7 @@ model directory.
 
 ## Upload policy
 
-There is no upload command or upload stage in either script. The final model,
+There is no upload command or upload stage in any operator script. The final model,
 adapter lineage, caches, private benchmark rows, generated speech, and W&B-local
 evidence stay under the run root. Upload is explicitly deferred until the user
 reviews the completed artifacts and separately authorizes a destination and

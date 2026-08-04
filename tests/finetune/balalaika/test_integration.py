@@ -24,8 +24,13 @@ class BalalaikaRecipeIntegrationTests(unittest.TestCase):
             self.assertEqual(result.stage, "complete")
             self.assertEqual(result.phase1_first_exit, 20)
             self.assertEqual(result.phase1_approved_exit, 0)
+            self.assertEqual(result.prepare_cache_exit, 0)
+            self.assertEqual(result.phase1_train_exit, 0)
             self.assertEqual(result.phase2_exit, 0)
-            self.assertEqual(result.workflow_calls, ("run_phase1", "run_phase1", "run_phase2"))
+            self.assertEqual(
+                result.workflow_calls,
+                ("run_phase1 --memorize", "prepare_cache", "run_phase1 --train", "run_phase2"),
+            )
             self.assertTrue(result.final_llm.exists())
             self.assertTrue(result.strict_load_verified)
             self.assertTrue(result.final_manifest.exists())

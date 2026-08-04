@@ -64,8 +64,23 @@ if [[ "${1:-}" == "--status" ]]; then
   exec python -m cosyvoice.finetune.balalaika.workflow status "$@"
 fi
 
+case "${1:-}" in
+  --memorize)
+    command="phase1-memorize"
+    shift
+    ;;
+  --train)
+    command="phase1-train"
+    shift
+    ;;
+  *)
+    echo "choose --memorize or --train" >&2
+    exit 2
+    ;;
+esac
+
 exec accelerate launch \
   --config_file "${repo_root}/examples/balalaika/cosyvoice3_lora/conf/accelerate.yaml" \
   --num_processes 8 \
   --mixed_precision bf16 \
-  -m cosyvoice.finetune.balalaika.workflow phase1 "$@"
+  -m cosyvoice.finetune.balalaika.workflow "${command}" "$@"
